@@ -86,6 +86,13 @@
  */
 #define ITEM_UPDATE_INTERVAL 60
 
+/*
+ * Valid range of the maximum size of an item, in bytes.
+ */
+#define ITEM_SIZE_MAX_LOWER_LIMIT 1024
+#define ITEM_SIZE_MAX_UPPER_LIMIT 1024 * 1024 * 1024
+
+
 /* unistd.h is here */
 #if HAVE_UNISTD_H
 # include <unistd.h>
@@ -428,8 +435,11 @@ struct settings {
     unsigned int logger_watcher_buf_size; /* size of logger's per-watcher buffer */
     unsigned int logger_buf_size; /* size of per-thread logger buffer */
     bool drop_privileges;   /* Whether or not to drop unnecessary process privileges */
+    bool watch_enabled; /* allows watch commands to be dropped */
     bool relaxed_privileges;   /* Relax process restrictions when running testapp */
 #ifdef EXTSTORE
+    unsigned int ext_io_threadcount; /* number of IO threads to run. */
+    unsigned int ext_page_size; /* size in megabytes of storage pages. */
     unsigned int ext_item_size; /* minimum size of items to store externally */
     unsigned int ext_item_age; /* max age of tail item before storing ext. */
     unsigned int ext_low_ttl; /* remaining TTL below this uses own pages */
@@ -768,7 +778,7 @@ extern int daemonize(int nochdir, int noclose);
 #define mutex_lock(x) pthread_mutex_lock(x)
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 
-#include "stats.h"
+#include "stats_prefix.h"
 #include "slabs.h"
 #include "assoc.h"
 #include "items.h"

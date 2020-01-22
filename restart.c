@@ -32,6 +32,10 @@ static restart_data_cb *cb_stack = NULL;
 // routines for the restart code.
 void restart_register(const char *tag, restart_check_cb ccb, restart_save_cb scb, void *data) {
     restart_data_cb *cb = calloc(1, sizeof(restart_data_cb));
+    if (cb == NULL) {
+        fprintf(stderr, "[restart] failed to allocate callback register\n");
+        abort();
+    }
 
     // Handle first time call initialization inline so we don't need separate
     // API call.
@@ -70,12 +74,18 @@ static int restart_check(const char *file) {
     size_t flen = strlen(file);
     const char *ext = ".meta";
     char *metafile = calloc(1, flen + strlen(ext) + 1);
+    if (metafile == NULL) {
+        // probably in a really bad position if we hit here, so don't start.
+        fprintf(stderr, "[restart] failed to allocate memory for restart check\n");
+        abort();
+    }
     memcpy(metafile, file, flen);
     memcpy(metafile+flen, ext, strlen(ext));
 
     FILE *f = fopen(metafile, "r");
     if (f == NULL) {
         fprintf(stderr, "[restart] no metadata save file, starting with a clean cache\n");
+        free(metafile);
         return -1;
     }
 
@@ -207,9 +217,14 @@ static int restart_save(const char *file) {
     // FIXME: function.
     size_t flen = strlen(file);
     const char *ext = ".meta";
-    char *metafile = calloc(1, flen + strlen(ext) + 1);
+    size_t extlen = strlen(ext);
+    char *metafile = calloc(1, flen + extlen + 1);
+    if (metafile == NULL) {
+        fprintf(stderr, "[restart] failed to allocate memory during metadata save\n");
+        return -1;
+    }
     memcpy(metafile, file, flen);
-    memcpy(metafile+flen, ext, strlen(ext));
+    memcpy(metafile+flen, ext, extlen);
 
     // restrictive permissions for the metadata file.
     // TODO: also for the mmap file eh? :P
@@ -218,6 +233,7 @@ static int restart_save(const char *file) {
     umask(oldmask);
     if (f == NULL) {
         // FIXME: correct error handling.
+        free(metafile);
         perror("failed to write metadata file");
         return -1;
     }
@@ -229,6 +245,8 @@ static int restart_save(const char *file) {
         // Plugins/engines in the metadata file are separated by tag lines.
         fprintf(f, "T%s\n", cb->tag);
         if (cb->scb(cb->tag, &ctx, cb->data) != 0) {
+            fclose(f);
+            free(metafile);
             return -1;
         }
 
@@ -281,6 +299,10 @@ bool restart_mmap_open(const size_t limit, const char *file, void **mem_base) {
     long pagesize = _find_pagesize();
     memory_file = strdup(file);
     mmap_fd = open(file, O_RDWR|O_CREAT, S_IRWXU);
+    if (mmap_fd == -1) {
+        perror("failed to open file for mmap");
+        abort();
+    }
     if (ftruncate(mmap_fd, limit) != 0) {
         perror("ftruncate failed");
         abort();
