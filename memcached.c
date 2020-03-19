@@ -199,6 +199,13 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
 
 #define REALTIME_MAXDELTA 60*60*24*30
 
+/* Negative exptimes can underflow and end up immortal. realtime() will
+   immediately expire values that are greater than REALTIME_MAXDELTA, but less
+   than process_started, so lets aim for that. */
+#define EXPTIME_TO_POSITIVE_TIME(exptime) (exptime < 0) ? \
+        REALTIME_MAXDELTA + 1 : exptime
+
+
 /*
  * given time value that's either unix time or delta from current unix time, return
  * unix time. Use the fact that delta can't exceed one month (and real time value can't
@@ -968,7 +975,7 @@ static void conn_set_state(conn *c, enum conn_states state) {
         }
 
         if (state == conn_write || state == conn_mwrite) {
-            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->resp->wbuf, c->resp->wbytes);
         }
         c->state = state;
     }
@@ -3185,6 +3192,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {
+        APPEND_STAT("ssl_handshake_errors", "%llu", (unsigned long long)stats.ssl_handshake_errors);
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
     }
 #endif
@@ -3897,7 +3905,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             return;
         }
         key_token++;
-        exptime = realtime(exptime_int);
+        exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
     }
 
     do {
@@ -4152,10 +4160,7 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
                     *errstr = "CLIENT_ERROR bad token in command line format";
                     of->has_error = 1;
                 } else {
-                    if (tmp_int < 0) {
-                        tmp_int = REALTIME_MAXDELTA + 1;
-                    }
-                    of->autoviv_exptime = realtime(tmp_int);
+                    of->autoviv_exptime = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
                 }
                 break;
             case 'T':
@@ -4164,10 +4169,7 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
                     *errstr = "CLIENT_ERROR bad token in command line format";
                     of->has_error = 1;
                 } else {
-                    if (tmp_int < 0) {
-                        tmp_int = REALTIME_MAXDELTA + 1;
-                    }
-                    of->exptime = realtime(tmp_int);
+                    of->exptime = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
                     of->new_ttl = true;
                 }
                 break;
@@ -4177,10 +4179,7 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
                     *errstr = "CLIENT_ERROR bad token in command line format";
                     of->has_error = 1;
                 } else {
-                    if (tmp_int < 0) {
-                        tmp_int = REALTIME_MAXDELTA + 1;
-                    }
-                    of->recache_time = realtime(tmp_int);
+                    of->recache_time = realtime(EXPTIME_TO_POSITIVE_TIME(tmp_int));
                 }
                 break;
             case 'l':
@@ -5101,7 +5100,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     size_t nkey;
     unsigned int flags;
     int32_t exptime_int = 0;
-    time_t exptime;
+    rel_time_t exptime = 0;
     int vlen;
     uint64_t req_cas_id=0;
     item *it;
@@ -5125,14 +5124,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         return;
     }
 
-    /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
-    exptime = exptime_int;
-
-    /* Negative exptimes can underflow and end up immortal. realtime() will
-       immediately expire values that are greater than REALTIME_MAXDELTA, but less
-       than process_started, so lets aim for that. */
-    if (exptime < 0)
-        exptime = REALTIME_MAXDELTA + 1;
+    exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
 
     // does cas value exist?
     if (handle_cas) {
@@ -5152,7 +5144,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_set(key, nkey);
     }
 
-    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+    it = item_alloc(key, nkey, flags, exptime, vlen);
 
     if (it == 0) {
         enum store_item_type status;
@@ -5203,6 +5195,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
     char *key;
     size_t nkey;
     int32_t exptime_int = 0;
+    rel_time_t exptime = 0;
     item *it;
 
     assert(c != NULL);
@@ -5222,7 +5215,8 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         return;
     }
 
-    it = item_touch(key, nkey, realtime(exptime_int), c);
+    exptime = realtime(EXPTIME_TO_POSITIVE_TIME(exptime_int));
+    it = item_touch(key, nkey, exptime, c);
     if (it) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
@@ -7027,7 +7021,7 @@ static void drive_machine(conn *c) {
                     }
                     SSL_set_fd(ssl, sfd);
                     int ret = SSL_accept(ssl);
-                    if (ret < 0) {
+                    if (ret <= 0) {
                         int err = SSL_get_error(ssl, ret);
                         if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
                             if (settings.verbose) {
@@ -7035,6 +7029,9 @@ static void drive_machine(conn *c) {
                             }
                             SSL_free(ssl);
                             close(sfd);
+                            STATS_LOCK();
+                            stats.ssl_handshake_errors++;
+                            STATS_UNLOCK();
                             break;
                         }
                     }
@@ -7964,7 +7961,7 @@ static void usage(void) {
            "                          (default: 1/4th of the assigned storage)\n"
            "   - ext_drop_under:      drop COLD items when fewer than this many free pages\n"
            "                          (default: 1/4th of the assigned storage)\n"
-           "   - ext_max_frag:        max page fragmentation to tolerage (default: %.2f)\n"
+           "   - ext_max_frag:        max page fragmentation to tolerate (default: %.2f)\n"
            "   - slab_automove_freeratio: ratio of memory to hold free as buffer.\n"
            "                          (see doc/storage.txt for more info, default: %.3f)\n",
            settings.ext_page_size / (1 << 20), settings.ext_wbuf_size / (1 << 20), settings.ext_io_threadcount,

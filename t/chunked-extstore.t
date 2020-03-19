@@ -18,8 +18,13 @@ if (!supports_extstore()) {
 
 $ext_path = "/tmp/extstore.$$";
 
-my $server = new_memcached("-m 64 -U 0 -o ext_page_size=8,ext_wbuf_size=2,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=10000,ext_max_frag=0.9,ext_path=$ext_path:64m,slab_chunk_max=16384,slab_automove=0,ext_compact_under=1");
+my $server = new_memcached("-m 64 -U 0 -o ext_page_size=8,ext_wbuf_size=2,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=0,ext_max_frag=0,ext_path=$ext_path:64m,slab_chunk_max=16384,slab_automove=0");
 my $sock = $server->sock;
+
+# Only able to disable compaction at runtime.
+# FIXME: -1 for disabled? :(
+print $sock "extstore compact_under 0\r\n";
+my $res = <$sock>;
 
 # Wait until all items have flushed
 sub wait_for_ext {
@@ -52,7 +57,7 @@ is(scalar <$sock>, "STORED\r\n", "stored pattern successfully");
 # Stash two more for later test
 print $sock "set pattern2 0 0 $plen noreply\r\n$pattern\r\n";
 print $sock "set pattern3 0 0 $plen noreply\r\n$pattern\r\n";
-sleep 4;
+wait_for_ext();
 mem_get_is($sock, "pattern", $pattern);
 
 for (1..5) {
@@ -62,6 +67,7 @@ for (1..5) {
     my $res = <$sock>;
     is($res, "STORED\r\n", "stored some big items");
 }
+wait_for_ext();
 
 {
     my $max = 1024 * 1024;
@@ -102,6 +108,7 @@ for (1..5) {
     wait_for_ext();
 
     my $stats = mem_stats($sock);
+    is($stats->{evictions}, 0, 'memory evictions should still be zero');
     cmp_ok($stats->{extstore_page_evictions}, '>', 0, 'at least one page evicted');
     cmp_ok($stats->{extstore_objects_evicted}, '>', 0, 'at least one object evicted');
     cmp_ok($stats->{extstore_bytes_evicted}, '>', 0, 'some bytes evicted');
@@ -109,6 +116,8 @@ for (1..5) {
     is($stats->{miss_from_extstore}, 0, 'no misses');
 
     # original "pattern" key should be gone.
+    cmp_ok($stats->{recache_from_extstore}, '<', 1, 'no recaching happening');
+    cmp_ok($stats->{extstore_compact_rescues}, '<', 1, 'no compaction rescues happened');
     mem_get_is($sock, "pattern", undef, "original pattern key is gone");
     $stats = mem_stats($sock);
     is($stats->{miss_from_extstore}, 1, 'one extstore miss');
@@ -137,8 +146,15 @@ for (1..5) {
     my $res = <$sock>;
     print $sock "extstore drop_under 3\r\n";
     $res = <$sock>;
+    print $sock "extstore max_frag 0.9\r\n";
+    $res = <$sock>;
 
-    sleep 4;
+    # Give compaction some time to run.
+    for (1 .. 30) {
+        my $stats = mem_stats($sock);
+        last if $stats->{extstore_pages_free} > 2;
+        sleep 1;
+    }
 
     my $stats = mem_stats($sock);
     cmp_ok($stats->{extstore_pages_free}, '>', 2, 'some pages now free');
