@@ -269,6 +269,7 @@ static void settings_init(void) {
     settings.ssl_ca_cert = NULL;
     settings.ssl_last_cert_refresh_time = current_time;
     settings.ssl_wbuf_size = 16 * 1024; // default is 16KB (SSL max frame size is 17KB)
+    settings.ssl_session_cache = false;
 #endif
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
@@ -341,7 +342,11 @@ static void *conn_timeout_thread(void *arg) {
     char buf[TIMEOUT_MSG_SIZE];
     rel_time_t oldest_last_cmd;
     int sleep_time;
-    useconds_t timeslice = 1000000 / (max_fds / CONNS_PER_SLICE);
+    int sleep_slice = max_fds / CONNS_PER_SLICE;
+    if (sleep_slice == 0)
+        sleep_slice = CONNS_PER_SLICE;
+
+    useconds_t timeslice = 1000000 / sleep_slice;
 
     while(do_run_conn_timeout_thread) {
         if (settings.verbose > 2)
@@ -937,6 +942,18 @@ static void conn_close(conn *c) {
     STATS_UNLOCK();
 
     return;
+}
+
+// Since some connections might be off on side threads and some are managed as
+// listeners we need to walk through them all from a central point.
+// Must be called with all worker threads hung or in the process of closing.
+void conn_close_all(void) {
+    int i;
+    for (i = 0; i < max_fds; i++) {
+        if (conns[i] && conns[i]->state != conn_closed) {
+            conn_close(conns[i]);
+        }
+    }
 }
 
 /**
@@ -2914,6 +2931,30 @@ typedef struct token_s {
 
 #define MAX_TOKENS 24
 
+#define WANT_TOKENS(ntokens, min, max) \
+    do { \
+        if ((min != -1 && ntokens < min) || (max != -1 && ntokens > max)) { \
+            out_string(c, "ERROR"); \
+            return; \
+        } \
+    } while (0)
+
+#define WANT_TOKENS_OR(ntokens, a, b) \
+    do { \
+        if (ntokens != a && ntokens != b) { \
+            out_string(c, "ERROR"); \
+            return; \
+        } \
+    } while (0)
+
+#define WANT_TOKENS_MIN(ntokens, min) \
+    do { \
+        if (ntokens < min) { \
+            out_string(c, "ERROR"); \
+            return; \
+        } \
+    } while (0)
+
 /*
  * Tokenize the command string by replacing whitespace with '\0' and update
  * the token array tokens with pointer to start of each token and length.
@@ -3192,6 +3233,9 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {
+        if (settings.ssl_session_cache) {
+            APPEND_STAT("ssl_new_sessions", "%llu", (unsigned long long)stats.ssl_new_sessions);
+        }
         APPEND_STAT("ssl_handshake_errors", "%llu", (unsigned long long)stats.ssl_handshake_errors);
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
     }
@@ -3279,6 +3323,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("ssl_ciphers", "%s", settings.ssl_ciphers ? settings.ssl_ciphers : "NULL");
     APPEND_STAT("ssl_ca_cert", "%s", settings.ssl_ca_cert ? settings.ssl_ca_cert : "NULL");
     APPEND_STAT("ssl_wbuf_size", "%u", settings.ssl_wbuf_size);
+    APPEND_STAT("ssl_session_cache", "%s", settings.ssl_session_cache ? "yes" : "no");
 #endif
 }
 
@@ -4288,11 +4333,12 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
     bool item_created = false;
     bool won_token = false;
     bool ttl_set = false;
-    char *errstr;
+    char *errstr = "CLIENT_ERROR bad command line format";
     mc_resp *resp = c->resp;
     char *p = resp->wbuf;
 
     assert(c != NULL);
+    WANT_TOKENS_MIN(ntokens, 3);
 
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_errstring(c, "CLIENT_ERROR bad command line format");
@@ -4587,6 +4633,7 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
     char *p = resp->wbuf;
 
     assert(c != NULL);
+    WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
@@ -4758,6 +4805,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
     char *p = resp->wbuf + 3;
 
     assert(c != NULL);
+    WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
@@ -4887,6 +4935,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
     item *it = NULL; // item returned by do_add_delta.
 
     assert(c != NULL);
+    WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
@@ -5542,6 +5591,11 @@ static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens
         return;
     }
 
+    if (resp_has_stack(c)) {
+        out_string(c, "ERROR cannot pipeline other commands before watch");
+        return;
+    }
+
     if (ntokens > 2) {
         for (x = COMMAND_TOKEN + 1; x < ntokens - 1; x++) {
             if ((strcmp(tokens[x].value, "rawcmds") == 0)) {
@@ -5718,6 +5772,239 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
     }
 }
 #endif
+static void process_flush_all_command(conn *c, token_t *tokens, const size_t ntokens) {
+    time_t exptime = 0;
+    rel_time_t new_oldest = 0;
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.flush_cmds++;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    if (!settings.flush_enabled) {
+        // flush_all is not allowed but we log it on stats
+        out_string(c, "CLIENT_ERROR flush_all not allowed");
+        return;
+    }
+
+    if (ntokens != (c->noreply ? 3 : 2)) {
+        exptime = strtol(tokens[1].value, NULL, 10);
+        if(errno == ERANGE) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+    }
+
+    /*
+      If exptime is zero realtime() would return zero too, and
+      realtime(exptime) - 1 would overflow to the max unsigned
+      value.  So we process exptime == 0 the same way we do when
+      no delay is given at all.
+    */
+    if (exptime > 0) {
+        new_oldest = realtime(exptime);
+    } else { /* exptime == 0 */
+        new_oldest = current_time;
+    }
+
+    if (settings.use_cas) {
+        settings.oldest_live = new_oldest - 1;
+        if (settings.oldest_live <= current_time)
+            settings.oldest_cas = get_cas_id();
+    } else {
+        settings.oldest_live = new_oldest;
+    }
+    out_string(c, "OK");
+}
+
+static void process_version_command(conn *c) {
+    out_string(c, "VERSION " VERSION);
+}
+
+static void process_quit_command(conn *c) {
+    conn_set_state(c, conn_mwrite);
+    c->close_after_write = true;
+}
+
+static void process_shutdown_command(conn *c) {
+    if (settings.shutdown_command) {
+        conn_set_state(c, conn_closing);
+        raise(SIGINT);
+    } else {
+        out_string(c, "ERROR: shutdown not enabled");
+    }
+}
+
+static void process_slabs_command(conn *c, token_t *tokens, const size_t ntokens) {
+    if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
+        int src, dst, rv;
+
+        if (settings.slab_reassign == false) {
+            out_string(c, "CLIENT_ERROR slab reassignment disabled");
+            return;
+        }
+
+        src = strtol(tokens[2].value, NULL, 10);
+        dst = strtol(tokens[3].value, NULL, 10);
+
+        if (errno == ERANGE) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+
+        rv = slabs_reassign(src, dst);
+        switch (rv) {
+        case REASSIGN_OK:
+            out_string(c, "OK");
+            break;
+        case REASSIGN_RUNNING:
+            out_string(c, "BUSY currently processing reassign request");
+            break;
+        case REASSIGN_BADCLASS:
+            out_string(c, "BADCLASS invalid src or dst class id");
+            break;
+        case REASSIGN_NOSPARE:
+            out_string(c, "NOSPARE source class has no spare pages");
+            break;
+        case REASSIGN_SRC_DST_SAME:
+            out_string(c, "SAME src and dst class are identical");
+            break;
+        }
+        return;
+    } else if (ntokens >= 4 &&
+        (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
+        process_slabs_automove_command(c, tokens, ntokens);
+    } else {
+        out_string(c, "ERROR");
+    }
+}
+
+static void process_lru_crawler_command(conn *c, token_t *tokens, const size_t ntokens) {
+    if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
+        int rv;
+        if (settings.lru_crawler == false) {
+            out_string(c, "CLIENT_ERROR lru crawler disabled");
+            return;
+        }
+
+        rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
+                settings.lru_crawler_tocrawl);
+        switch(rv) {
+        case CRAWLER_OK:
+            out_string(c, "OK");
+            break;
+        case CRAWLER_RUNNING:
+            out_string(c, "BUSY currently processing crawler request");
+            break;
+        case CRAWLER_BADCLASS:
+            out_string(c, "BADCLASS invalid class id");
+            break;
+        case CRAWLER_NOTSTARTED:
+            out_string(c, "NOTSTARTED no items to crawl");
+            break;
+        case CRAWLER_ERROR:
+            out_string(c, "ERROR an unknown error happened");
+            break;
+        }
+        return;
+    } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
+        if (settings.lru_crawler == false) {
+            out_string(c, "CLIENT_ERROR lru crawler disabled");
+            return;
+        }
+        if (!settings.dump_enabled) {
+            out_string(c, "ERROR metadump not allowed");
+            return;
+        }
+        if (resp_has_stack(c)) {
+            out_string(c, "ERROR cannot pipeline other commands before metadump");
+            return;
+        }
+
+        int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
+                c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
+        switch(rv) {
+            case CRAWLER_OK:
+                // TODO: documentation says this string is returned, but
+                // it never was before. We never switch to conn_write so
+                // this o_s call never worked. Need to talk to users and
+                // decide if removing the OK from docs is fine.
+                //out_string(c, "OK");
+                // TODO: Don't reuse conn_watch here.
+                conn_set_state(c, conn_watch);
+                event_del(&c->event);
+                break;
+            case CRAWLER_RUNNING:
+                out_string(c, "BUSY currently processing crawler request");
+                break;
+            case CRAWLER_BADCLASS:
+                out_string(c, "BADCLASS invalid class id");
+                break;
+            case CRAWLER_NOTSTARTED:
+                out_string(c, "NOTSTARTED no items to crawl");
+                break;
+            case CRAWLER_ERROR:
+                out_string(c, "ERROR an unknown error happened");
+                break;
+        }
+        return;
+    } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
+        uint32_t tocrawl;
+         if (!safe_strtoul(tokens[2].value, &tocrawl)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        settings.lru_crawler_tocrawl = tocrawl;
+        out_string(c, "OK");
+        return;
+    } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
+        uint32_t tosleep;
+        if (!safe_strtoul(tokens[2].value, &tosleep)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        if (tosleep > 1000000) {
+            out_string(c, "CLIENT_ERROR sleep must be one second or less");
+            return;
+        }
+        settings.lru_crawler_sleep = tosleep;
+        out_string(c, "OK");
+        return;
+    } else if (ntokens == 3) {
+        if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
+            if (start_item_crawler_thread() == 0) {
+                out_string(c, "OK");
+            } else {
+                out_string(c, "ERROR failed to start lru crawler thread");
+            }
+        } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
+            if (stop_item_crawler_thread(CRAWLER_NOWAIT) == 0) {
+                out_string(c, "OK");
+            } else {
+                out_string(c, "ERROR failed to stop lru crawler thread");
+            }
+        } else {
+            out_string(c, "ERROR");
+        }
+        return;
+    } else {
+        out_string(c, "ERROR");
+    }
+}
+#ifdef TLS
+static void process_refresh_certs_command(conn *c, token_t *tokens, const size_t ntokens) {
+    set_noreply_maybe(c, tokens, ntokens);
+    char *errmsg = NULL;
+    if (refresh_certs(&errmsg)) {
+        out_string(c, "OK");
+    } else {
+        write_and_free(c, errmsg, strlen(errmsg));
+    }
+    return;
+}
+#endif
+
 // TODO: pipelined commands are incompatible with shifting connections to a
 // side thread. Given this only happens in two instances (watch and
 // lru_crawler metadump) it should be fine for things to bail. It _should_ be
@@ -5751,324 +6038,182 @@ static void process_command(conn *c, char *command) {
     }
 
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
-    if (ntokens >= 3 &&
-        ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
-         (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
+    // All commands need a minimum of two tokens: cmd and NULL finalizer
+    // There are also no valid commands shorter than two bytes.
+    if (ntokens < 2 || tokens[COMMAND_TOKEN].length < 2) {
+        out_string(c, "ERROR");
+        return;
+    }
 
-        process_get_command(c, tokens, ntokens, false, false);
+    // Meta commands are all 2-char in length.
+    char first = tokens[COMMAND_TOKEN].value[0];
+    if (first == 'm' && tokens[COMMAND_TOKEN].length == 2) {
+        switch (tokens[COMMAND_TOKEN].value[1]) {
+            case 'g':
+                process_mget_command(c, tokens, ntokens);
+                break;
+            case 's':
+                process_mset_command(c, tokens, ntokens);
+                break;
+            case 'd':
+                process_mdelete_command(c, tokens, ntokens);
+                break;
+            case 'n':
+                out_string(c, "MN");
+                // mn command forces immediate writeback flush.
+                conn_set_state(c, conn_mwrite);
+                break;
+            case 'a':
+                process_marithmetic_command(c, tokens, ntokens);
+                break;
+            case 'e':
+                process_meta_command(c, tokens, ntokens);
+                break;
+            default:
+                out_string(c, "ERROR");
+                break;
+        }
+    } else if (first == 'g') {
+        // Various get commands are very common.
+        WANT_TOKENS_MIN(ntokens, 3);
+        if (strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) {
 
-    } else if ((ntokens == 6 || ntokens == 7) &&
-               ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
+            process_get_command(c, tokens, ntokens, false, false);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0) {
+
+            process_get_command(c, tokens, ntokens, true, false);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "gat") == 0) {
+
+            process_get_command(c, tokens, ntokens, false, true);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "gats") == 0) {
+
+            process_get_command(c, tokens, ntokens, true, true);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 's') {
+        if (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) {
+
+            WANT_TOKENS_OR(ntokens, 6, 7);
+            process_update_command(c, tokens, ntokens, comm, false);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0) {
+
+            process_stat(c, tokens, ntokens);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0) {
+
+            process_shutdown_command(c);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
+
+            process_slabs_command(c, tokens, ntokens);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 'a') {
+        if ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
+            (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) ) {
+
+            WANT_TOKENS_OR(ntokens, 6, 7);
+            process_update_command(c, tokens, ntokens, comm, false);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 'c') {
+        if (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS)) {
+
+            WANT_TOKENS_OR(ntokens, 7, 8);
+            process_update_command(c, tokens, ntokens, comm, true);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0) {
+
+            WANT_TOKENS_OR(ntokens, 3, 4);
+            process_memlimit_command(c, tokens, ntokens);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 'i') {
+        if (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0) {
+
+            WANT_TOKENS_OR(ntokens, 4, 5);
+            process_arithmetic_command(c, tokens, ntokens, 1);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 'd') {
+        if (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0) {
+
+            WANT_TOKENS(ntokens, 3, 5);
+            process_delete_command(c, tokens, ntokens);
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0) {
+
+            WANT_TOKENS_OR(ntokens, 4, 5);
+            process_arithmetic_command(c, tokens, ntokens, 0);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (first == 't') {
+        if (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0) {
+
+            WANT_TOKENS_OR(ntokens, 4, 5);
+            process_touch_command(c, tokens, ntokens);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (
                 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
-                (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
+                (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ) {
 
+        WANT_TOKENS_OR(ntokens, 6, 7);
         process_update_command(c, tokens, ntokens, comm, false);
 
-    } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0) {
+        // ancient "binary get" command which isn't in any documentation, was
+        // removed > 10 years ago, etc. Keeping for compatibility reasons but
+        // we should look deeper into client code and remove this.
+        WANT_TOKENS_MIN(ntokens, 3);
+        process_get_command(c, tokens, ntokens, false, false);
 
-        process_update_command(c, tokens, ntokens, comm, true);
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0) {
 
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+        WANT_TOKENS(ntokens, 2, 4);
+        process_flush_all_command(c, tokens, ntokens);
 
-        process_arithmetic_command(c, tokens, ntokens, 1);
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0) {
 
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
+        process_version_command(c);
 
-        process_get_command(c, tokens, ntokens, true, false);
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0) {
 
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "mg") == 0)) {
-        process_mget_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "ms") == 0)) {
-        process_mset_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && (strcmp(tokens[COMMAND_TOKEN].value, "md") == 0)) {
-        process_mdelete_command(c, tokens, ntokens);
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "mn") == 0)) {
-        out_string(c, "MN");
-        // mn command forces immediate writeback flush.
-        conn_set_state(c, conn_mwrite);
-        return;
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "ma") == 0)) {
-        process_marithmetic_command(c, tokens, ntokens);
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "me") == 0)) {
-        process_meta_command(c, tokens, ntokens);
-        return;
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+        process_quit_command(c);
 
-        process_arithmetic_command(c, tokens, ntokens, 0);
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
 
-    } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
+        process_lru_crawler_command(c, tokens, ntokens);
 
-        process_delete_command(c, tokens, ntokens);
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
 
-    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
-
-        process_touch_command(c, tokens, ntokens);
-
-    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gat") == 0)) {
-
-        process_get_command(c, tokens, ntokens, false, true);
-
-    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gats") == 0)) {
-
-        process_get_command(c, tokens, ntokens, true, true);
-
-    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
-
-        process_stat(c, tokens, ntokens);
-
-    } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
-        time_t exptime = 0;
-        rel_time_t new_oldest = 0;
-
-        set_noreply_maybe(c, tokens, ntokens);
-
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.flush_cmds++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        if (!settings.flush_enabled) {
-            // flush_all is not allowed but we log it on stats
-            out_string(c, "CLIENT_ERROR flush_all not allowed");
-            return;
-        }
-
-        if (ntokens != (c->noreply ? 3 : 2)) {
-            exptime = strtol(tokens[1].value, NULL, 10);
-            if(errno == ERANGE) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-        }
-
-        /*
-          If exptime is zero realtime() would return zero too, and
-          realtime(exptime) - 1 would overflow to the max unsigned
-          value.  So we process exptime == 0 the same way we do when
-          no delay is given at all.
-        */
-        if (exptime > 0) {
-            new_oldest = realtime(exptime);
-        } else { /* exptime == 0 */
-            new_oldest = current_time;
-        }
-
-        if (settings.use_cas) {
-            settings.oldest_live = new_oldest - 1;
-            if (settings.oldest_live <= current_time)
-                settings.oldest_cas = get_cas_id();
-        } else {
-            settings.oldest_live = new_oldest;
-        }
-        out_string(c, "OK");
-        return;
-
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
-
-        out_string(c, "VERSION " VERSION);
-
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
-
-        conn_set_state(c, conn_mwrite);
-        c->close_after_write = true;
-
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
-
-        if (settings.shutdown_command) {
-            conn_set_state(c, conn_closing);
-            raise(SIGINT);
-        } else {
-            out_string(c, "ERROR: shutdown not enabled");
-        }
-
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
-        if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
-            int src, dst, rv;
-
-            if (settings.slab_reassign == false) {
-                out_string(c, "CLIENT_ERROR slab reassignment disabled");
-                return;
-            }
-
-            src = strtol(tokens[2].value, NULL, 10);
-            dst = strtol(tokens[3].value, NULL, 10);
-
-            if (errno == ERANGE) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-
-            rv = slabs_reassign(src, dst);
-            switch (rv) {
-            case REASSIGN_OK:
-                out_string(c, "OK");
-                break;
-            case REASSIGN_RUNNING:
-                out_string(c, "BUSY currently processing reassign request");
-                break;
-            case REASSIGN_BADCLASS:
-                out_string(c, "BADCLASS invalid src or dst class id");
-                break;
-            case REASSIGN_NOSPARE:
-                out_string(c, "NOSPARE source class has no spare pages");
-                break;
-            case REASSIGN_SRC_DST_SAME:
-                out_string(c, "SAME src and dst class are identical");
-                break;
-            }
-            return;
-        } else if (ntokens >= 4 &&
-            (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
-            process_slabs_automove_command(c, tokens, ntokens);
-        } else {
-            out_string(c, "ERROR");
-        }
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
-        if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
-            int rv;
-            if (settings.lru_crawler == false) {
-                out_string(c, "CLIENT_ERROR lru crawler disabled");
-                return;
-            }
-
-            rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
-                    settings.lru_crawler_tocrawl);
-            switch(rv) {
-            case CRAWLER_OK:
-                out_string(c, "OK");
-                break;
-            case CRAWLER_RUNNING:
-                out_string(c, "BUSY currently processing crawler request");
-                break;
-            case CRAWLER_BADCLASS:
-                out_string(c, "BADCLASS invalid class id");
-                break;
-            case CRAWLER_NOTSTARTED:
-                out_string(c, "NOTSTARTED no items to crawl");
-                break;
-            case CRAWLER_ERROR:
-                out_string(c, "ERROR an unknown error happened");
-                break;
-            }
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
-            if (settings.lru_crawler == false) {
-                out_string(c, "CLIENT_ERROR lru crawler disabled");
-                return;
-            }
-            if (!settings.dump_enabled) {
-                out_string(c, "ERROR metadump not allowed");
-                return;
-            }
-            if (resp_has_stack(c)) {
-                out_string(c, "ERROR cannot pipeline other commands before metadump");
-                return;
-            }
-
-            int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
-                    c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
-            switch(rv) {
-                case CRAWLER_OK:
-                    // TODO: documentation says this string is returned, but
-                    // it never was before. We never switch to conn_write so
-                    // this o_s call never worked. Need to talk to users and
-                    // decide if removing the OK from docs is fine.
-                    //out_string(c, "OK");
-                    // TODO: Don't reuse conn_watch here.
-                    conn_set_state(c, conn_watch);
-                    event_del(&c->event);
-                    break;
-                case CRAWLER_RUNNING:
-                    out_string(c, "BUSY currently processing crawler request");
-                    break;
-                case CRAWLER_BADCLASS:
-                    out_string(c, "BADCLASS invalid class id");
-                    break;
-                case CRAWLER_NOTSTARTED:
-                    out_string(c, "NOTSTARTED no items to crawl");
-                    break;
-                case CRAWLER_ERROR:
-                    out_string(c, "ERROR an unknown error happened");
-                    break;
-            }
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
-            uint32_t tocrawl;
-             if (!safe_strtoul(tokens[2].value, &tocrawl)) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-            settings.lru_crawler_tocrawl = tocrawl;
-            out_string(c, "OK");
-            return;
-        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
-            uint32_t tosleep;
-            if (!safe_strtoul(tokens[2].value, &tosleep)) {
-                out_string(c, "CLIENT_ERROR bad command line format");
-                return;
-            }
-            if (tosleep > 1000000) {
-                out_string(c, "CLIENT_ERROR sleep must be one second or less");
-                return;
-            }
-            settings.lru_crawler_sleep = tosleep;
-            out_string(c, "OK");
-            return;
-        } else if (ntokens == 3) {
-            if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
-                if (start_item_crawler_thread() == 0) {
-                    out_string(c, "OK");
-                } else {
-                    out_string(c, "ERROR failed to start lru crawler thread");
-                }
-            } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
-                if (stop_item_crawler_thread(CRAWLER_NOWAIT) == 0) {
-                    out_string(c, "OK");
-                } else {
-                    out_string(c, "ERROR failed to stop lru crawler thread");
-                }
-            } else {
-                out_string(c, "ERROR");
-            }
-            return;
-        } else {
-            out_string(c, "ERROR");
-        }
-    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
-        if (resp_has_stack(c)) {
-            out_string(c, "ERROR cannot pipeline other commands before watch");
-            return;
-        }
         process_watch_command(c, tokens, ntokens);
-    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0)) {
-        process_memlimit_command(c, tokens, ntokens);
-    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
+
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0) {
+        WANT_TOKENS_OR(ntokens, 3, 4);
         process_verbosity_command(c, tokens, ntokens);
-    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
+        WANT_TOKENS_MIN(ntokens, 3);
         process_lru_command(c, tokens, ntokens);
 #ifdef MEMCACHED_DEBUG
     // commands which exist only for testing the memcached's security protection
-    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0)) {
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0) {
         process_misbehave_command(c);
 #endif
 #ifdef EXTSTORE
-    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
+        WANT_TOKENS_MIN(ntokens, 3);
         process_extstore_command(c, tokens, ntokens);
 #endif
 #ifdef TLS
-    } else if (ntokens == 2 && strcmp(tokens[COMMAND_TOKEN].value, "refresh_certs") == 0) {
-        set_noreply_maybe(c, tokens, ntokens);
-        char *errmsg = NULL;
-        if (refresh_certs(&errmsg)) {
-            out_string(c, "OK");
-        } else {
-            write_and_free(c, errmsg, strlen(errmsg));
-        }
-        return;
+    } else if (strcmp(tokens[COMMAND_TOKEN].value, "refresh_certs") == 0) {
+        process_refresh_certs_command(c, tokens, ntokens);
 #endif
     } else {
-        if (ntokens >= 2 && strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
+        if (strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
             conn_set_state(c, conn_closing);
         } else {
             out_string(c, "ERROR");
@@ -6175,8 +6320,9 @@ static int try_read_command_binary(conn *c) {
         // want to refactor a ton of code either. Header is only ever used out
         // of c->binary_header, but the extlen stuff is used for the latter
         // bytes. Just wastes 24 bytes on the stack this way.
-        char extbuf[sizeof(c->binary_header) + BIN_MAX_EXTLEN];
-        memcpy(extbuf + sizeof(c->binary_header), c->rcurr + sizeof(c->binary_header), extlen);
+        char extbuf[sizeof(c->binary_header) + BIN_MAX_EXTLEN+1];
+        memcpy(extbuf + sizeof(c->binary_header), c->rcurr + sizeof(c->binary_header),
+                extlen > BIN_MAX_EXTLEN ? BIN_MAX_EXTLEN : extlen);
         c->rbytes -= sizeof(c->binary_header) + extlen + keylen;
         c->rcurr += sizeof(c->binary_header) + extlen + keylen;
 
@@ -7981,6 +8127,8 @@ static void usage(void) {
            "   - ssl_ca_cert:         PEM format file of acceptable client CA's\n"
            "   - ssl_wbuf_size:       size in kilobytes of per-connection SSL output buffer\n"
            "                          (default: %u)\n", settings.ssl_wbuf_size / (1 << 10));
+    printf("   - ssl_session_cache:   enable server-side SSL session cache, to support session\n"
+           "                          resumption\n");
     verify_default("ssl_keyformat", settings.ssl_keyformat == SSL_FILETYPE_PEM);
     verify_default("ssl_verify_mode", settings.ssl_verify_mode == SSL_VERIFY_NONE);
 #endif
@@ -8636,6 +8784,7 @@ int main (int argc, char **argv) {
         SSL_CIPHERS,
         SSL_CA_CERT,
         SSL_WBUF_SIZE,
+        SSL_SESSION_CACHE,
 #endif
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
@@ -8704,6 +8853,7 @@ int main (int argc, char **argv) {
         [SSL_CIPHERS] = "ssl_ciphers",
         [SSL_CA_CERT] = "ssl_ca_cert",
         [SSL_WBUF_SIZE] = "ssl_wbuf_size",
+        [SSL_SESSION_CACHE] = "ssl_session_cache",
 #endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
@@ -8770,7 +8920,7 @@ int main (int argc, char **argv) {
 
     char *shortopts =
           "a:"  /* access mask for unix socket */
-          "A"  /* enable admin shutdown command */
+          "A"   /* enable admin shutdown command */
           "Z"   /* enable SSL */
           "p:"  /* TCP port number to listen on */
           "s:"  /* unix socket path to listen on */
@@ -9374,6 +9524,9 @@ int main (int argc, char **argv) {
                     return 1;
                 }
                 settings.ssl_wbuf_size *= 1024; /* kilobytes */
+                break;
+            case SSL_SESSION_CACHE:
+                settings.ssl_session_cache = true;
                 break;
 #endif
 #ifdef EXTSTORE
@@ -10125,13 +10278,6 @@ int main (int argc, char **argv) {
 
     fprintf(stderr, "Gracefully stopping\n");
     stop_threads();
-    int i;
-    // FIXME: make a function callable from threads.c
-    for (i = 0; i < max_fds; i++) {
-        if (conns[i] && conns[i]->state != conn_closed) {
-            conn_close(conns[i]);
-        }
-    }
     if (memory_file != NULL) {
         restart_mmap_close();
     }

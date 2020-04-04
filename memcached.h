@@ -358,6 +358,7 @@ struct stats {
 #endif
 #ifdef TLS
     uint64_t      ssl_handshake_errors; /* TLS failures at accept/handshake time */
+    uint64_t      ssl_new_sessions; /* successfully negotiated new (non-reused) TLS sessions */
 #endif
     struct timeval maxconns_entered;  /* last time maxconns entered */
 };
@@ -473,6 +474,7 @@ struct settings {
     char *ssl_ca_cert; /* certificate with CAs. */
     rel_time_t ssl_last_cert_refresh_time; /* time of the last server certificate refresh */
     unsigned int ssl_wbuf_size; /* size of the write buffer used by ssl_sendmsg method */
+    bool ssl_session_cache; /* enable SSL server session caching */
 #endif
 };
 
@@ -820,9 +822,8 @@ enum delta_result_type add_delta(conn *c, const char *key,
                                  const int64_t delta, char *buf,
                                  uint64_t *cas);
 void accept_new_conns(const bool do_accept);
-conn *conn_from_freelist(void);
-bool  conn_add_to_freelist(conn *c);
 void  conn_close_idle(conn *c);
+void  conn_close_all(void);
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
 #define DO_UPDATE true
 #define DONT_UPDATE false
