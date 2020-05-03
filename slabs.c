@@ -279,7 +279,10 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
     {
         char *t_initial_malloc = getenv("T_MEMD_INITIAL_MALLOC");
         if (t_initial_malloc) {
-            mem_malloced = (size_t)atol(t_initial_malloc);
+            int64_t env_malloced;
+            if (safe_strtoll((const char *)t_initial_malloc, &env_malloced)) {
+                mem_malloced = (size_t)env_malloced;
+            }
         }
 
     }
@@ -453,6 +456,8 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
     it->prev = 0;
     // header object's original classid is stored in chunk.
     p = &slabclass[chunk->orig_clsid];
+    // original class id needs to be set on free memory.
+    it->slabs_clsid = chunk->orig_clsid;
     if (chunk->next) {
         chunk = chunk->next;
         chunk->prev = 0;

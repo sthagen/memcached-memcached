@@ -16,6 +16,7 @@
 #include <string.h>
 #include <assert.h>
 #include "extstore.h"
+#include "config.h"
 
 // TODO: better if an init option turns this on/off.
 #ifdef EXTSTORE_DEBUG
@@ -114,7 +115,7 @@ static _store_wbuf *wbuf_new(size_t size) {
     _store_wbuf *b = calloc(1, sizeof(_store_wbuf));
     if (b == NULL)
         return NULL;
-    b->buf = malloc(size);
+    b->buf = calloc(size, sizeof(char));
     if (b->buf == NULL) {
         free(b);
         return NULL;
@@ -773,8 +774,10 @@ static void *extstore_io_thread(void *arg) {
                     }
                     pthread_mutex_unlock(&p->mutex);
                     if (do_op) {
-#ifdef __APPLE__
-                        ret = lseek(p->fd, SEEK_SET, p->offset + cur_io->offset);
+#if !defined(HAVE_PREAD) || !defined(HAVE_PREADV)
+                        // TODO: lseek offset is natively 64-bit on OS X, but
+                        // perhaps not on all platforms? Else use lseek64()
+                        ret = lseek(p->fd, p->offset + cur_io->offset, SEEK_SET);
                         if (ret >= 0) {
                             if (cur_io->iov == NULL) {
                                 ret = read(p->fd, cur_io->buf, cur_io->len);

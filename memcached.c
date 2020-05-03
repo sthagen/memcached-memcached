@@ -103,7 +103,7 @@ static bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void 
 static void settings_init(void);
 
 /* event handling, network IO */
-static void event_handler(const int fd, const short which, void *arg);
+static void event_handler(const evutil_socket_t fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
 static bool update_event(conn *c, const int new_flags);
@@ -183,7 +183,7 @@ static enum transmit_result transmit(conn *c);
 static volatile bool allow_new_conns = true;
 static bool stop_main_loop = false;
 static struct event maxconnsevent;
-static void maxconns_handler(const int fd, const short which, void *arg) {
+static void maxconns_handler(const evutil_socket_t fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
 
     if (fd == -42 || allow_new_conns == false) {
@@ -3371,7 +3371,6 @@ static inline void get_conn_text(const conn *c, const int af,
     addr_text[0] = '\0';
     const char *protoname = "?";
     unsigned short port = 0;
-    size_t pathlen = 0;
 
     switch (af) {
         case AF_INET:
@@ -3396,7 +3395,10 @@ static inline void get_conn_text(const conn *c, const int af,
             protoname = IS_UDP(c->transport) ? "udp6" : "tcp6";
             break;
 
+#ifndef DISABLE_UNIX_SOCKET
         case AF_UNIX:
+        {
+            size_t pathlen = 0;
             // this strncpy call originally could piss off an address
             // sanitizer; we supplied the size of the dest buf as a limiter,
             // but optimized versions of strncpy could read past the end of
@@ -3419,7 +3421,9 @@ static inline void get_conn_text(const conn *c, const int af,
                     pathlen);
             addr_text[pathlen] = '\0';
             protoname = "unix";
+        }
             break;
+#endif /* #ifndef DISABLE_UNIX_SOCKET */
     }
 
     if (strlen(addr_text) < 2) {
@@ -6337,13 +6341,6 @@ static int try_read_command_asciiauth(conn *c) {
     size_t ntokens;
     char *cont = NULL;
 
-    if (!c->resp) {
-        if (!resp_start(c)) {
-            conn_set_state(c, conn_closing);
-            return 1;
-        }
-    }
-
     // TODO: move to another function.
     if (!c->sasl_started) {
         char *el;
@@ -6380,6 +6377,12 @@ static int try_read_command_asciiauth(conn *c) {
         if (ntokens < 6
                 || strcmp(tokens[0].value, "set") != 0
                 || !safe_strtoul(tokens[4].value, &size)) {
+            if (!c->resp) {
+                if (!resp_start(c)) {
+                    conn_set_state(c, conn_closing);
+                    return 1;
+                }
+            }
             out_string(c, "CLIENT_ERROR unauthenticated");
             return 1;
         }
@@ -6394,6 +6397,14 @@ static int try_read_command_asciiauth(conn *c) {
     if (c->rbytes < c->rlbytes) {
         // need more bytes.
         return 0;
+    }
+
+    // Going to respond at this point, so attach a response object.
+    if (!c->resp) {
+        if (!resp_start(c)) {
+            conn_set_state(c, conn_closing);
+            return 1;
+        }
     }
 
     cont = c->rcurr;
@@ -7361,9 +7372,9 @@ static void drive_machine(conn *c) {
             if (settings.verbose > 0) {
                 fprintf(stderr, "Failed to read, and not due to blocking:\n"
                         "errno: %d %s \n"
-                        "rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\n",
+                        "rcurr=%p ritem=%p rbuf=%p rlbytes=%d rsize=%d\n",
                         errno, strerror(errno),
-                        (long)c->rcurr, (long)c->ritem, (long)c->rbuf,
+                        (void *)c->rcurr, (void *)c->ritem, (void *)c->rbuf,
                         (int)c->rlbytes, (int)c->rsize);
             }
             conn_set_state(c, conn_closing);
@@ -7485,7 +7496,7 @@ static void drive_machine(conn *c) {
     return;
 }
 
-void event_handler(const int fd, const short which, void *arg) {
+void event_handler(const evutil_socket_t fd, const short which, void *arg) {
     conn *c;
 
     c = (conn *)arg;
@@ -7535,7 +7546,11 @@ static void maximize_sndbuf(const int sfd) {
     int old_size;
 
     /* Start with the default size. */
+#ifdef _WIN32
+    if (getsockopt((SOCKET)sfd, SOL_SOCKET, SO_SNDBUF, (char *)&old_size, &intsize) != 0) {
+#else
     if (getsockopt(sfd, SOL_SOCKET, SO_SNDBUF, &old_size, &intsize) != 0) {
+#endif /* #ifdef _WIN32 */
         if (settings.verbose > 0)
             perror("getsockopt(SO_SNDBUF)");
         return;
@@ -7812,6 +7827,7 @@ static int server_sockets(int port, enum network_transport transport,
     }
 }
 
+#ifndef DISABLE_UNIX_SOCKET
 static int new_socket_unix(void) {
     int sfd;
     int flags;
@@ -7889,6 +7905,9 @@ static int server_socket_unix(const char *path, int access_mask) {
 
     return 0;
 }
+#else
+#define server_socket_unix(path, access_mask)   -1
+#endif /* #ifndef DISABLE_UNIX_SOCKET */
 
 /*
  * We keep the current time of day in a global variable that's updated by a
@@ -7909,7 +7928,7 @@ static int64_t monotonic_start;
  * from jitter, simply ticking our internal timer here is accurate enough.
  * Note that users who are setting explicit dates for expiration times *must*
  * ensure their clocks are correct before starting memcached. */
-static void clock_handler(const int fd, const short which, void *arg) {
+static void clock_handler(const evutil_socket_t fd, const short which, void *arg) {
     struct timeval t = {.tv_sec = 1, .tv_usec = 0};
     static bool initialized = false;
 
@@ -7966,16 +7985,20 @@ static void verify_default(const char* param, bool condition) {
 static void usage(void) {
     printf(PACKAGE " " VERSION "\n");
     printf("-p, --port=<num>          TCP port to listen on (default: %d)\n"
-           "-U, --udp-port=<num>      UDP port to listen on (default: %d, off)\n"
-           "-s, --unix-socket=<file>  UNIX socket to listen on (disables network support)\n"
-           "-A, --enable-shutdown     enable ascii \"shutdown\" command\n"
-           "-a, --unix-mask=<mask>    access mask for UNIX socket, in octal (default: %o)\n"
-           "-l, --listen=<addr>       interface to listen on (default: INADDR_ANY)\n"
+           "-U, --udp-port=<num>      UDP port to listen on (default: %d, off)\n",
+           settings.port, settings.udpport);
+#ifndef DISABLE_UNIX_SOCKET
+    printf("-s, --unix-socket=<file>  UNIX socket to listen on (disables network support)\n");
+    printf("-a, --unix-mask=<mask>    access mask for UNIX socket, in octal (default: %o)\n",
+            settings.access);
+#endif /* #ifndef DISABLE_UNIX_SOCKET */
+    printf("-A, --enable-shutdown     enable ascii \"shutdown\" command\n");
+    printf("-l, --listen=<addr>       interface to listen on (default: INADDR_ANY)\n");
 #ifdef TLS
-           "                          if TLS/SSL is enabled, 'notls' prefix can be used to\n"
-           "                          disable for specific listeners (-l notls:<ip>:<port>) \n"
+    printf("                          if TLS/SSL is enabled, 'notls' prefix can be used to\n"
+           "                          disable for specific listeners (-l notls:<ip>:<port>) \n");
 #endif
-           "-d, --daemon              run as a daemon\n"
+    printf("-d, --daemon              run as a daemon\n"
            "-r, --enable-coredumps    maximize core file limit\n"
            "-u, --user=<user>         assume identity of <username> (only when run as root)\n"
            "-m, --memory-limit=<num>  item memory in megabytes (default: %lu)\n"
@@ -7991,7 +8014,7 @@ static void usage(void) {
            "-P, --pidfile=<file>      save PID in <file>, only used with -d option\n"
            "-f, --slab-growth-factor=<num> chunk size growth factor (default: %2.2f)\n"
            "-n, --slab-min-size=<bytes> min space used for key+value+flags (default: %d)\n",
-           settings.port, settings.udpport, settings.access, (unsigned long) settings.maxbytes / (1 << 20),
+           (unsigned long) settings.maxbytes / (1 << 20),
            settings.maxconns, settings.factor, settings.chunk_size);
     verify_default("udp-port",settings.udpport == 0);
     printf("-L, --enable-largepages  try to use large memory pages (if available)\n");
@@ -9016,8 +9039,13 @@ int main (int argc, char **argv) {
 #endif
             break;
         case 'a':
+#ifndef DISABLE_UNIX_SOCKET
             /* access for unix domain socket, as octal mask (like chmod)*/
             settings.access= strtol(optarg,NULL,8);
+#else
+            fprintf(stderr, "This server is not built with unix socket support.\n");
+            exit(EX_USAGE);
+#endif /* #ifndef DISABLE_UNIX_SOCKET */
             break;
         case 'U':
             settings.udpport = atoi(optarg);
@@ -9028,7 +9056,12 @@ int main (int argc, char **argv) {
             tcp_specified = true;
             break;
         case 's':
+#ifndef DISABLE_UNIX_SOCKET
             settings.socketpath = optarg;
+#else
+            fprintf(stderr, "This server is not built with unix socket support.\n");
+            exit(EX_USAGE);
+#endif /* #ifndef DISABLE_UNIX_SOCKET */
             break;
         case 'm':
             settings.maxbytes = ((size_t)atoi(optarg)) * 1024 * 1024;
