@@ -75,15 +75,16 @@ AS_IF([test "$ICC" = "yes" -o "$GCC" = "yes"],
     AS_IF(test "$CLANG" = "no",[CFLAGS="$CFLAGS -pthread"])
 ])
 
+dnl clang will error .arch_extension crc32 assembler directives to allow
+dnl assembling crc instructions without this
+AS_IF(test "$CLANG" = "yes",[CFLAGS="$CFLAGS -Wno-language-extension-token"])
+
 if test "$ICC" = "no"; then
    AC_PROG_CC_C99
 fi
 
 AM_PROG_CC_C_O
 AC_PROG_INSTALL
-
-AC_ARG_ENABLE(arm_crc32,
-  [AS_HELP_STRING([--enable-arm-crc32], [Enable ARMv8 CRC32 instructions])])
 
 AC_ARG_ENABLE(extstore,
   [AS_HELP_STRING([--disable-extstore], [Disable external storage (extstore)])])
@@ -202,10 +203,6 @@ fi
 
 if test "x$enable_tls" = "xyes"; then
     AC_DEFINE([TLS],1,[Set to nonzero if you want to enable TLS])
-fi
-
-if test "x$enable_arm_crc32" = "xyes"; then
-    AC_DEFINE([ARM_CRC32],1,[Set to nonzero if you want to enable ARMv8 crc32])
 fi
 
 if test "x$enable_asan" = "xyes"; then
@@ -390,6 +387,22 @@ if test $ac_cv_libevent_dir != "(system)"; then
     CPPFLAGS="-I$ac_cv_libevent_dir $CPPFLAGS"
   fi
 fi
+
+AC_RUN_IFELSE(
+   [AC_LANG_PROGRAM([
+#include <event.h>
+   ], [dnl
+const char *ver = event_get_version();
+return (ver != NULL && *ver != '1') ? 0 : 1;
+   ])
+   ],[
+     AC_DEFINE(HAVE_LIBEVENT_NEW, 1, [linked to libevent])
+   ],
+   [
+     AC_MSG_ERROR([libevent2 is required])
+   ],
+   []
+[])
 
 trylibssldir=""
 AC_ARG_WITH(libssl,
@@ -628,7 +641,6 @@ AC_CHECK_FUNCS(mlockall)
 AC_CHECK_FUNCS(getpagesizes)
 AC_CHECK_FUNCS(sysconf)
 AC_CHECK_FUNCS(memcntl)
-AC_CHECK_FUNCS(sigignore)
 AC_CHECK_FUNCS(clock_gettime)
 AC_CHECK_FUNCS(preadv)
 AC_CHECK_FUNCS(pread)
@@ -777,7 +789,7 @@ if test "$ICC" = "yes"
 then
    dnl ICC trying to be gcc.
    CFLAGS="$CFLAGS -diag-disable 187 -Wall -Werror"
-   AC_DEFINE([_GNU_SOURCE],[1],[find sigignore on Linux])
+   AC_DEFINE([_GNU_SOURCE],[1],[make sure IOV_MAX is defined])
 elif test "$GCC" = "yes"
 then
   GCC_VERSION=`$CC -dumpversion`
@@ -790,7 +802,7 @@ then
     CFLAGS="$CFLAGS -fno-strict-aliasing"
     ;;
   esac
-  AC_DEFINE([_GNU_SOURCE],[1],[find sigignore on Linux])
+  AC_DEFINE([_GNU_SOURCE],[1],[make sure IOV_MAX is defined])
 elif test "$SUNCC" = "yes"
 then
   CFLAGS="$CFLAGS -errfmt=error -errwarn -errshort=tags"

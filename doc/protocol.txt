@@ -897,6 +897,8 @@ Meta No-Op
 The meta no-op command exists solely to return a static response code. It
 takes no flags, no arguments.
 
+"mn\r\n"
+
 This returns the static response:
 
 "MN\r\n"
@@ -1069,12 +1071,17 @@ The response line could be one of:
 
 - "BADCLASS [message]" to indicate an invalid class was specified.
 
-lru_crawler metadump <classid,classid,classid|all>
+lru_crawler metadump <classid,classid,classid|all|hash>
 
 - Similar in function to the above "lru_crawler crawl" command, this function
   outputs one line for every valid item found in the matching slab classes.
   Similar to "cachedump", but does not lock the cache and can return all
   items, not just 1MB worth.
+
+  if "hash" is specified instead of a classid or "all", the crawler will dump
+  items by directly walking the hash table instead of the LRU's. This makes it
+  more likely all items will be visited once as LRU reordering and locking can
+  cause frequently accessed items to be missed.
 
   Lines are in "key=value key2=value2" format, with value being URI encoded
   (ie: %20 for a space).
@@ -1200,12 +1207,13 @@ integers separated by a colon (treat this as a floating point number).
 | rejected_connections  | 64u     | Conns rejected in maxconns_fast mode      |
 | connection_structures | 32u     | Number of connection structures allocated |
 |                       |         | by the server                             |
-| response_obj_bytes    | 64u     | Number of bytes used for response objects |
-| response_obj_total    | 64u     | Total nummber of response objects         |
-| response_obj_free     | 64u     | Current free cached response objects      |
 | response_obj_oom      | 64u     | Connections closed by lack of memory      |
-| read_buf_bytes        | 64u     | Total read buffer bytes allocated         |
-| read_buf_bytes_free   | 64u     | Total read buffer bytes cached for reuse  |
+| response_obj_count    | 64u     | Total response objects in use             |
+| response_obj_bytes    | 64u     | Total bytes used for resp. objects. is a  |
+|                       |         | subset of bytes from read_buf_bytes.      |
+| read_buf_count        | 64u     | Total read/resp buffers allocated         |
+| read_buf_bytes        | 64u     | Total read/resp buffer bytes allocated    |
+| read_buf_bytes_free   | 64u     | Total read/resp buffer bytes cached       |
 | read_buf_oom          | 64u     | Connections closed by lack of memory      |
 | reserved_fds          | 32u     | Number of misc fds used internally        |
 | cmd_get               | 64u     | Cumulative number of retrieval reqs       |
@@ -1307,6 +1315,11 @@ integers separated by a colon (treat this as a floating point number).
 | log_worker_written    | 64u     | Logs written by a worker, to be picked up |
 | log_watcher_skipped   | 64u     | Logs not sent to slow watchers.           |
 | log_watcher_sent      | 64u     | Logs written to watchers.                 |
+| unexected_napi_ids    | 64u     | Number of times an unexpected napi id is  |
+|                       |         | is received. See doc/napi_ids.txt         |
+| round_robin_fallback  | 64u     | Number of times napi id of 0 is received  |
+|                       |         | resulting in fallback to round robin      |
+|                       |         | thread selection. See doc/napi_ids.txt    |
 |-----------------------+---------+-------------------------------------------|
 
 Settings statistics
@@ -1374,14 +1387,14 @@ other stats command.
 |                   |          | per active watcher connected.                |
 | worker_logbuf_size| 32u      | Size of internal per-worker-thread buffer    |
 |                   |          | which the background thread reads from.      |
-| resp_obj_mem_limit| 32u      | Megabyte limit for conn. response objects.   |
-| read_obj_mem_limit| 32u      | Megabyte limit for conn. read buffers.       |
+| read_obj_mem_limit| 32u      | Megabyte limit for conn. read/resp buffers.  |
 | track_sizes       | bool     | If yes, a "stats sizes" histogram is being   |
 |                   |          | dynamically tracked.                         |
 | inline_ascii_response                                                       |
 |                   | bool     | Does nothing as of 1.5.15                    |
 | drop_privileges   | bool     | If yes, and available, drop unused syscalls  |
 |                   |          | (see seccomp on Linux, pledge on OpenBSD)    |
+| memory_file       | char     | Warm restart memory file path, if enabled    |
 |-------------------+----------+----------------------------------------------|
 
 
@@ -1681,6 +1694,12 @@ be released back to the OS asynchronously.
 
 The argument is in megabytes, not bytes. Input gets multiplied out into
 megabytes internally.
+
+"shutdown" is a command with an optional argument used to stop memcached with
+a kill signal. By default, "shutdown" alone raises SIGINT, though "graceful"
+may be specified as the single argument to instead trigger a graceful shutdown
+with SIGUSR1. The shutdown command is disabled by default, and can be enabled
+with the -A/--enable-shutdown flag.
 
 "version" is a command with no arguments:
 

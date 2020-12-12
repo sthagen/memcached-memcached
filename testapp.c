@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "cache.h"
+#include "crc32c.h"
 #include "hash.h"
 #include "jenkins_hash.h"
 #include "stats_prefix.h"
@@ -165,6 +166,9 @@ static enum test_return cache_reuse_test(void)
     int ii;
     cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
                                   NULL, NULL);
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
     char *ptr = cache_alloc(cache);
     cache_free(cache, ptr);
     for (ii = 0; ii < 100; ++ii) {
@@ -181,6 +185,9 @@ static enum test_return cache_bulkalloc(size_t datasize)
 {
     cache_t *cache = cache_create("test", datasize, sizeof(char*),
                                   NULL, NULL);
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
 #define ITERATIONS 1024
     void *ptr[ITERATIONS];
 
@@ -215,6 +222,9 @@ static enum test_return cache_redzone_test(void)
     cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
                                   NULL, NULL);
 
+    if (cache == NULL) {
+        return TEST_FAIL;
+    }
     /* Ignore SIGABRT */
     struct sigaction old_action;
     struct sigaction action = { .sa_handler = SIG_IGN, .sa_flags = 0};
@@ -242,6 +252,34 @@ static enum test_return cache_redzone_test(void)
 #else
     return TEST_SKIP;
 #endif
+}
+
+static enum test_return cache_limit_revised_downward_test(void)
+{
+    int limit = 10, allocated_num = limit + 1, i;
+    char ** alloc_objs = calloc(allocated_num, sizeof(char *));
+
+    cache_t *cache = cache_create("test", sizeof(uint32_t), sizeof(char*),
+                                  NULL, NULL);
+    assert(cache != NULL);
+
+    /* cache->limit is 0 and we can allocate limit+1 items */
+    for (i = 0; i < allocated_num; i++) {
+        alloc_objs[i] = cache_alloc(cache);
+        assert(alloc_objs[i] != NULL);
+    }
+    assert(cache->total == allocated_num);
+
+    /* revised downward cache->limit */
+    cache_set_limit(cache, limit);
+
+    /* If we free one item, the cache->total should decreased by one*/
+    cache_free(cache, alloc_objs[0]);
+
+    assert(cache->total == allocated_num-1);
+    cache_destroy(cache);
+
+    return TEST_PASS;
 }
 
 static enum test_return test_stats_prefix_find(void) {
@@ -273,6 +311,9 @@ static enum test_return test_stats_prefix_record_get(void) {
 
     stats_prefix_record_get("abc:123", 7, false);
     pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
     assert(1 == pfs->num_gets);
     assert(0 == pfs->num_hits);
     stats_prefix_record_get("abc:456", 7, false);
@@ -293,6 +334,9 @@ static enum test_return test_stats_prefix_record_delete(void) {
 
     stats_prefix_record_delete("abc:123", 7);
     pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
     assert(0 == pfs->num_gets);
     assert(0 == pfs->num_hits);
     assert(1 == pfs->num_deletes);
@@ -308,6 +352,9 @@ static enum test_return test_stats_prefix_record_set(void) {
 
     stats_prefix_record_set("abc:123", 7);
     pfs = stats_prefix_find("abc:123", 7);
+    if (pfs == NULL) {
+        return TEST_FAIL;
+    }
     assert(0 == pfs->num_gets);
     assert(0 == pfs->num_hits);
     assert(0 == pfs->num_deletes);
@@ -519,7 +566,6 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
 
     pid_t pid = fork();
     assert(pid != -1);
-
     if (pid == 0) {
         /* Child */
         char *argv[24];
@@ -574,8 +620,16 @@ static pid_t start_server(in_port_t *port_out, bool daemon, int timeout) {
     }
 
     /* Yeah just let us "busy-wait" for the file to be created ;-) */
-    while (access(filename, F_OK) == -1) {
-        usleep(10);
+    useconds_t wait_timeout = 1000000 * 10;
+    useconds_t wait = 1000;
+    while (access(filename, F_OK) == -1 && wait_timeout > 0) {
+        usleep(wait);
+        wait_timeout -= (wait > wait_timeout ? wait_timeout : wait);
+    }
+
+    if (access(filename, F_OK) == -1) {
+        fprintf(stderr, "Failed to start the memcached server.\n");
+        assert(false);
     }
 
     FILE *fp = fopen(filename, "r");
@@ -842,6 +896,34 @@ static enum test_return test_issue_92(void) {
     close_conn();
     con = connect_server("127.0.0.1", port, false, enable_ssl);
     assert(con);
+    return TEST_PASS;
+}
+
+static enum test_return test_crc32c(void) {
+    uint32_t crc_hw, crc_sw;
+
+    char buffer[256];
+    for (int x = 0; x < 256; x++)
+        buffer[x] = x;
+
+    /* Compare harware to software implementaiton */
+    crc_hw = crc32c(0, buffer, 256);
+    crc_sw = crc32c_sw(0, buffer, 256);
+    assert(crc_hw == 0x9c44184b);
+    assert(crc_sw == 0x9c44184b);
+
+    /* Test that passing a CRC in also works */
+    crc_hw = crc32c(crc_hw, buffer, 256);
+    crc_sw = crc32c_sw(crc_sw, buffer, 256);
+    assert(crc_hw == 0xae10ee5a);
+    assert(crc_sw == 0xae10ee5a);
+
+    /* Test odd offsets/sizes */
+    crc_hw = crc32c(crc_hw, buffer + 1, 256 - 2);
+    crc_sw = crc32c_sw(crc_sw, buffer + 1, 256 - 2);
+    assert(crc_hw == 0xed37b906);
+    assert(crc_sw == 0xed37b906);
+
     return TEST_PASS;
 }
 
@@ -2230,6 +2312,7 @@ struct testcase testcases[] = {
     { "cache_destructor", cache_destructor_test },
     { "cache_reuse", cache_reuse_test },
     { "cache_redzone", cache_redzone_test },
+    { "cache_limit_revised_downward", cache_limit_revised_downward_test },
     { "stats_prefix_find", test_stats_prefix_find },
     { "stats_prefix_record_get", test_stats_prefix_record_get },
     { "stats_prefix_record_delete", test_stats_prefix_record_delete },
@@ -2243,6 +2326,7 @@ struct testcase testcases[] = {
     { "issue_44", test_issue_44 },
     { "vperror", test_vperror },
     { "issue_101", test_issue_101 },
+    { "crc32c", test_crc32c },
     /* The following tests all run towards the same server */
     { "start_server", start_memcached_server },
     { "issue_92", test_issue_92 },
@@ -2308,6 +2392,8 @@ int main(int argc, char **argv)
        the definition of settings struct from memcached.h */
     hash = jenkins_hash;
     stats_prefix_init(':');
+
+    crc32c_init();
 
     for (num_cases = 0; testcases[num_cases].description; num_cases++) {
         /* Just counting */

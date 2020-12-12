@@ -226,12 +226,16 @@ void stop_threads(void) {
     stop_item_crawler_thread(CRAWLER_WAIT);
     if (settings.verbose > 0)
         fprintf(stderr, "stopped lru crawler\n");
-    stop_lru_maintainer_thread();
-    if (settings.verbose > 0)
-        fprintf(stderr, "stopped maintainer\n");
-    stop_slab_maintenance_thread();
-    if (settings.verbose > 0)
-        fprintf(stderr, "stopped slab mover\n");
+    if (settings.lru_maintainer_thread) {
+        stop_lru_maintainer_thread();
+        if (settings.verbose > 0)
+            fprintf(stderr, "stopped maintainer\n");
+    }
+    if (settings.slab_reassign) {
+        stop_slab_maintenance_thread();
+        if (settings.verbose > 0)
+            fprintf(stderr, "stopped slab mover\n");
+    }
     logger_stop();
     if (settings.verbose > 0)
         fprintf(stderr, "stopped logger thread\n");
@@ -420,28 +424,13 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         exit(EXIT_FAILURE);
     }
 
-    me->resp_cache = cache_create("resp", sizeof(mc_resp), sizeof(char *), NULL, NULL);
-    if (me->resp_cache == NULL) {
-        fprintf(stderr, "Failed to create response cache\n");
-        exit(EXIT_FAILURE);
-    }
-    // Note: we were cleanly passing in num_threads before, but this now
-    // relies on settings globals too much.
-    if (settings.resp_obj_mem_limit) {
-        int limit = settings.resp_obj_mem_limit / settings.num_threads;
-        if (limit < sizeof(mc_resp)) {
-            limit = 1;
-        } else {
-            limit = limit / sizeof(mc_resp);
-        }
-        cache_set_limit(me->resp_cache, limit);
-    }
-
     me->rbuf_cache = cache_create("rbuf", READ_BUFFER_SIZE, sizeof(char *), NULL, NULL);
     if (me->rbuf_cache == NULL) {
         fprintf(stderr, "Failed to create read buffer cache\n");
         exit(EXIT_FAILURE);
     }
+    // Note: we were cleanly passing in num_threads before, but this now
+    // relies on settings globals too much.
     if (settings.read_buf_mem_limit) {
         int limit = settings.read_buf_mem_limit / settings.num_threads;
         if (limit < READ_BUFFER_SIZE) {
@@ -452,13 +441,11 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         cache_set_limit(me->rbuf_cache, limit);
     }
 
-#ifdef EXTSTORE
-    me->io_cache = cache_create("io", sizeof(io_wrap), sizeof(char*), NULL, NULL);
+    me->io_cache = cache_create("io", sizeof(io_pending_t), sizeof(char*), NULL, NULL);
     if (me->io_cache == NULL) {
         fprintf(stderr, "Failed to create IO object cache\n");
         exit(EXIT_FAILURE);
     }
-#endif
 #ifdef TLS
     if (settings.ssl_enabled) {
         me->ssl_wbuf = (char *)malloc((size_t)settings.ssl_wbuf_size);
@@ -549,6 +536,14 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
                     }
                 } else {
                     c->thread = me;
+#ifdef EXTSTORE
+                    if (c->thread->storage) {
+                        conn_io_queue_add(c, IO_QUEUE_EXTSTORE, c->thread->storage,
+                            storage_submit_cb, storage_complete_cb, storage_finalize_cb);
+                    }
+#endif
+                    conn_io_queue_add(c, IO_QUEUE_NONE, NULL, NULL, NULL, NULL);
+
 #ifdef TLS
                     if (settings.ssl_enabled && c->ssl != NULL) {
                         assert(c->thread && c->thread->ssl_wbuf);
@@ -592,6 +587,77 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
 /* Which thread we assigned a connection to most recently. */
 static int last_thread = -1;
 
+/* Last thread we assigned to a connection based on napi_id */
+static int last_thread_by_napi_id = -1;
+
+static LIBEVENT_THREAD *select_thread_round_robin(void)
+{
+    int tid = (last_thread + 1) % settings.num_threads;
+
+    last_thread = tid;
+
+    return threads + tid;
+}
+
+static void reset_threads_napi_id(void)
+{
+    LIBEVENT_THREAD *thread;
+    int i;
+
+    for (i = 0; i < settings.num_threads; i++) {
+         thread = threads + i;
+         thread->napi_id = 0;
+    }
+
+    last_thread_by_napi_id = -1;
+}
+
+/* Select a worker thread based on the NAPI ID of an incoming connection
+ * request. NAPI ID is a globally unique ID that identifies a NIC RX queue
+ * on which a flow is received.
+ */
+static LIBEVENT_THREAD *select_thread_by_napi_id(int sfd)
+{
+    LIBEVENT_THREAD *thread;
+    int napi_id, err, i;
+    socklen_t len;
+    int tid = -1;
+
+    len = sizeof(socklen_t);
+    err = getsockopt(sfd, SOL_SOCKET, SO_INCOMING_NAPI_ID, &napi_id, &len);
+    if ((err == -1) || (napi_id == 0)) {
+        STATS_LOCK();
+        stats.round_robin_fallback++;
+        STATS_UNLOCK();
+        return select_thread_round_robin();
+    }
+
+select:
+    for (i = 0; i < settings.num_threads; i++) {
+         thread = threads + i;
+         if (last_thread_by_napi_id < i) {
+             thread->napi_id = napi_id;
+             last_thread_by_napi_id = i;
+             tid = i;
+             break;
+         }
+         if (thread->napi_id == napi_id) {
+             tid = i;
+             break;
+         }
+    }
+
+    if (tid == -1) {
+        STATS_LOCK();
+        stats.unexpected_napi_ids++;
+        STATS_UNLOCK();
+        reset_threads_napi_id();
+        goto select;
+    }
+
+    return threads + tid;
+}
+
 /*
  * Dispatches a new connection to another thread. This is only ever called
  * from the main thread, either during initialization (for UDP) or because
@@ -608,11 +674,12 @@ void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
         return;
     }
 
-    int tid = (last_thread + 1) % settings.num_threads;
+    LIBEVENT_THREAD *thread;
 
-    LIBEVENT_THREAD *thread = threads + tid;
-
-    last_thread = tid;
+    if (!settings.num_napi_ids)
+        thread = select_thread_round_robin();
+    else
+        thread = select_thread_by_napi_id(sfd);
 
     item->sfd = sfd;
     item->init_state = init_state;
@@ -843,9 +910,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
                 threads[ii].stats.lru_hits[sid];
         }
 
-        stats->response_obj_bytes += threads[ii].resp_cache->total * sizeof(mc_resp);
-        stats->response_obj_total += threads[ii].resp_cache->total;
-        stats->response_obj_free += threads[ii].resp_cache->freecurr;
+        stats->read_buf_count += threads[ii].rbuf_cache->total;
         stats->read_buf_bytes += threads[ii].rbuf_cache->total * READ_BUFFER_SIZE;
         stats->read_buf_bytes_free += threads[ii].rbuf_cache->freecurr * READ_BUFFER_SIZE;
         pthread_mutex_unlock(&threads[ii].stats.mutex);

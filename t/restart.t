@@ -24,6 +24,12 @@ my $mem_path = "/tmp/mc_restart.$$";
 my $server = new_memcached("-m 128 -e $mem_path -I 2m");
 my $sock = $server->sock;
 
+diag "restart basic stats";
+{
+    my $stats = mem_stats($server->sock, ' settings');
+    is($stats->{memory_file}, $mem_path);
+}
+
 diag "Set some values, various sizes.";
 {
     my $cur = 2;
@@ -90,7 +96,7 @@ my $deleted_chunked_item = 0;
 
 diag "Data that should expire while stopped.";
 {
-    print $sock "set low1 0 8 2\r\nbo\r\n";
+    print $sock "set low1 0 5 2\r\nbo\r\n";
     like(scalar <$sock>, qr/STORED/, "stored low ttl item");
     # This one should stay.
     print $sock "set low2 0 20 2\r\nmo\r\n";
