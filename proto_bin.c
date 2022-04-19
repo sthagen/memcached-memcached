@@ -110,7 +110,10 @@ int try_read_command_binary(conn *c) {
         // want to refactor a ton of code either. Header is only ever used out
         // of c->binary_header, but the extlen stuff is used for the latter
         // bytes. Just wastes 24 bytes on the stack this way.
-        char extbuf[sizeof(c->binary_header) + BIN_MAX_EXTLEN+1];
+
+        // +4 need to be here because extbuf is used for protocol_binary_request_incr
+        // and its member message is alligned to 48 bytes intead of 44
+        char extbuf[sizeof(c->binary_header) + BIN_MAX_EXTLEN+4];
         memcpy(extbuf + sizeof(c->binary_header), c->rcurr + sizeof(c->binary_header),
                 extlen > BIN_MAX_EXTLEN ? BIN_MAX_EXTLEN : extlen);
         c->rbytes -= sizeof(c->binary_header) + extlen + keylen;
@@ -262,10 +265,10 @@ static void complete_incr_bin(conn *c, char *extbuf) {
     char tmpbuf[INCR_MAX_STORAGE_LEN];
     uint64_t cas = 0;
 
+    assert(c != NULL);
     protocol_binary_response_incr* rsp = (protocol_binary_response_incr*)c->resp->wbuf;
     protocol_binary_request_incr* req = (void *)extbuf;
 
-    assert(c != NULL);
     //assert(c->wsize >= sizeof(*rsp));
 
     /* fix byteorder in the request */
@@ -1032,6 +1035,7 @@ static void dispatch_bin_command(conn *c, char *extbuf) {
                 write_bin_response(c, NULL, 0, 0, 0);
                 conn_set_state(c, conn_mwrite);
                 c->close_after_write = true;
+                c->close_reason = NORMAL_CLOSE;
             } else {
                 protocol_error = 1;
             }
@@ -1282,10 +1286,9 @@ static void process_bin_delete(conn *c) {
     item *it;
     uint32_t hv;
 
+    assert(c != NULL);
     char* key = binary_get_key(c);
     size_t nkey = c->binary_header.request.keylen;
-
-    assert(c != NULL);
 
     if (settings.verbose > 1) {
         int ii;

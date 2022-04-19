@@ -23,7 +23,8 @@
 // re-cast an io_pending_t into this more descriptive structure.
 // the first few items _must_ match the original struct.
 typedef struct _io_pending_storage_t {
-    io_queue_t *q;
+    int io_queue_type;
+    LIBEVENT_THREAD *thread;
     conn *c;
     mc_resp *resp;            /* original struct ends here */
     item *hdr_it;             /* original header item. */
@@ -69,6 +70,9 @@ void process_extstore_stats(ADD_STAT add_stats, conn *c) {
     assert(add_stats);
 
     void *storage = c->thread->storage;
+    if (storage == NULL) {
+        return;
+    }
     extstore_get_stats(storage, &st);
     st.page_data = calloc(st.page_count, sizeof(struct extstore_page_data));
     extstore_get_page_data(storage, &st);
@@ -220,13 +224,14 @@ static void _storage_get_item_cb(void *e, obj_io *io, int ret) {
         p->miss = false;
     }
 
-    p->q->count--;
     p->active = false;
     //assert(c->io_wrapleft >= 0);
 
     // All IO's have returned, lets re-attach this connection to our original
     // thread.
-    if (p->q->count == 0) {
+    io_queue_t *q = conn_io_queue_get(p->c, p->io_queue_type);
+    q->count--;
+    if (q->count == 0) {
         redispatch_conn(c);
     }
 }
@@ -269,7 +274,7 @@ int storage_get_item(conn *c, item *it, mc_resp *resp) {
     // io_pending owns the reference for this object now.
     p->hdr_it = it;
     p->resp = resp;
-    p->q = q; // quicker access to the queue structure.
+    p->io_queue_type = IO_QUEUE_EXTSTORE;
     obj_io *eio = &p->io_ctx;
 
     // FIXME: error handling.
@@ -363,9 +368,9 @@ int storage_get_item(conn *c, item *it, mc_resp *resp) {
     return 0;
 }
 
-void storage_submit_cb(void *ctx, void *stack) {
+void storage_submit_cb(io_queue_t *q) {
     // Don't need to do anything special for extstore.
-    extstore_submit(ctx, stack);
+    extstore_submit(q->ctx, q->stack_ctx);
 }
 
 static void recache_or_free(io_pending_t *pending) {
@@ -374,9 +379,9 @@ static void recache_or_free(io_pending_t *pending) {
 
     conn *c = p->c;
     obj_io *io = &p->io_ctx;
+    assert(io != NULL);
     item *it = (item *)io->buf;
     assert(c != NULL);
-    assert(io != NULL);
     bool do_free = true;
     if (p->active) {
         // If request never dispatched, free the read buffer but leave the
@@ -384,8 +389,10 @@ static void recache_or_free(io_pending_t *pending) {
         do_free = false;
         size_t ntotal = ITEM_ntotal(p->hdr_it);
         slabs_free(it, ntotal, slabs_clsid(ntotal));
-        p->q->count--;
-        assert(p->q->count >= 0);
+
+        io_queue_t *q = conn_io_queue_get(c, p->io_queue_type);
+        q->count--;
+        assert(q->count >= 0);
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.get_aborted_extstore++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -443,7 +450,9 @@ static void recache_or_free(io_pending_t *pending) {
 // TODO: stubbed with a reminder: should be able to move most of the extstore
 // callback code into this code instead, executing on worker thread instead of
 // IO thread.
-void storage_complete_cb(void *ctx, void *stack_ctx) {
+void storage_complete_cb(io_queue_t *q) {
+    // need to reset the stack for next use.
+    q->stack_ctx = NULL;
     return;
 }
 
@@ -562,7 +571,6 @@ static int storage_write(void *storage, const int clsid, const int item_age) {
 
 static pthread_t storage_write_tid;
 static pthread_mutex_t storage_write_plock;
-#define WRITE_SLEEP_MAX 1000000
 #define WRITE_SLEEP_MIN 500
 
 static void *storage_write_thread(void *arg) {
@@ -585,8 +593,8 @@ static void *storage_write_thread(void *arg) {
         int min_class = slabs_clsid(settings.ext_item_size);
         bool do_sleep = true;
         counter++;
-        if (to_sleep > WRITE_SLEEP_MAX)
-            to_sleep = WRITE_SLEEP_MAX;
+        if (to_sleep > settings.ext_max_sleep)
+            to_sleep = settings.ext_max_sleep;
 
         for (int x = 0; x < MAX_NUMBER_OF_SLAB_CLASSES; x++) {
             bool did_move = false;
@@ -756,7 +764,6 @@ static int storage_compact_check(void *storage, logger *l,
 static pthread_t storage_compact_tid;
 static pthread_mutex_t storage_compact_plock;
 #define MIN_STORAGE_COMPACT_SLEEP 10000
-#define MAX_STORAGE_COMPACT_SLEEP 2000000
 
 struct storage_compact_wrap {
     obj_io io;
@@ -879,7 +886,7 @@ static void _storage_compact_cb(void *e, obj_io *io, int ret) {
 // I guess it's only COLD. that's probably fine.
 static void *storage_compact_thread(void *arg) {
     void *storage = arg;
-    useconds_t to_sleep = MAX_STORAGE_COMPACT_SLEEP;
+    useconds_t to_sleep = settings.ext_max_sleep;
     bool compacting = false;
     uint64_t page_version = 0;
     uint64_t page_size = 0;
@@ -965,11 +972,11 @@ static void *storage_compact_thread(void *arg) {
             }
             pthread_mutex_unlock(&wrap.lock);
 
-            if (to_sleep > MIN_STORAGE_COMPACT_SLEEP)
-                to_sleep /= 2;
+            // finish actual compaction quickly.
+            to_sleep = MIN_STORAGE_COMPACT_SLEEP;
         } else {
-            if (to_sleep < MAX_STORAGE_COMPACT_SLEEP)
-                to_sleep += MIN_STORAGE_COMPACT_SLEEP;
+            if (to_sleep < settings.ext_max_sleep)
+                to_sleep += settings.ext_max_sleep;
         }
     }
     free(readback_buf);
@@ -1115,6 +1122,7 @@ void *storage_init_config(struct settings *s) {
     s->ext_wbuf_size = 1024 * 1024 * 4;
     s->ext_compact_under = 0;
     s->ext_drop_under = 0;
+    s->ext_max_sleep = 1000000;
     s->slab_automove_freeratio = 0.01;
     s->ext_page_size = 1024 * 1024 * 64;
     s->ext_io_threadcount = 1;
@@ -1146,6 +1154,7 @@ int storage_read_config(void *conf, char **subopt) {
         EXT_RECACHE_RATE,
         EXT_COMPACT_UNDER,
         EXT_DROP_UNDER,
+        EXT_MAX_SLEEP,
         EXT_MAX_FRAG,
         EXT_DROP_UNREAD,
         SLAB_AUTOMOVE_FREERATIO, // FIXME: move this back?
@@ -1163,6 +1172,7 @@ int storage_read_config(void *conf, char **subopt) {
         [EXT_RECACHE_RATE] = "ext_recache_rate",
         [EXT_COMPACT_UNDER] = "ext_compact_under",
         [EXT_DROP_UNDER] = "ext_drop_under",
+        [EXT_MAX_SLEEP] = "ext_max_sleep",
         [EXT_MAX_FRAG] = "ext_max_frag",
         [EXT_DROP_UNREAD] = "ext_drop_unread",
         [SLAB_AUTOMOVE_FREERATIO] = "slab_automove_freeratio",
@@ -1274,6 +1284,16 @@ int storage_read_config(void *conf, char **subopt) {
             }
             if (!safe_strtoul(subopts_value, &settings.ext_drop_under)) {
                 fprintf(stderr, "could not parse argument to ext_drop_under\n");
+                return 1;
+            }
+            break;
+        case EXT_MAX_SLEEP:
+            if (subopts_value == NULL) {
+                fprintf(stderr, "Missing ext_max_sleep argument\n");
+                return 1;
+            }
+            if (!safe_strtoul(subopts_value, &settings.ext_max_sleep)) {
+                fprintf(stderr, "could not parse argument to ext_max_sleep\n");
                 return 1;
             }
             break;

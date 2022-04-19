@@ -20,7 +20,7 @@ if (!supports_extstore()) {
 
 $ext_path = "/tmp/extstore.$$";
 
-my $server = new_memcached("-m 64 -I 4m -U 0 -o ext_page_size=8,ext_wbuf_size=8,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=10000,ext_max_frag=0.9,ext_path=$ext_path:64m,slab_automove=0,ext_compact_under=1");
+my $server = new_memcached("-m 64 -I 4m -U 0 -o ext_page_size=8,ext_wbuf_size=8,ext_threads=1,ext_io_depth=2,ext_item_size=512,ext_item_age=2,ext_recache_rate=10000,ext_max_frag=0.9,ext_path=$ext_path:64m,slab_automove=0,ext_compact_under=1,ext_max_sleep=100000");
 my $sock = $server->sock;
 
 # Wait until all items have flushed
@@ -66,6 +66,14 @@ wait_for_ext();
     ok(scalar <$sock> =~ /CLIENT_ERROR bad command line format/, 'long key fails');
     my $stats = mem_stats($sock);
     cmp_ok($stats->{get_aborted_extstore}, '>', 1, 'some extstore queries aborted');
+}
+
+# Infinite loop: if we aborted some extstore requests, the next request would hang
+# the daemon.
+{
+    my $size = 3000 * 1024;
+    my $data = "x" x $size;
+    mem_get_is($sock, "foo1", $data);
 }
 
 # Disable automatic page balancing, then move enough pages that the large

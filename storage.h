@@ -18,8 +18,8 @@ bool storage_validate_item(void *e, item *it);
 int storage_get_item(conn *c, item *it, mc_resp *resp);
 
 // callbacks for the IO queue subsystem.
-void storage_submit_cb(void *ctx, void *stack);
-void storage_complete_cb(void *ctx, void *stack);
+void storage_submit_cb(io_queue_t *q);
+void storage_complete_cb(io_queue_t *q);
 void storage_finalize_cb(io_pending_t *pending);
 
 // Thread functions.

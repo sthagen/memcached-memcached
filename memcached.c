@@ -56,6 +56,7 @@
 
 #include "proto_text.h"
 #include "proto_bin.h"
+#include "proto_proxy.h"
 
 #if defined(__FreeBSD__)
 #include <sys/sysctl.h>
@@ -84,7 +85,6 @@ static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
 static int start_conn_timeout_thread();
-
 
 /* stats */
 static void stats_init(void);
@@ -233,6 +233,7 @@ static void settings_init(void) {
     settings.ssl_last_cert_refresh_time = current_time;
     settings.ssl_wbuf_size = 16 * 1024; // default is 16KB (SSL max frame size is 17KB)
     settings.ssl_session_cache = false;
+    settings.ssl_min_version = TLS1_2_VERSION;
 #endif
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
@@ -301,11 +302,9 @@ static pthread_cond_t conn_timeout_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t conn_timeout_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define CONNS_PER_SLICE 100
-#define TIMEOUT_MSG_SIZE (1 + sizeof(int))
 static void *conn_timeout_thread(void *arg) {
     int i;
     conn *c;
-    char buf[TIMEOUT_MSG_SIZE];
     rel_time_t oldest_last_cmd;
     int sleep_time;
     int sleep_slice = max_fds / CONNS_PER_SLICE;
@@ -341,11 +340,7 @@ static void *conn_timeout_thread(void *arg) {
                 continue;
 
             if ((current_time - c->last_cmd_time) > settings.idle_timeout) {
-                buf[0] = 't';
-                memcpy(&buf[1], &i, sizeof(int));
-                if (write(c->thread->notify_send_fd, buf, TIMEOUT_MSG_SIZE)
-                    != TIMEOUT_MSG_SIZE)
-                    perror("Failed to write timeout to notify pipe");
+                timeout_conn(c);
             } else {
                 if (c->last_cmd_time < oldest_last_cmd)
                     oldest_last_cmd = c->last_cmd_time;
@@ -445,8 +440,8 @@ bool rbuf_switch_to_malloc(conn *c) {
     if (!tmp)
         return false;
 
-    do_cache_free(c->thread->rbuf_cache, c->rbuf);
     memcpy(tmp, c->rcurr, c->rbytes);
+    do_cache_free(c->thread->rbuf_cache, c->rbuf);
 
     c->rcurr = c->rbuf = tmp;
     c->rsize = size;
@@ -505,6 +500,11 @@ static const char *prot_text(enum protocol prot) {
         case negotiating_prot:
             rv = "auto-negotiate";
             break;
+#ifdef PROXY
+        case proxy_prot:
+            rv = "proxy";
+            break;
+#endif
     }
     return rv;
 }
@@ -525,6 +525,8 @@ void conn_close_idle(conn *c) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.idle_kicks++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        c->close_reason = IDLE_TIMEOUT_CLOSE;
 
         conn_set_state(c, conn_closing);
         drive_machine(c);
@@ -562,18 +564,50 @@ void conn_worker_readd(conn *c) {
     }
 }
 
-void conn_io_queue_add(conn *c, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb fin_cb) {
-    io_queue_t *q = c->io_queues;
+void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb ret_cb, io_queue_cb fin_cb) {
+    io_queue_cb_t *q = t->io_queues;
     while (q->type != IO_QUEUE_NONE) {
         q++;
     }
     q->type = type;
     q->ctx = ctx;
-    q->stack_ctx = NULL;
     q->submit_cb = cb;
     q->complete_cb = com_cb;
     q->finalize_cb = fin_cb;
+    q->return_cb   = ret_cb;
     return;
+}
+
+void conn_io_queue_setup(conn *c) {
+    io_queue_cb_t *qcb = c->thread->io_queues;
+    io_queue_t *q = c->io_queues;
+    while (qcb->type != IO_QUEUE_NONE) {
+        q->type = qcb->type;
+        q->ctx = qcb->ctx;
+        q->stack_ctx = NULL;
+        q->count = 0;
+        qcb++;
+        q++;
+    }
+}
+
+// To be called from conn_release_items to ensure the stack ptrs are reset.
+static void conn_io_queue_reset(conn *c) {
+    for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
+        assert(q->count == 0);
+        q->stack_ctx = NULL;
+    }
+}
+
+io_queue_cb_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type) {
+    io_queue_cb_t *q = t->io_queues;
+    while (q->type != IO_QUEUE_NONE) {
+        if (q->type == type) {
+            return q;
+        }
+        q++;
+    }
+    return NULL;
 }
 
 io_queue_t *conn_io_queue_get(conn *c, int type) {
@@ -592,16 +626,21 @@ io_queue_t *conn_io_queue_get(conn *c, int type) {
 // not and handle appropriately.
 static void conn_io_queue_complete(conn *c) {
     io_queue_t *q = c->io_queues;
+    io_queue_cb_t *qcb = c->thread->io_queues;
     while (q->type != IO_QUEUE_NONE) {
-        // Reuse the same submit stack. We zero it out first so callbacks can
-        // queue new IO's if necessary.
         if (q->stack_ctx) {
-            void *tmp = q->stack_ctx;
-            q->stack_ctx = NULL;
-            q->complete_cb(q->ctx, tmp);
+            qcb->complete_cb(q);
         }
+        qcb++;
         q++;
     }
+}
+
+// called to return a single IO object to the original worker thread.
+void conn_io_queue_return(io_pending_t *io) {
+    io_queue_cb_t *q = thread_io_queue_get(io->thread, io->io_queue_type);
+    q->return_cb(io);
+    return;
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
@@ -672,6 +711,11 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
+    if (init_state == conn_new_cmd) {
+        LOGGER_LOG(NULL, LOG_CONNEVENTS, LOGGER_CONNECTION_NEW, NULL,
+                &c->request_addr, c->request_addr_size, c->transport, 0, sfd);
+    }
+
     if (settings.verbose > 1) {
         if (init_state == conn_listening) {
             fprintf(stderr, "<%d server listening (%s)\n", sfd,
@@ -704,6 +748,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rcurr = c->rbuf;
     c->ritem = 0;
     c->rbuf_malloced = false;
+    c->item_malloced = false;
     c->sasl_started = false;
     c->set_stale = false;
     c->mset_res = false;
@@ -757,6 +802,11 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             case negotiating_prot:
                 c->try_read_command = try_read_command_negotiate;
                 break;
+#ifdef PROXY
+            case proxy_prot:
+                c->try_read_command = try_read_command_proxy;
+                break;
+#endif
         }
     }
 
@@ -783,7 +833,12 @@ void conn_release_items(conn *c) {
     assert(c != NULL);
 
     if (c->item) {
-        item_remove(c->item);
+        if (c->item_malloced) {
+            free(c->item);
+            c->item_malloced = false;
+        } else {
+            item_remove(c->item);
+        }
         c->item = 0;
     }
 
@@ -806,6 +861,7 @@ void conn_release_items(conn *c) {
             }
             resp = resp_finish(c, resp);
         }
+        conn_io_queue_reset(c);
     }
 }
 
@@ -813,7 +869,11 @@ static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
     conn_release_items(c);
-
+#ifdef PROXY
+    if (c->proxy_coro_ref) {
+        proxy_cleanup_conn(c);
+    }
+#endif
     if (c->sasl_conn) {
         assert(settings.sasl);
         sasl_dispose(&c->sasl_conn);
@@ -849,6 +909,12 @@ void conn_free(conn *c) {
 static void conn_close(conn *c) {
     assert(c != NULL);
 
+    if (c->thread) {
+        LOGGER_LOG(c->thread->l, LOG_CONNEVENTS, LOGGER_CONNECTION_CLOSE, NULL,
+                &c->request_addr, c->request_addr_size, c->transport,
+                c->close_reason, c->sfd);
+    }
+
     /* delete the event, the socket and the conn */
     event_del(&c->event);
 
@@ -872,6 +938,7 @@ static void conn_close(conn *c) {
     }
 #endif
     close(c->sfd);
+    c->close_reason = 0;
     pthread_mutex_lock(&conn_lock);
     allow_new_conns = true;
     pthread_mutex_unlock(&conn_lock);
@@ -1139,7 +1206,8 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
     if (resp->io_pending) {
         // If we had a pending IO, tell it to internally clean up then return
         // the main object back to our thread cache.
-        resp->io_pending->q->finalize_cb(resp->io_pending);
+        io_queue_cb_t *qcb = thread_io_queue_get(c->thread, resp->io_pending->io_queue_type);
+        qcb->finalize_cb(resp->io_pending);
         do_cache_free(c->thread->io_cache, resp->io_pending);
         resp->io_pending = NULL;
     }
@@ -1344,7 +1412,12 @@ static void reset_cmd_handler(conn *c) {
     if (c->item != NULL) {
         // TODO: Any other way to get here?
         // SASL auth was mistakenly using it. Nothing else should?
-        item_remove(c->item);
+        if (c->item_malloced) {
+            free(c->item);
+            c->item_malloced = false;
+        } else {
+            item_remove(c->item);
+        }
         c->item = NULL;
     }
     if (c->rbytes > 0) {
@@ -1358,13 +1431,22 @@ static void reset_cmd_handler(conn *c) {
 
 static void complete_nread(conn *c) {
     assert(c != NULL);
+#ifdef PROXY
+    assert(c->protocol == ascii_prot
+           || c->protocol == binary_prot
+           || c->protocol == proxy_prot);
+#else
     assert(c->protocol == ascii_prot
            || c->protocol == binary_prot);
-
+#endif
     if (c->protocol == ascii_prot) {
         complete_nread_ascii(c);
     } else if (c->protocol == binary_prot) {
         complete_nread_binary(c);
+#ifdef PROXY
+    } else if (c->protocol == proxy_prot) {
+        complete_nread_proxy(c);
+#endif
     }
 }
 
@@ -1627,7 +1709,8 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         c->cas = ITEM_get_cas(it);
     }
     LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
-            stored, comm, ITEM_key(it), it->nkey, it->exptime, ITEM_clsid(it), c->sfd);
+            stored, comm, ITEM_key(it), it->nkey, it->nbytes, it->exptime,
+            ITEM_clsid(it), c->sfd);
 
     return stored;
 }
@@ -1709,6 +1792,14 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("read_buf_bytes_free", "%llu", (unsigned long long)thread_stats.read_buf_bytes_free);
     APPEND_STAT("read_buf_oom", "%llu", (unsigned long long)thread_stats.read_buf_oom);
     APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        APPEND_STAT("proxy_conn_requests", "%llu", (unsigned long long)thread_stats.proxy_conn_requests);
+        APPEND_STAT("proxy_conn_errors", "%llu", (unsigned long long)thread_stats.proxy_conn_errors);
+        APPEND_STAT("proxy_conn_oom", "%llu", (unsigned long long)thread_stats.proxy_conn_oom);
+        APPEND_STAT("proxy_req_active", "%llu", (unsigned long long)thread_stats.proxy_req_active);
+    }
+#endif
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
     APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
     APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
@@ -1739,6 +1830,8 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("cas_badval", "%llu", (unsigned long long)slab_stats.cas_badval);
     APPEND_STAT("touch_hits", "%llu", (unsigned long long)slab_stats.touch_hits);
     APPEND_STAT("touch_misses", "%llu", (unsigned long long)thread_stats.touch_misses);
+    APPEND_STAT("store_too_large", "%llu", (unsigned long long)thread_stats.store_too_large);
+    APPEND_STAT("store_no_memory", "%llu", (unsigned long long)thread_stats.store_no_memory);
     APPEND_STAT("auth_cmds", "%llu", (unsigned long long)thread_stats.auth_cmds);
     APPEND_STAT("auth_errors", "%llu", (unsigned long long)thread_stats.auth_errors);
     if (settings.idle_timeout) {
@@ -1778,9 +1871,13 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("log_worker_written", "%llu", (unsigned long long)stats.log_worker_written);
     APPEND_STAT("log_watcher_skipped", "%llu", (unsigned long long)stats.log_watcher_skipped);
     APPEND_STAT("log_watcher_sent", "%llu", (unsigned long long)stats.log_watcher_sent);
+    APPEND_STAT("log_watchers", "%llu", (unsigned long long)stats_state.log_watchers);
     STATS_UNLOCK();
 #ifdef EXTSTORE
     storage_stats(add_stats, c);
+#endif
+#ifdef PROXY
+    proxy_stats(add_stats, c);
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {
@@ -1808,6 +1905,8 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("domain_socket", "%s",
                 settings.socketpath ? settings.socketpath : "NULL");
     APPEND_STAT("umask", "%o", settings.access);
+    APPEND_STAT("shutdown_command", "%s",
+                settings.shutdown_command ? "yes" : "no");
     APPEND_STAT("growth_factor", "%.2f", settings.factor);
     APPEND_STAT("chunk_size", "%d", settings.chunk_size);
     APPEND_STAT("num_threads", "%d", settings.num_threads);
@@ -1862,6 +1961,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("ext_wbuf_size", "%u", settings.ext_wbuf_size);
     APPEND_STAT("ext_compact_under", "%u", settings.ext_compact_under);
     APPEND_STAT("ext_drop_under", "%u", settings.ext_drop_under);
+    APPEND_STAT("ext_max_sleep", "%u", settings.ext_max_sleep);
     APPEND_STAT("ext_max_frag", "%.2f", settings.ext_max_frag);
     APPEND_STAT("slab_automove_freeratio", "%.3f", settings.slab_automove_freeratio);
     APPEND_STAT("ext_drop_unread", "%s", settings.ext_drop_unread ? "yes" : "no");
@@ -1876,6 +1976,11 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("ssl_ca_cert", "%s", settings.ssl_ca_cert ? settings.ssl_ca_cert : "NULL");
     APPEND_STAT("ssl_wbuf_size", "%u", settings.ssl_wbuf_size);
     APPEND_STAT("ssl_session_cache", "%s", settings.ssl_session_cache ? "yes" : "no");
+    APPEND_STAT("ssl_min_version", "%s", ssl_proto_text(settings.ssl_min_version));
+#endif
+#ifdef PROXY
+    APPEND_STAT("proxy_enabled", "%s", settings.proxy_enabled ? "yes" : "no");
+    APPEND_STAT("proxy_uring_enabled", "%s", settings.proxy_uring ? "yes" : "no");
 #endif
     APPEND_STAT("num_napi_ids", "%s", settings.num_napi_ids);
     APPEND_STAT("memory_file", "%s", settings.memory_file);
@@ -2227,8 +2332,8 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 }
 
 static int try_read_command_negotiate(conn *c) {
-    assert(c->protocol == negotiating_prot);
     assert(c != NULL);
+    assert(c->protocol == negotiating_prot);
     assert(c->rcurr <= (c->rbuf + c->rsize));
     assert(c->rbytes > 0);
 
@@ -2364,6 +2469,7 @@ static enum try_read_result try_read_network(conn *c) {
             }
         }
         if (res == 0) {
+            c->close_reason = NORMAL_CLOSE;
             return READ_ERROR;
         }
         if (res == -1) {
@@ -2624,8 +2730,8 @@ static void build_udp_header(unsigned char *hdr, mc_resp *resp) {
     // header, so "tosend" must be static.
     if (!resp->udp_total) {
         uint32_t total;
-        total = resp->tosend / UDP_MAX_PAYLOAD_SIZE;
-        if (resp->tosend % UDP_MAX_PAYLOAD_SIZE)
+        total = resp->tosend / UDP_DATA_SIZE;
+        if (resp->tosend % UDP_DATA_SIZE)
             total++;
         // The spec doesn't really say what we should do here. It's _probably_
         // better to bail out?
@@ -3012,7 +3118,7 @@ static void drive_machine(conn *c) {
         case conn_parse_cmd:
             c->noreply = false;
             if (c->try_read_command(c) == 0) {
-                /* wee need more data! */
+                /* we need more data! */
                 if (c->resp_head) {
                     // Buffered responses waiting, flush in the meantime.
                     conn_set_state(c, conn_mwrite);
@@ -3070,7 +3176,7 @@ static void drive_machine(conn *c) {
                 break;
             }
 
-            if ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) {
+            if (c->item_malloced || ((((item *)c->item)->it_flags & ITEM_CHUNKED) == 0) ) {
                 /* first check if we have leftovers in the conn_read buffer */
                 if (c->rbytes > 0) {
                     int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
@@ -3104,6 +3210,7 @@ static void drive_machine(conn *c) {
             }
 
             if (res == 0) { /* end of stream */
+                c->close_reason = NORMAL_CLOSE;
                 conn_set_state(c, conn_closing);
                 break;
             }
@@ -3169,6 +3276,7 @@ static void drive_machine(conn *c) {
                 break;
             }
             if (res == 0) { /* end of stream */
+                c->close_reason = NORMAL_CLOSE;
                 conn_set_state(c, conn_closing);
                 break;
             }
@@ -3194,25 +3302,21 @@ static void drive_machine(conn *c) {
              * remove the connection from the worker thread and dispatch the
              * IO queue
              */
-            if (c->io_queues[0].type != IO_QUEUE_NONE) {
-                assert(c->io_queues_submitted == 0);
-                bool hit = false;
+            assert(c->io_queues_submitted == 0);
 
-                for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
-                    if (q->count != 0) {
-                        assert(q->stack_ctx != NULL);
-                        hit = true;
-                        q->submit_cb(q->ctx, q->stack_ctx);
-                        c->io_queues_submitted++;
-                    }
+            for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
+                if (q->stack_ctx != NULL) {
+                    io_queue_cb_t *qcb = thread_io_queue_get(c->thread, q->type);
+                    qcb->submit_cb(q);
+                    c->io_queues_submitted++;
                 }
-                if (hit) {
-                    conn_set_state(c, conn_io_queue);
-                    event_del(&c->event);
+            }
+            if (c->io_queues_submitted != 0) {
+                conn_set_state(c, conn_io_queue);
+                event_del(&c->event);
 
-                    stop = true;
-                    break;
-                }
+                stop = true;
+                break;
             }
 
             switch (!IS_UDP(c->transport) ? transmit(c) : transmit_udp(c)) {
@@ -3550,6 +3654,8 @@ static int server_sockets(int port, enum network_transport transport,
             fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
             return 1;
         }
+        // If we encounter any failure, preserve the first errno for the caller.
+        int errno_save = 0;
         for (char *p = strtok_r(list, ";,", &b);
             p != NULL;
             p = strtok_r(NULL, ";,", &b)) {
@@ -3607,8 +3713,10 @@ static int server_sockets(int port, enum network_transport transport,
                 p = NULL;
             }
             ret |= server_socket(p, the_port, transport, portnumber_file, ssl_enabled);
+            if (ret != 0 && errno_save == 0) errno_save = errno;
         }
         free(list);
+        errno = errno_save;
         return ret;
     }
 }
@@ -3705,6 +3813,10 @@ static int server_socket_unix(const char *path, int access_mask) {
  */
 volatile rel_time_t current_time;
 static struct event clockevent;
+#ifdef MEMCACHED_DEBUG
+volatile bool is_paused;
+volatile int64_t delta;
+#endif
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
 static bool monotonic = false;
 static int64_t monotonic_start;
@@ -3734,25 +3846,42 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
         settings.sig_hup = false;
 
         authfile_load(settings.auth_file);
+#ifdef PROXY
+        if (settings.proxy_ctx) {
+            proxy_start_reload(settings.proxy_ctx);
+        }
+#endif
     }
 
     evtimer_set(&clockevent, clock_handler, 0);
     event_base_set(main_base, &clockevent);
     evtimer_add(&clockevent, &t);
 
+#ifdef MEMCACHED_DEBUG
+    if (is_paused) return;
+#endif
+
 #if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
     if (monotonic) {
         struct timespec ts;
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
             return;
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (ts.tv_sec - monotonic_start + delta);
+#else
         current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+#endif
         return;
     }
 #endif
     {
         struct timeval tv;
         gettimeofday(&tv, NULL);
+#ifdef MEMCACHED_DEBUG
+        current_time = (rel_time_t) (tv.tv_sec - process_started + delta);
+#else
         current_time = (rel_time_t) (tv.tv_sec - process_started);
+#endif
     }
 }
 
@@ -3845,7 +3974,7 @@ static void usage(void) {
            "                          forcefully killing LRU tail item.\n"
            "                          disabled by default; very dangerous option.\n"
            "   - hash_algorithm:      the hash table algorithm\n"
-           "                          default is murmur3 hash. options: jenkins, murmur3\n"
+           "                          default is murmur3 hash. options: jenkins, murmur3, xxh3\n"
            "   - no_lru_crawler:      disable LRU Crawler background thread.\n"
            "   - lru_crawler_sleep:   microseconds to sleep between items\n"
            "                          default is %d.\n"
@@ -3912,13 +4041,20 @@ static void usage(void) {
            "   - ext_drop_under:      drop COLD items when fewer than this many free pages\n"
            "                          (default: 1/4th of the assigned storage)\n"
            "   - ext_max_frag:        max page fragmentation to tolerate (default: %.2f)\n"
+           "   - ext_max_sleep:       max sleep time of background threads in us (default: %u)\n"
            "   - slab_automove_freeratio: ratio of memory to hold free as buffer.\n"
            "                          (see doc/storage.txt for more info, default: %.3f)\n",
            settings.ext_page_size / (1 << 20), settings.ext_wbuf_size / (1 << 20), settings.ext_io_threadcount,
            settings.ext_item_size, settings.ext_low_ttl,
            flag_enabled_disabled(settings.ext_drop_unread), settings.ext_recache_rate,
-           settings.ext_max_frag, settings.slab_automove_freeratio);
+           settings.ext_max_frag, settings.ext_max_sleep, settings.slab_automove_freeratio);
     verify_default("ext_item_age", settings.ext_item_age == UINT_MAX);
+#endif
+#ifdef PROXY
+    printf("   - proxy_config:        path to lua config file.\n");
+#ifdef HAVE_LIBURING
+    printf("   - proxy_uring:         enable IO_URING for proxy backends.\n");
+#endif
 #endif
 #ifdef TLS
     printf("   - ssl_chain_cert:      certificate chain file in PEM format\n"
@@ -3932,9 +4068,22 @@ static void usage(void) {
            "   - ssl_wbuf_size:       size in kilobytes of per-connection SSL output buffer\n"
            "                          (default: %u)\n", settings.ssl_wbuf_size / (1 << 10));
     printf("   - ssl_session_cache:   enable server-side SSL session cache, to support session\n"
-           "                          resumption\n");
+           "                          resumption\n"
+           "   - ssl_min_version:     minimum protocol version to accept (default: %s)\n"
+#if defined(TLS1_3_VERSION)
+           "                          valid values are 0(%s), 1(%s), 2(%s), or 3(%s).\n",
+           ssl_proto_text(settings.ssl_min_version),
+           ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
+           ssl_proto_text(TLS1_2_VERSION), ssl_proto_text(TLS1_3_VERSION));
+#else
+           "                          valid values are 0(%s), 1(%s), or 2(%s).\n",
+           ssl_proto_text(settings.ssl_min_version),
+           ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
+           ssl_proto_text(TLS1_2_VERSION));
+#endif
     verify_default("ssl_keyformat", settings.ssl_keyformat == SSL_FILETYPE_PEM);
     verify_default("ssl_verify_mode", settings.ssl_verify_mode == SSL_VERIFY_NONE);
+    verify_default("ssl_min_version", settings.ssl_min_version == TLS1_2_VERSION);
 #endif
     printf("-N, --napi_ids            number of napi ids. see doc/napi_ids.txt for more details\n");
     return;
@@ -4114,10 +4263,35 @@ static int enable_large_pages(void) {
     return ret;
 #elif defined(__linux__) && defined(MADV_HUGEPAGE)
     /* check if transparent hugepages is compiled into the kernel */
-    struct stat st;
-    int ret = stat("/sys/kernel/mm/transparent_hugepage/enabled", &st);
-    if (ret || !(st.st_mode & S_IFREG)) {
+    /* RH based systems possibly uses a different path */
+    static const char *mm_thp_paths[] = {
+        "/sys/kernel/mm/transparent_hugepage/enabled",
+        "/sys/kernel/mm/redhat_transparent_hugepage/enabled",
+        NULL
+    };
+
+    char thpb[128] = {0};
+    int pfd = -1;
+    for (const char **p = mm_thp_paths; *p; p++) {
+        if ((pfd = open(*p, O_RDONLY)) != -1)
+            break;
+    }
+
+    if (pfd == -1) {
         fprintf(stderr, "Transparent huge pages support not detected.\n");
+        fprintf(stderr, "Will use default page size.\n");
+        return -1;
+    }
+    ssize_t rd = read(pfd, thpb, sizeof(thpb));
+    close(pfd);
+    if (rd <= 0) {
+        fprintf(stderr, "Transparent huge pages could not read the configuration.\n");
+        fprintf(stderr, "Will use default page size.\n");
+        return -1;
+    }
+    thpb[rd] = 0;
+    if (strstr(thpb, "[never]")) {
+        fprintf(stderr, "Transparent huge pages support disabled.\n");
         fprintf(stderr, "Will use default page size.\n");
         return -1;
     }
@@ -4220,7 +4394,7 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
     // TODO: should get a version of version which is numeric, else
     // comparisons for compat reasons are difficult.
     // it may be possible to punt on this for now; since we can test for the
-    // absense of another key... such as the new numeric version.
+    // absence of another key... such as the new numeric version.
     //restart_set_kv(ctx, "version", "%s", VERSION);
     // We hold the original factor or subopts _string_
     // it can be directly compared without roundtripping through floats or
@@ -4559,6 +4733,7 @@ int main (int argc, char **argv) {
         DROP_PRIVILEGES,
         RESP_OBJ_MEM_LIMIT,
         READ_BUF_MEM_LIMIT,
+        META_RESPONSE_OLD,
 #ifdef TLS
         SSL_CERT,
         SSL_KEY,
@@ -4568,6 +4743,11 @@ int main (int argc, char **argv) {
         SSL_CA_CERT,
         SSL_WBUF_SIZE,
         SSL_SESSION_CACHE,
+        SSL_MIN_VERSION,
+#endif
+#ifdef PROXY
+        PROXY_CONFIG,
+        PROXY_URING,
 #endif
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
@@ -4612,6 +4792,7 @@ int main (int argc, char **argv) {
         [DROP_PRIVILEGES] = "drop_privileges",
         [RESP_OBJ_MEM_LIMIT] = "resp_obj_mem_limit",
         [READ_BUF_MEM_LIMIT] = "read_buf_mem_limit",
+        [META_RESPONSE_OLD] = "meta_response_old",
 #ifdef TLS
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
@@ -4621,6 +4802,11 @@ int main (int argc, char **argv) {
         [SSL_CA_CERT] = "ssl_ca_cert",
         [SSL_WBUF_SIZE] = "ssl_wbuf_size",
         [SSL_SESSION_CACHE] = "ssl_session_cache",
+        [SSL_MIN_VERSION] = "ssl_min_version",
+#endif
+#ifdef PROXY
+        [PROXY_CONFIG] = "proxy_config",
+        [PROXY_URING] = "proxy_uring",
 #endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
@@ -5053,8 +5239,10 @@ int main (int argc, char **argv) {
                     hash_type = JENKINS_HASH;
                 } else if (strcmp(subopts_value, "murmur3") == 0) {
                     hash_type = MURMUR3_HASH;
+                } else if (strcmp(subopts_value, "xxh3") == 0) {
+                    hash_type = XXH3_HASH;
                 } else {
-                    fprintf(stderr, "Unknown hash_algorithm option (jenkins, murmur3)\n");
+                    fprintf(stderr, "Unknown hash_algorithm option (jenkins, murmur3, xxh3)\n");
                     return 1;
                 }
                 break;
@@ -5206,6 +5394,9 @@ int main (int argc, char **argv) {
                 start_lru_maintainer = false;
                 settings.lru_segmented = false;
                 break;
+            case META_RESPONSE_OLD:
+                settings.meta_response_old = true;
+                break;
 #ifdef TLS
             case SSL_CERT:
                 if (subopts_value == NULL) {
@@ -5292,6 +5483,37 @@ int main (int argc, char **argv) {
             case SSL_SESSION_CACHE:
                 settings.ssl_session_cache = true;
                 break;
+            case SSL_MIN_VERSION: {
+                int min_version;
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing ssl_min_version argument\n");
+                    return 1;
+                }
+                if (!safe_strtol(subopts_value, &min_version)) {
+                    fprintf(stderr, "could not parse argument to ssl_min_version\n");
+                    return 1;
+                }
+                switch (min_version) {
+                    case 0:
+                        settings.ssl_min_version = TLS1_VERSION;
+                        break;
+                    case 1:
+                        settings.ssl_min_version = TLS1_1_VERSION;
+                        break;
+                    case 2:
+                        settings.ssl_min_version = TLS1_2_VERSION;
+                        break;
+#if defined(TLS1_3_VERSION)
+                    case 3:
+                        settings.ssl_min_version = TLS1_3_VERSION;
+                        break;
+#endif
+                    default:
+                        fprintf(stderr, "Invalid ssl_min_version. Use help to see valid options.\n");
+                        return 1;
+                }
+                break;
+            }
 #endif
             case MODERN:
                 /* currently no new defaults */
@@ -5329,6 +5551,25 @@ int main (int argc, char **argv) {
                 }
                 settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
                 break;
+#ifdef PROXY
+            case PROXY_CONFIG:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing proxy_config file argument\n");
+                    return 1;
+                }
+                if (protocol_specified) {
+                    fprintf(stderr, "Cannot specify a protocol with proxy mode enabled\n");
+                    return 1;
+                }
+                settings.proxy_startfile = strdup(subopts_value);
+                settings.proxy_enabled = true;
+                settings.binding_protocol = proxy_prot;
+                protocol_specified = true;
+                break;
+            case PROXY_URING:
+                settings.proxy_uring = true;
+                break;
+#endif
 #ifdef MEMCACHED_DEBUG
             case RELAXED_PRIVILEGES:
                 settings.relaxed_privileges = true;
@@ -5542,18 +5783,14 @@ int main (int argc, char **argv) {
         fprintf(stderr, "failed to getrlimit number of files\n");
         exit(EX_OSERR);
     } else {
-#ifdef MEMCACHED_DEBUG
-        if (rlim.rlim_cur < settings.maxconns || rlim.rlim_max < settings.maxconns) {
-#endif
         rlim.rlim_cur = settings.maxconns;
         rlim.rlim_max = settings.maxconns;
         if (setrlimit(RLIMIT_NOFILE, &rlim) != 0) {
+#ifndef MEMCACHED_DEBUG
             fprintf(stderr, "failed to set rlimit for open files. Try starting as root or requesting smaller maxconns value.\n");
             exit(EX_OSERR);
-        }
-#ifdef MEMCACHED_DEBUG
-        }
 #endif
+        }
     }
 
     /* lose root privileges if we have them */
@@ -5736,6 +5973,14 @@ int main (int argc, char **argv) {
         exit(EX_OSERR);
     }
     /* start up worker threads if MT mode */
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        proxy_init(settings.proxy_uring);
+        if (proxy_load_config(settings.proxy_ctx) != 0) {
+            exit(EXIT_FAILURE);
+        }
+    }
+#endif
 #ifdef EXTSTORE
     slabs_set_storage(storage);
     memcached_thread_init(settings.num_threads, storage);
@@ -5835,7 +6080,11 @@ int main (int argc, char **argv) {
         errno = 0;
         if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
-            vperror("failed to listen on TCP port %d", settings.port);
+            if (settings.inter == NULL) {
+                vperror("failed to listen on TCP port %d", settings.port);
+            } else {
+                vperror("failed to listen on one of interface(s) %s", settings.inter);
+            }
             exit(EX_OSERR);
         }
 
@@ -5850,7 +6099,11 @@ int main (int argc, char **argv) {
         errno = 0;
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
-            vperror("failed to listen on UDP port %d", settings.udpport);
+            if (settings.inter == NULL) {
+                vperror("failed to listen on UDP port %d", settings.udpport);
+            } else {
+                vperror("failed to listen on one of interface(s) %s", settings.inter);
+            }
             exit(EX_OSERR);
         }
 

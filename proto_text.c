@@ -5,20 +5,121 @@
 
 #include "memcached.h"
 #include "proto_text.h"
+// FIXME: only for process_proxy_stats()
+// - some better/different structure for stats subcommands
+// would remove this abstraction leak.
+#include "proto_proxy.h"
 #include "authfile.h"
 #include "storage.h"
+#include "base64.h"
 #ifdef TLS
 #include "tls.h"
 #endif
 #include <string.h>
 #include <stdlib.h>
 
-static void process_command(conn *c, char *command);
+#define META_SPACE(p) { \
+    *p = ' '; \
+    p++; \
+}
+
+#define META_CHAR(p, c) { \
+    *p = ' '; \
+    *(p+1) = c; \
+    p += 2; \
+}
+
+// NOTE: being a little casual with the write buffer.
+// the buffer needs to be sized that the longest possible meta response will
+// fit. Here we allow the key to fill up to half the write buffer, in case
+// something terrible has gone wrong.
+#define META_KEY(p, key, nkey, bin) { \
+    META_CHAR(p, 'k'); \
+    if (!bin) { \
+        memcpy(p, key, nkey); \
+        p += nkey; \
+    } else { \
+        p += base64_encode((unsigned char *) key, nkey, (unsigned char *)p, WRITE_BUFFER_SIZE / 2); \
+        *p = ' '; \
+        *(p+1) = 'b'; \
+        p += 2; \
+    } \
+}
 
 typedef struct token_s {
     char *value;
     size_t length;
 } token_t;
+
+static void _finalize_mset(conn *c, enum store_item_type ret) {
+    mc_resp *resp = c->resp;
+    item *it = c->item;
+    conn_set_state(c, conn_new_cmd);
+
+    // information about the response line has been stashed in wbuf.
+    char *p = resp->wbuf + resp->wbytes;
+    char *end = p; // end of the stashed data portion.
+
+    switch (ret) {
+    case STORED:
+      if (settings.meta_response_old) {
+          memcpy(p, "OK", 2);
+      } else {
+          memcpy(p, "HD", 2);
+      }
+      // Only place noreply is used for meta cmds is a nominal response.
+      if (c->noreply) {
+          resp->skip = true;
+      }
+      break;
+    case EXISTS:
+      memcpy(p, "EX", 2);
+      break;
+    case NOT_FOUND:
+      memcpy(p, "NF", 2);
+      break;
+    case NOT_STORED:
+      memcpy(p, "NS", 2);
+      break;
+    default:
+      c->noreply = false;
+      out_string(c, "SERVER_ERROR Unhandled storage type.");
+      return;
+    }
+    p += 2;
+
+    for (char *fp = resp->wbuf; fp < end; fp++) {
+        switch (*fp) {
+            case 'O':
+                // Copy stashed opaque.
+                META_SPACE(p);
+                while (fp < end && *fp != ' ') {
+                    *p = *fp;
+                    p++;
+                    fp++;
+                }
+                break;
+            case 'k':
+                // Encode the key here instead of earlier to minimize copying.
+                META_KEY(p, ITEM_key(it), it->nkey, (it->it_flags & ITEM_KEY_BINARY));
+                break;
+            case 'c':
+                // We don't have the CAS until this point, which is why we
+                // generate this line so late.
+                META_CHAR(p, 'c');
+                p = itoa_u64(c->cas, p);
+                break;
+            default:
+                break;
+        }
+    }
+
+    memcpy(p, "\r\n", 2);
+    p += 2;
+    // we're offset into wbuf, but good convention to track wbytes.
+    resp->wbytes = p - resp->wbuf;
+    resp_add_iov(resp, end, p - end);
+}
 
 /*
  * we get here after reading the value in set/add/replace commands. The command
@@ -104,31 +205,7 @@ void complete_nread_ascii(conn *c) {
 #endif
 
       if (c->mset_res) {
-          // Replace the status code in the response.
-          // Rest was prepared during mset parsing.
-          mc_resp *resp = c->resp;
-          conn_set_state(c, conn_new_cmd);
-          switch (ret) {
-          case STORED:
-              memcpy(resp->wbuf, "OK ", 3);
-              // Only place noreply is used for meta cmds is a nominal response.
-              if (c->noreply) {
-                  resp->skip = true;
-              }
-              break;
-          case EXISTS:
-              memcpy(resp->wbuf, "EX ", 3);
-              break;
-          case NOT_FOUND:
-              memcpy(resp->wbuf, "NF ", 3);
-              break;
-          case NOT_STORED:
-              memcpy(resp->wbuf, "NS ", 3);
-              break;
-          default:
-              c->noreply = false;
-              out_string(c, "SERVER_ERROR Unhandled storage type.");
-          }
+          _finalize_mset(c, ret);
       } else {
           switch (ret) {
           case STORED:
@@ -206,10 +283,9 @@ void complete_nread_ascii(conn *c) {
 static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
     char *s, *e;
     size_t ntokens = 0;
+    assert(command != NULL && tokens != NULL && max_tokens > 1);
     size_t len = strlen(command);
     unsigned int i = 0;
-
-    assert(command != NULL && tokens != NULL && max_tokens > 1);
 
     s = e = command;
     for (i = 0; i < len; i++) {
@@ -265,7 +341,7 @@ int try_read_command_asciiauth(conn *c) {
 
         // If no newline after 1k, getting junk data, close out.
         if (!el) {
-            if (c->rbytes > 1024) {
+            if (c->rbytes > 2048) {
                 conn_set_state(c, conn_closing);
                 return 1;
             }
@@ -367,9 +443,9 @@ int try_read_command_ascii(conn *c) {
 
     el = memchr(c->rcurr, '\n', c->rbytes);
     if (!el) {
-        if (c->rbytes > 1024) {
+        if (c->rbytes > 2048) {
             /*
-             * We didn't have a '\n' in the first k. This _has_ to be a
+             * We didn't have a '\n' in the first few k. This _has_ to be a
              * large multiget, if not we should just nuke the connection.
              */
             char *ptr = c->rcurr;
@@ -406,7 +482,7 @@ int try_read_command_ascii(conn *c) {
     assert(cont <= (c->rcurr + c->rbytes));
 
     c->last_cmd_time = current_time;
-    process_command(c, c->rcurr);
+    process_command_ascii(c, c->rcurr);
 
     c->rbytes -= (cont - c->rcurr);
     c->rcurr = cont;
@@ -717,6 +793,10 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     } else if (strcmp(subcommand, "extstore") == 0) {
         process_extstore_stats(&append_stats, c);
 #endif
+#ifdef PROXY
+    } else if (strcmp(subcommand, "proxy") == 0) {
+        process_proxy_stats(&append_stats, c);
+#endif
     } else {
         /* getting here means that the subcommand is either engine specific or
            is invalid. query the engine and see. */
@@ -744,19 +824,28 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     }
 }
 
-
-
 // slow snprintf for debugging purposes.
 static void process_meta_command(conn *c, token_t *tokens, const size_t ntokens) {
     assert(c != NULL);
 
-    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+    if (ntokens < 3 || tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
 
     char *key = tokens[KEY_TOKEN].value;
     size_t nkey = tokens[KEY_TOKEN].length;
+
+    if (ntokens >= 4 && tokens[2].length == 1 && tokens[2].value[0] == 'b') {
+        size_t ret = base64_decode((unsigned char *)key, nkey,
+                    (unsigned char *)key, nkey);
+        if (ret == 0) {
+            // failed to decode.
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        nkey = ret;
+    }
 
     bool overflow; // not used here.
     item *it = limited_get(key, nkey, c, 0, false, DONT_UPDATE, &overflow);
@@ -767,8 +856,15 @@ static void process_meta_command(conn *c, token_t *tokens, const size_t ntokens)
         // similar to out_string().
         memcpy(resp->wbuf, "ME ", 3);
         total += 3;
-        memcpy(resp->wbuf + total, ITEM_key(it), it->nkey);
-        total += it->nkey;
+        if (it->it_flags & ITEM_KEY_BINARY) {
+            // re-encode from memory rather than copy the original key;
+            // to help give confidence that what in memory is what we asked
+            // for.
+            total += base64_encode((unsigned char *) ITEM_key(it), it->nkey, (unsigned char *)resp->wbuf + total, WRITE_BUFFER_SIZE - total);
+        } else {
+            memcpy(resp->wbuf + total, ITEM_key(it), it->nkey);
+            total += it->nkey;
+        }
         resp->wbuf[total] = ' ';
         total++;
 
@@ -808,24 +904,25 @@ struct _meta_flags {
     unsigned int no_reply :1;
     unsigned int has_cas :1;
     unsigned int new_ttl :1;
+    unsigned int key_binary:1;
     char mode; // single character mode switch, common to ms/ma
     rel_time_t exptime;
     rel_time_t autoviv_exptime;
     rel_time_t recache_time;
-    int32_t value_len;
     uint32_t client_flags;
     uint64_t req_cas_id;
     uint64_t delta; // ma
     uint64_t initial; // ma
 };
 
-static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
+static int _meta_flag_preparse(token_t *tokens, const size_t start,
         struct _meta_flags *of, char **errstr) {
     unsigned int i;
+    size_t ret;
     int32_t tmp_int;
     uint8_t seen[127] = {0};
     // Start just past the key token. Look at first character of each token.
-    for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
+    for (i = start; tokens[i].length != 0; i++) {
         uint8_t o = (uint8_t)tokens[i].value[0];
         // zero out repeat flags so we don't over-parse for return data.
         if (o >= 127 || seen[o] != 0) {
@@ -834,6 +931,19 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
         }
         seen[o] = 1;
         switch (o) {
+            // base64 decode the key in-place, as the binary should always be
+            // shorter and the conversion code buffers bytes.
+            case 'b':
+                ret = base64_decode((unsigned char *)tokens[KEY_TOKEN].value, tokens[KEY_TOKEN].length,
+                            (unsigned char *)tokens[KEY_TOKEN].value, tokens[KEY_TOKEN].length);
+                if (ret == 0) {
+                    // Failed to decode
+                    *errstr = "CLIENT_ERROR error decoding key";
+                    of->has_error = 1;
+                }
+                tokens[KEY_TOKEN].length = ret;
+                of->key_binary = 1;
+                break;
             /* Negative exptimes can underflow and end up immortal. realtime() will
                immediately expire values that are greater than REALTIME_MAXDELTA, but less
                than process_started, so lets aim for that. */
@@ -871,6 +981,8 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
                 of->locked = 1; // need locked to delay LRU bump
                 break;
             case 'O':
+            case 'P':
+            case 'L':
                 break;
             case 'k': // known but no special handling
             case 's':
@@ -894,20 +1006,6 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
             case 'F':
                 if (!safe_strtoul(tokens[i].value+1, &of->client_flags)) {
                     of->has_error = true;
-                }
-                break;
-            case 'S':
-                if (!safe_strtol(tokens[i].value+1, &tmp_int)) {
-                    of->has_error = true;
-                } else {
-                    // Size is adjusted for underflow or overflow once the
-                    // \r\n terminator is added.
-                    if (tmp_int < 0 || tmp_int > (INT_MAX - 2)) {
-                        *errstr = "CLIENT_ERROR invalid length";
-                        of->has_error = true;
-                    } else {
-                        of->value_len = tmp_int + 2; // \r\n
-                    }
                 }
                 break;
             case 'C': // mset, mdelete, marithmetic
@@ -950,17 +1048,6 @@ static int _meta_flag_preparse(token_t *tokens, const size_t ntokens,
     return of->has_error ? -1 : 0;
 }
 
-#define META_SPACE(p) { \
-    *p = ' '; \
-    p++; \
-}
-
-#define META_CHAR(p, c) { \
-    *p = ' '; \
-    *(p+1) = c; \
-    p += 2; \
-}
-
 static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key;
     size_t nkey;
@@ -973,19 +1060,17 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
     bool won_token = false;
     bool ttl_set = false;
     char *errstr = "CLIENT_ERROR bad command line format";
+    assert(c != NULL);
     mc_resp *resp = c->resp;
     char *p = resp->wbuf;
 
-    assert(c != NULL);
     WANT_TOKENS_MIN(ntokens, 3);
 
+    // FIXME: do we move this check to after preparse?
     if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_errstring(c, "CLIENT_ERROR bad command line format");
         return;
     }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
 
     // NOTE: final token has length == 0.
     // KEY_TOKEN == 1. 0 is command.
@@ -1001,11 +1086,16 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
     }
 
     // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
+    // we pass in the first token that should be a flag.
+    if (_meta_flag_preparse(tokens, 2, &of, &errstr) != 0) {
         out_errstring(c, errstr);
         return;
     }
     c->noreply = of.no_reply;
+
+    // Grab key and length after meta preparsing in case it was decoded.
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
 
     // TODO: need to indicate if the item was overflowed or not?
     // I think we do, since an overflow shouldn't trigger an alloc/replace.
@@ -1050,7 +1140,11 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
             memcpy(p, "VA ", 3);
             p = itoa_u32(it->nbytes-2, p+3);
         } else {
-            memcpy(p, "OK", 2);
+            if (settings.meta_response_old) {
+                memcpy(p, "OK", 2);
+            } else {
+                memcpy(p, "HD", 2);
+            }
             p += 2;
         }
 
@@ -1128,9 +1222,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
                     p += tokens[i].length;
                     break;
                 case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, ITEM_key(it), it->nkey);
-                    p += it->nkey;
+                    META_KEY(p, ITEM_key(it), it->nkey, (it->it_flags & ITEM_KEY_BINARY));
                     break;
             }
         }
@@ -1267,11 +1359,12 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
     short comm = NREAD_SET;
     struct _meta_flags of = {0}; // option bitflags.
     char *errstr = "CLIENT_ERROR bad command line format";
-    uint32_t hv;
+    uint32_t hv; // cached hash value.
+    int vlen = 0; // value from data line.
+    assert(c != NULL);
     mc_resp *resp = c->resp;
     char *p = resp->wbuf;
 
-    assert(c != NULL);
     WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
@@ -1279,9 +1372,6 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
         out_errstring(c, "CLIENT_ERROR bad command line format");
         return;
     }
-
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
 
     if (ntokens == 3) {
         out_errstring(c, "CLIENT_ERROR bad command line format");
@@ -1293,17 +1383,35 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
         return;
     }
 
-    // leave space for the status code.
-    p = resp->wbuf + 3;
+    // We note tokens into the front of the write buffer, so we can create the
+    // final buffer in complete_nread_ascii.
+    p = resp->wbuf;
+
+    if (!safe_strtol(tokens[KEY_TOKEN + 1].value, (int32_t*)&vlen)) {
+        out_errstring(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    if (vlen < 0 || vlen > (INT_MAX - 2)) {
+        out_errstring(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+    vlen += 2;
 
     // We need to at least try to get the size to properly slurp bad bytes
     // after an error.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
+    // we pass in the first token that should be a flag.
+    if (_meta_flag_preparse(tokens, 3, &of, &errstr) != 0) {
         goto error;
     }
 
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
     // Set noreply after tokens are understood.
     c->noreply = of.no_reply;
+    // Clear cas return value
+    c->cas = 0;
 
     bool has_error = false;
     for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
@@ -1321,8 +1429,10 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
                 break;
             case 'k':
                 META_CHAR(p, 'k');
-                memcpy(p, key, nkey);
-                p += nkey;
+                break;
+            case 'c':
+                // need to set the cas value post-assignment.
+                META_CHAR(p, 'c');
                 break;
         }
     }
@@ -1365,18 +1475,24 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
     if (has_error)
         goto error;
 
-    it = item_alloc(key, nkey, of.client_flags, of.exptime, of.value_len);
+    it = item_alloc(key, nkey, of.client_flags, of.exptime, vlen);
 
     if (it == 0) {
         enum store_item_type status;
         // TODO: These could be normalized codes (TL and OM). Need to
         // reorganize the output stuff a bit though.
-        if (! item_size_ok(nkey, of.client_flags, of.value_len)) {
+        if (! item_size_ok(nkey, of.client_flags, vlen)) {
             errstr = "SERVER_ERROR object too large for cache";
             status = TOO_LARGE;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.store_too_large++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
         } else {
             errstr = "SERVER_ERROR out of memory storing object";
             status = NO_MEMORY;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.store_no_memory++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
         }
         // FIXME: LOGGER_LOG specific to mset, include options.
         LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
@@ -1408,20 +1524,24 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
 #endif
     c->rlbytes = it->nbytes;
     c->cmd = comm;
+
+    // Prevent printing back the key in meta commands as garbage.
+    if (of.key_binary) {
+        it->it_flags |= ITEM_KEY_BINARY;
+    }
+
     if (of.set_stale && comm == NREAD_CAS) {
         c->set_stale = true;
     }
     resp->wbytes = p - resp->wbuf;
-    memcpy(resp->wbuf + resp->wbytes, "\r\n", 2);
-    resp->wbytes += 2;
-    // We've written the status line into wbuf, use wbytes to finalize later.
-    resp_add_iov(resp, resp->wbuf, resp->wbytes);
+    // we don't set up the iov here, instead after complete_nread_ascii when
+    // we have the full status code and item data.
     c->mset_res = true;
     conn_set_state(c, conn_nread);
     return;
 error:
     /* swallow the data line */
-    c->sbytes = of.value_len;
+    c->sbytes = vlen;
 
     // Note: no errors possible after the item was successfully allocated.
     // So we're just looking at dumping error codes and returning.
@@ -1433,17 +1553,16 @@ error:
 static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntokens) {
     char *key;
     size_t nkey;
-    uint64_t req_cas_id = 0;
     item *it = NULL;
     int i;
     uint32_t hv;
     struct _meta_flags of = {0}; // option bitflags.
     char *errstr = "CLIENT_ERROR bad command line format";
+    assert(c != NULL);
     mc_resp *resp = c->resp;
     // reserve 3 bytes for status code
     char *p = resp->wbuf + 3;
 
-    assert(c != NULL);
     WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
@@ -1452,22 +1571,24 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
         return;
     }
 
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
     if (ntokens > MFLAG_MAX_OPT_LENGTH) {
         out_string(c, "CLIENT_ERROR options flags too long");
         return;
     }
 
     // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
+    // we pass in the first token that should be a flag.
+    // FIXME: not using the preparse errstr?
+    if (_meta_flag_preparse(tokens, 2, &of, &errstr) != 0) {
         out_errstring(c, "CLIENT_ERROR invalid or duplicate flag");
         return;
     }
+    assert(c != NULL);
     c->noreply = of.no_reply;
 
-    assert(c != NULL);
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
     for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
         switch (tokens[i].value[0]) {
             // TODO: macro perhaps?
@@ -1481,9 +1602,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
                 p += tokens[i].length;
                 break;
             case 'k':
-                META_CHAR(p, 'k');
-                memcpy(p, key, nkey);
-                p += nkey;
+                META_KEY(p, key, nkey, of.key_binary);
                 break;
         }
     }
@@ -1493,7 +1612,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
 
         // allow only deleting/marking if a CAS value matches.
-        if (of.has_cas && ITEM_get_cas(it) != req_cas_id) {
+        if (of.has_cas && ITEM_get_cas(it) != of.req_cas_id) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.delete_misses++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -1518,7 +1637,11 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
             // Clients can noreply nominal responses.
             if (c->noreply)
                 resp->skip = true;
-            memcpy(resp->wbuf, "OK ", 3);
+            if (settings.meta_response_old) {
+                memcpy(resp->wbuf, "OK ", 3);
+            } else {
+                memcpy(resp->wbuf, "HD ", 3);
+            }
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
@@ -1528,7 +1651,11 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
             STORAGE_delete(c->thread->storage, it);
             if (c->noreply)
                 resp->skip = true;
-            memcpy(resp->wbuf, "OK ", 3);
+            if (settings.meta_response_old) {
+                memcpy(resp->wbuf, "OK ", 3);
+            } else {
+                memcpy(resp->wbuf, "HD ", 3);
+            }
         }
         goto cleanup;
     } else {
@@ -1561,6 +1688,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
     int i;
     struct _meta_flags of = {0}; // option bitflags.
     char *errstr = "CLIENT_ERROR bad command line format";
+    assert(c != NULL);
     mc_resp *resp = c->resp;
     // no reservation (like del/set) since we post-process the status line.
     char *p = resp->wbuf;
@@ -1573,7 +1701,6 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
     uint32_t hv = 0;
     item *it = NULL; // item returned by do_add_delta.
 
-    assert(c != NULL);
     WANT_TOKENS_MIN(ntokens, 3);
 
     // TODO: most of this is identical to mget.
@@ -1582,22 +1709,23 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
         return;
     }
 
-    key = tokens[KEY_TOKEN].value;
-    nkey = tokens[KEY_TOKEN].length;
-
     if (ntokens > MFLAG_MAX_OPT_LENGTH) {
         out_string(c, "CLIENT_ERROR options flags too long");
         return;
     }
 
     // scrubs duplicated options and sets flags for how to load the item.
-    if (_meta_flag_preparse(tokens, ntokens, &of, &errstr) != 0) {
+    // we pass in the first token that should be a flag.
+    if (_meta_flag_preparse(tokens, 2, &of, &errstr) != 0) {
         out_errstring(c, "CLIENT_ERROR invalid or duplicate flag");
         return;
     }
+    assert(c != NULL);
     c->noreply = of.no_reply;
 
-    assert(c != NULL);
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
     // "mode switch" to alternative commands
     switch (of.mode) {
         case 0: // no switch supplied.
@@ -1630,7 +1758,11 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
     case OK:
         if (c->noreply)
             resp->skip = true;
-        memcpy(resp->wbuf, "OK ", 3);
+        if (settings.meta_response_old) {
+            memcpy(resp->wbuf, "OK ", 3);
+        } else {
+            memcpy(resp->wbuf, "HD ", 3);
+        }
         break;
     case NON_NUMERIC:
         errstr = "CLIENT_ERROR cannot increment or decrement non-numeric value";
@@ -1688,7 +1820,11 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
             memcpy(p, "VA ", 3);
             p = itoa_u32(vlen, p+3);
         } else {
-            memcpy(p, "OK", 2);
+            if (settings.meta_response_old) {
+                memcpy(p, "OK", 2);
+            } else {
+                memcpy(p, "HD", 2);
+            }
             p += 2;
         }
 
@@ -1727,9 +1863,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
                     p += tokens[i].length;
                     break;
                 case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, key, nkey);
-                    p += nkey;
+                    META_KEY(p, key, nkey, of.key_binary);
                     break;
             }
         }
@@ -1758,9 +1892,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
                     p += tokens[i].length;
                     break;
                 case 'k':
-                    META_CHAR(p, 'k');
-                    memcpy(p, key, nkey);
-                    p += nkey;
+                    META_KEY(p, key, nkey, of.key_binary);
                     break;
             }
         }
@@ -1839,9 +1971,15 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         if (! item_size_ok(nkey, flags, vlen)) {
             out_string(c, "SERVER_ERROR object too large for cache");
             status = TOO_LARGE;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.store_too_large++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
         } else {
             out_of_memory(c, "SERVER_ERROR out of memory storing object");
             status = NO_MEMORY;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.store_no_memory++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
         }
         LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
                 NULL, status, comm, key, nkey, 0, 0, c->sfd);
@@ -2067,6 +2205,27 @@ static void process_misbehave_command(conn *c) {
         out_string(c, "OK");
     }
 }
+
+static void process_debugtime_command(conn *c, token_t *tokens, const size_t ntokens) {
+    if (strcmp(tokens[1].value, "p") == 0) {
+        if (!is_paused) {
+            is_paused = true;
+        }
+    } else if (strcmp(tokens[1].value, "r") == 0) {
+        if (is_paused) {
+            is_paused = false;
+        }
+    } else {
+        int64_t time_delta = 0;
+        if (!safe_strtoll(tokens[1].value, &time_delta)) {
+            out_string(c, "ERROR");
+            return;
+        }
+        delta += time_delta;
+        current_time += delta;
+    }
+    out_string(c, "OK");
+}
 #endif
 
 static void process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -2130,6 +2289,14 @@ static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens
                 f |= LOG_MUTATIONS;
             } else if ((strcmp(tokens[x].value, "sysevents") == 0)) {
                 f |= LOG_SYSEVENTS;
+            } else if ((strcmp(tokens[x].value, "connevents") == 0)) {
+                f |= LOG_CONNEVENTS;
+            } else if ((strcmp(tokens[x].value, "proxycmds") == 0)) {
+                f |= LOG_PROXYCMDS;
+            } else if ((strcmp(tokens[x].value, "proxyevents") == 0)) {
+                f |= LOG_PROXYEVENTS;
+            } else if ((strcmp(tokens[x].value, "proxyuser") == 0)) {
+                f |= LOG_PROXYUSER;
             } else {
                 out_string(c, "ERROR");
                 return;
@@ -2274,6 +2441,9 @@ static void process_extstore_command(conn *c, token_t *tokens, const size_t ntok
     } else if (strcmp(tokens[1].value, "drop_under") == 0) {
         if (!safe_strtoul(tokens[2].value, &settings.ext_drop_under))
             ok = false;
+    } else if (strcmp(tokens[1].value, "max_sleep") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_max_sleep))
+            ok = false;
     } else if (strcmp(tokens[1].value, "max_frag") == 0) {
         if (!safe_strtod(tokens[2].value, &settings.ext_max_frag))
             ok = false;
@@ -2346,6 +2516,7 @@ static void process_version_command(conn *c) {
 static void process_quit_command(conn *c) {
     conn_set_state(c, conn_mwrite);
     c->close_after_write = true;
+    c->close_reason = NORMAL_CLOSE;
 }
 
 static void process_shutdown_command(conn *c, token_t *tokens, const size_t ntokens) {
@@ -2355,9 +2526,11 @@ static void process_shutdown_command(conn *c, token_t *tokens, const size_t ntok
     }
 
     if (ntokens == 2) {
+        c->close_reason = SHUTDOWN_CLOSE;
         conn_set_state(c, conn_closing);
         raise(SIGINT);
     } else if (ntokens == 3 && strcmp(tokens[SUBCOMMAND_TOKEN].value, "graceful") == 0) {
+        c->close_reason = SHUTDOWN_CLOSE;
         conn_set_state(c, conn_closing);
         raise(SIGUSR1);
     } else {
@@ -2540,7 +2713,7 @@ static void process_refresh_certs_command(conn *c, token_t *tokens, const size_t
 // we can't drop out and back in again.
 // Leaving this note here to spend more time on a fix when necessary, or if an
 // opportunity becomes obvious.
-static void process_command(conn *c, char *command) {
+void process_command_ascii(conn *c, char *command) {
 
     token_t tokens[MAX_TOKENS];
     size_t ntokens;
@@ -2673,6 +2846,11 @@ static void process_command(conn *c, char *command) {
 
             WANT_TOKENS_OR(ntokens, 4, 5);
             process_arithmetic_command(c, tokens, ntokens, 0);
+#ifdef MEMCACHED_DEBUG
+        } else if (strcmp(tokens[COMMAND_TOKEN].value, "debugtime") == 0) {
+            WANT_TOKENS_MIN(ntokens, 2);
+            process_debugtime_command(c, tokens, ntokens);
+#endif
         } else {
             out_string(c, "ERROR");
         }
