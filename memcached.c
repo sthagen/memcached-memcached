@@ -233,6 +233,7 @@ static void settings_init(void) {
     settings.ssl_last_cert_refresh_time = current_time;
     settings.ssl_wbuf_size = 16 * 1024; // default is 16KB (SSL max frame size is 17KB)
     settings.ssl_session_cache = false;
+    settings.ssl_kernel_tls = false;
     settings.ssl_min_version = TLS1_2_VERSION;
 #endif
     /* By default this string should be NULL for getaddrinfo() */
@@ -729,6 +730,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             fprintf(stderr, "<%d new ascii client connection.\n", sfd);
         } else if (c->protocol == binary_prot) {
             fprintf(stderr, "<%d new binary client connection.\n", sfd);
+#ifdef PROXY
+        } else if (c->protocol == proxy_prot) {
+            fprintf(stderr, "<%d new proxy client connection.\n", sfd);
+#endif
         } else {
             fprintf(stderr, "<%d new unknown (%d) client connection\n",
                 sfd, c->protocol);
@@ -1976,6 +1981,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("ssl_ca_cert", "%s", settings.ssl_ca_cert ? settings.ssl_ca_cert : "NULL");
     APPEND_STAT("ssl_wbuf_size", "%u", settings.ssl_wbuf_size);
     APPEND_STAT("ssl_session_cache", "%s", settings.ssl_session_cache ? "yes" : "no");
+    APPEND_STAT("ssl_kernel_tls", "%s", settings.ssl_kernel_tls ? "yes" : "no");
     APPEND_STAT("ssl_min_version", "%s", ssl_proto_text(settings.ssl_min_version));
 #endif
 #ifdef PROXY
@@ -4069,15 +4075,15 @@ static void usage(void) {
            "                          (default: %u)\n", settings.ssl_wbuf_size / (1 << 10));
     printf("   - ssl_session_cache:   enable server-side SSL session cache, to support session\n"
            "                          resumption\n"
-           "   - ssl_min_version:     minimum protocol version to accept (default: %s)\n"
+           "   - ssl_kernel_tls:      enable kernel TLS offload\n"
+           "   - ssl_min_version:     minimum protocol version to accept (default: %s)\n",
+           ssl_proto_text(settings.ssl_min_version));
 #if defined(TLS1_3_VERSION)
-           "                          valid values are 0(%s), 1(%s), 2(%s), or 3(%s).\n",
-           ssl_proto_text(settings.ssl_min_version),
+    printf("                          valid values are 0(%s), 1(%s), 2(%s), or 3(%s).\n",
            ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
            ssl_proto_text(TLS1_2_VERSION), ssl_proto_text(TLS1_3_VERSION));
 #else
-           "                          valid values are 0(%s), 1(%s), or 2(%s).\n",
-           ssl_proto_text(settings.ssl_min_version),
+    printf("                          valid values are 0(%s), 1(%s), or 2(%s).\n",
            ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
            ssl_proto_text(TLS1_2_VERSION));
 #endif
@@ -4743,6 +4749,7 @@ int main (int argc, char **argv) {
         SSL_CA_CERT,
         SSL_WBUF_SIZE,
         SSL_SESSION_CACHE,
+        SSL_KERNEL_TLS,
         SSL_MIN_VERSION,
 #endif
 #ifdef PROXY
@@ -4802,6 +4809,7 @@ int main (int argc, char **argv) {
         [SSL_CA_CERT] = "ssl_ca_cert",
         [SSL_WBUF_SIZE] = "ssl_wbuf_size",
         [SSL_SESSION_CACHE] = "ssl_session_cache",
+        [SSL_KERNEL_TLS] = "ssl_kernel_tls",
         [SSL_MIN_VERSION] = "ssl_min_version",
 #endif
 #ifdef PROXY
@@ -5483,6 +5491,9 @@ int main (int argc, char **argv) {
             case SSL_SESSION_CACHE:
                 settings.ssl_session_cache = true;
                 break;
+            case SSL_KERNEL_TLS:
+                settings.ssl_kernel_tls = true;
+                break;
             case SSL_MIN_VERSION: {
                 int min_version;
                 if (subopts_value == NULL) {
@@ -5728,6 +5739,11 @@ int main (int argc, char **argv) {
 
     if (udp_specified && settings.udpport != 0 && !tcp_specified) {
         settings.port = settings.udpport;
+    }
+
+    if (settings.port > 65535) {
+        fprintf(stderr, "ERROR: Invalid port number %d.\n", settings.port);
+        exit(EX_USAGE);
     }
 
 

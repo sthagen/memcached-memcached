@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include <lua.h>
 #include <lualib.h>
@@ -154,11 +155,7 @@ typedef struct {
     bool set; // NOTE: not sure if necessary if code structured properly
 } proxy_event_t;
 
-static struct __kernel_timespec updater_ts = {.tv_sec = 3, .tv_nsec = 0};
-static void _proxy_evthr_evset_notifier(proxy_event_thread_t *t);
-static void _proxy_evthr_evset_clock(proxy_event_thread_t *t);
-static void *proxy_event_thread_ur(void *arg);
-static void proxy_event_updater_ur(void *udata, struct io_uring_cqe *cqe);
+void *proxy_event_thread_ur(void *arg);
 #endif
 
 // Note: This ends up wasting a few counters, but simplifies the rest of the
@@ -310,7 +307,8 @@ struct mcp_backend_s {
     void *client; // mcmc client
     STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
     io_head_t io_head; // stack of requests.
-    char *rbuf; // static allocated read buffer.
+    char *rbuf; // statically allocated read buffer.
+    size_t rbufused; // currently active bytes in the buffer
     struct event event; // libevent
 #ifdef HAVE_LIBURING
     proxy_event_t ur_rd_ev; // liburing.
@@ -364,13 +362,14 @@ enum mcp_resp_mode {
 #define RESP_CMD_MAX 8
 typedef struct {
     mcmc_resp_t resp;
-    struct timeval start; // start time inherited from paired request
     char *buf; // response line + potentially value.
     size_t blen; // total size of the value to read.
     int status; // status code from mcmc_read()
     int bread; // amount of bytes read into value so far.
-    char cmd[RESP_CMD_MAX+1]; // until we can reverse CMD_*'s to strings directly.
+    uint8_t cmd; // from parser (pr.command)
     enum mcp_resp_mode mode; // reply mode (for noreply fixing)
+    char be_name[MAX_NAMELEN+1];
+    char be_port[MAX_PORTLEN+1];
 } mcp_resp_t;
 
 // re-cast an io_pending_t into this more descriptive structure.
@@ -458,6 +457,8 @@ int mcplib_request_ltrimkey(lua_State *L);
 int mcplib_request_rtrimkey(lua_State *L);
 int mcplib_request_token(lua_State *L);
 int mcplib_request_ntokens(lua_State *L);
+int mcplib_request_has_flag(lua_State *L);
+int mcplib_request_flag_token(lua_State *L);
 int mcplib_request_gc(lua_State *L);
 
 int mcplib_open_dist_jump_hash(lua_State *L);

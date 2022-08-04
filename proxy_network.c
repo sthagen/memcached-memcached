@@ -9,7 +9,7 @@ static void proxy_event_updater(evutil_socket_t fd, short which, void *arg);
 static int _flush_pending_write(mcp_backend_t *be);
 static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err);
 static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t, event_callback_fn callback);
-static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf, size_t *toread);
+static int proxy_backend_drive_machine(mcp_backend_t *be);
 
 static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
     io_head_t head;
@@ -33,6 +33,9 @@ static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
 
         // _no_ mutex on backends. they are owned by the event thread.
         STAILQ_REMOVE_HEAD(&head, io_next);
+        // paranoia about moving items between lists.
+        io->io_next.stqe_next = NULL;
+
         if (be->bad) {
             P_DEBUG("%s: fast failing request to bad backend\n", __func__);
             io->client_resp->status = MCMC_ERR;
@@ -44,6 +47,8 @@ static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
         io_count++;
         if (!be->stacked) {
             be->stacked = true;
+            // more paranoia about be_next not being overwritten
+            be->be_next.stqe_next = NULL;
             STAILQ_INSERT_TAIL(&t->be_head, be, be_next);
             be_count++;
         }
@@ -56,6 +61,10 @@ static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
 static void _proxy_evthr_evset_be_read(mcp_backend_t *be, char *buf, size_t len, struct __kernel_timespec *ts);
 static void _proxy_evthr_evset_be_wrpoll(mcp_backend_t *be, struct __kernel_timespec *ts);
 static void _proxy_evthr_evset_be_retry(mcp_backend_t *be);
+static void _proxy_evthr_evset_notifier(proxy_event_thread_t *t);
+static void _proxy_evthr_evset_clock(proxy_event_thread_t *t);
+static void proxy_event_updater_ur(void *udata, struct io_uring_cqe *cqe);
+struct __kernel_timespec updater_ts = {.tv_sec = 3, .tv_nsec = 0};
 
 static void proxy_event_updater_ur(void *udata, struct io_uring_cqe *cqe) {
     proxy_event_thread_t *t = udata;
@@ -113,8 +122,6 @@ static void _backend_failed_ur(mcp_backend_t *be) {
 static void proxy_backend_handler_ur(void *udata, struct io_uring_cqe *cqe) {
     mcp_backend_t *be = udata;
     int bread = cqe->res;
-    char *rbuf = NULL;
-    size_t toread = 0;
     // Error or disconnection.
     if (bread <= 0) {
         _reset_bad_backend(be, P_BE_FAIL_DISCONNECTED);
@@ -125,11 +132,12 @@ static void proxy_backend_handler_ur(void *udata, struct io_uring_cqe *cqe) {
         return;
     }
 
-    int res = proxy_backend_drive_machine(be, bread, &rbuf, &toread);
-    P_DEBUG("%s: bread: %d res: %d toread: %lu\n", __func__, bread, res, toread);
+    be->rbufused += bread;
+    int res = proxy_backend_drive_machine(be);
 
     if (res > 0) {
-        _proxy_evthr_evset_be_read(be, rbuf, toread, &be->event_thread->tunables.read_ur);
+        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->event_thread->tunables.read_ur);
+        return;
     } else if (res == -1) {
         _reset_bad_backend(be, P_BE_FAIL_DISCONNECTED);
         return;
@@ -137,7 +145,7 @@ static void proxy_backend_handler_ur(void *udata, struct io_uring_cqe *cqe) {
 
     // TODO (v2): when exactly do we need to reset the backend handler?
     if (!STAILQ_EMPTY(&be->io_head)) {
-        _proxy_evthr_evset_be_read(be, be->rbuf, READ_BUFFER_SIZE, &be->event_thread->tunables.read_ur);
+        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->event_thread->tunables.read_ur);
     }
 }
 
@@ -339,7 +347,7 @@ static void _proxy_evthr_evset_notifier(proxy_event_thread_t *t) {
 // - after CQE's are processed, backends are processed (ouch?)
 //   - if SQE's starve here, bail but keep the BE queue.
 // - then submit SQE's
-static void *proxy_event_thread_ur(void *arg) {
+void *proxy_event_thread_ur(void *arg) {
     proxy_event_thread_t *t = arg;
     struct io_uring_cqe *cqe;
 
@@ -494,10 +502,9 @@ static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, st
 // TODO (v2): second argument with enum for a specific error.
 // - probably just for logging. for app if any of these errors shouldn't
 // result in killing the request stack!
-static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf, size_t *toread) {
+static int proxy_backend_drive_machine(mcp_backend_t *be) {
     bool stop = false;
     io_pending_proxy_t *p = NULL;
-    mcmc_resp_t tmp_resp; // helper for testing for GET's END marker.
     int flags = 0;
 
     p = STAILQ_FIRST(&be->io_head);
@@ -516,31 +523,19 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
     while (!stop) {
         mcp_resp_t *r;
         int res = 1;
-        int remain = 0;
-        char *newbuf = NULL;
 
     switch(be->state) {
         case mcp_backend_read:
             assert(p != NULL);
-            P_DEBUG("%s: [read] bread: %d\n", __func__, bread);
-
-            if (bread == 0) {
-                // haven't actually done a read yet; figure out where/what.
-                *rbuf = mcmc_read_prep(be->client, be->rbuf, READ_BUFFER_SIZE, toread);
-                return EV_READ;
-            } else {
-                be->state = mcp_backend_parse;
-            }
+            // FIXME: remove the _read state?
+            be->state = mcp_backend_parse;
             break;
         case mcp_backend_parse:
             r = p->client_resp;
-            r->status = mcmc_parse_buf(be->client, be->rbuf, bread, &r->resp);
-            // FIXME (v2): Don't like how this mcmc API ended up.
-            bread = 0; // only add the bread once per loop.
+            r->status = mcmc_parse_buf(be->client, be->rbuf, be->rbufused, &r->resp);
             if (r->status != MCMC_OK) {
                 P_DEBUG("%s: mcmc_read failed [%d]\n", __func__, r->status);
                 if (r->status == MCMC_WANT_READ) {
-                    *rbuf = mcmc_read_prep(be->client, be->rbuf, READ_BUFFER_SIZE, toread);
                     return EV_READ;
                 } else {
                     flags = -1;
@@ -602,15 +597,17 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
 
                 P_DEBUG("%s: r->status: %d, r->bread: %d, r->vlen: %lu\n", __func__, r->status, r->bread, r->resp.vlen);
                 if (r->resp.vlen != r->resp.vlen_read) {
+                    // shouldn't be possible to have excess in buffer
+                    // if we're dealing with a partial value.
+                    assert(be->rbufused == r->resp.reslen+r->resp.vlen_read);
                     P_DEBUG("%s: got a short read, moving to want_read\n", __func__);
                     // copy the partial and advance mcmc's buffer digestion.
-                    // FIXME (v2): should call this for both cases?
-                    // special function for advancing mcmc's buffer for
-                    // reading a value? perhaps a flag to skip the data copy
-                    // when it's unnecessary?
-                    memcpy(r->buf, be->rbuf, r->resp.reslen);
-                    r->status = mcmc_read_value_buf(be->client, r->buf+r->resp.reslen, r->resp.vlen, &r->bread);
+                    memcpy(r->buf, be->rbuf, r->resp.reslen + r->resp.vlen_read);
+                    r->bread = r->resp.reslen + r->resp.vlen_read;
+                    be->rbufused = 0;
                     be->state = mcp_backend_want_read;
+                    flags |= EV_READ;
+                    stop = true;
                     break;
                 } else {
                     // mcmc's already counted the value as read if it fit in
@@ -627,14 +624,13 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
                 break;
             }
 
-            if (r->resp.type == MCMC_RESP_GET) {
-                // advance the buffer
-                newbuf = mcmc_buffer_consume(be->client, &remain);
-                if (remain != 0) {
-                    // TODO (v2): don't need to shuffle buffer with better API
-                    memmove(be->rbuf, newbuf, remain);
-                }
+            // had a response, advance the buffer.
+            be->rbufused -= r->resp.reslen + r->resp.vlen_read;
+            if (be->rbufused > 0) {
+                memmove(be->rbuf, be->rbuf+r->resp.reslen+r->resp.vlen_read, be->rbufused);
+            }
 
+            if (r->resp.type == MCMC_RESP_GET) {
                 be->state = mcp_backend_read_end;
             } else {
                 be->state = mcp_backend_next;
@@ -646,32 +642,32 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
             // we need to ensure the next data in the stream is "END\r\n"
             // if not, the stack is desynced and we lose it.
 
-            r->status = mcmc_parse_buf(be->client, be->rbuf, bread, &tmp_resp);
-            bread = 0;
-            P_DEBUG("%s [read_end]: r->status: %d, bread: %d resp.type:%d\n", __func__, r->status, bread, tmp_resp.type);
-            if (r->status != MCMC_OK) {
-                if (r->status == MCMC_WANT_READ) {
-                    *rbuf = mcmc_read_prep(be->client, be->rbuf, READ_BUFFER_SIZE, toread);
-                    return EV_READ;
-                } else {
-                    flags = -1; // TODO (v2): specific error.
+            if (be->rbufused >= ENDLEN) {
+                if (memcmp(be->rbuf, ENDSTR, ENDLEN) != 0) {
+                    // TODO (v2): specific error.
+                    flags = -1;
                     stop = true;
+                    break;
+                } else {
+                    // response is good.
+                    // FIXME (v2): copy what the server actually sent?
+                    if (!p->ascii_multiget) {
+                        // sigh... if part of a multiget we need to eat the END
+                        // markers down here.
+                        memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
+                        r->blen += 5;
+                    }
+
+                    // advance buffer
+                    be->rbufused -= ENDLEN;
+                    if (be->rbufused > 0) {
+                        memmove(be->rbuf, be->rbuf+ENDLEN, be->rbufused);
+                    }
                 }
-                break;
-            } else if (tmp_resp.type != MCMC_RESP_END) {
-                // TODO (v2): specific error about protocol desync
-                flags = -1;
+            } else {
+                flags |= EV_READ;
                 stop = true;
                 break;
-            } else {
-                // response is good.
-                // FIXME (v2): copy what the server actually sent?
-                if (!p->ascii_multiget) {
-                    // sigh... if part of a multiget we need to eat the END
-                    // markers down here.
-                    memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
-                    r->blen += 5;
-                }
             }
 
             be->state = mcp_backend_next;
@@ -682,28 +678,30 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
             r = p->client_resp;
             // take bread input and see if we're done reading the value,
             // else advance, set buffers, return next.
-            if (bread > 0) {
-                r->bread += bread;
-                bread = 0;
-            }
             P_DEBUG("%s: [want_read] r->bread: %d vlen: %lu\n", __func__, r->bread, r->resp.vlen);
+            assert(be->rbufused != 0);
+            size_t tocopy = be->rbufused < r->blen - r->bread ?
+                be->rbufused : r->blen - r->bread;
+            memcpy(r->buf+r->bread, be->rbuf, tocopy);
+            r->bread += tocopy;
 
             if (r->bread >= r->resp.vlen) {
                 // all done copying data.
                 if (r->resp.type == MCMC_RESP_GET) {
-                    newbuf = mcmc_buffer_consume(be->client, &remain);
-                    // Shouldn't be anything in the buffer if we had to run to
-                    // want_read to read the value.
-                    assert(remain == 0);
                     be->state = mcp_backend_read_end;
                 } else {
                     be->state = mcp_backend_next;
                 }
+
+                // shuffle remaining buffer.
+                be->rbufused -= tocopy;
+                if (be->rbufused > 0) {
+                    memmove(be->rbuf, be->rbuf+tocopy, be->rbufused);
+                }
             } else {
+                assert(tocopy == be->rbufused);
                 // signal to caller to issue a read.
-                *rbuf = r->buf+r->resp.reslen+r->bread;
-                *toread = r->resp.vlen - r->bread;
-                // need to retry later.
+                be->rbufused = 0;
                 flags |= EV_READ;
                 stop = true;
             }
@@ -717,28 +715,28 @@ static int proxy_backend_drive_machine(mcp_backend_t *be, int bread, char **rbuf
             // stuff here. The moment we call return_io here we
             // don't own *p anymore.
             return_io_pending((io_pending_t *)p);
+            be->state = mcp_backend_read;
 
             if (STAILQ_EMPTY(&be->io_head)) {
-                // TODO (v2): suspicious of this code. audit harder?
                 stop = true;
+                // TODO: if there're no pending requests, the read buffer
+                // should also be empty.
+                // Get a specific return code for errors to surface this.
+                if (be->rbufused > 0) {
+                    flags = -1;
+                }
+                break;
             } else {
                 p = STAILQ_FIRST(&be->io_head);
             }
 
-            // mcmc_buffer_consume() - if leftover, keep processing
-            // IO's.
+            // if leftover, keep processing IO's.
             // if no more data in buffer, need to re-set stack head and re-set
             // event.
-            remain = 0;
-            // TODO (v2): do we need to yield every N reads?
-            newbuf = mcmc_buffer_consume(be->client, &remain);
-            P_DEBUG("%s: [next] remain: %d\n", __func__, remain);
-            be->state = mcp_backend_read;
-            if (remain != 0) {
+            P_DEBUG("%s: [next] remain: %lu\n", __func__, be->rbufused);
+            if (be->rbufused != 0) {
                 // data trailing in the buffer, for a different request.
-                memmove(be->rbuf, newbuf, remain);
                 be->state = mcp_backend_parse;
-                P_DEBUG("read buffer remaining: %p %d\n", (void *)be, remain);
             } else {
                 // need to read more data, buffer is empty.
                 stop = true;
@@ -811,15 +809,22 @@ const char *proxy_be_failure_text[] = {
 // _must_ be called from within the event thread.
 static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err) {
     io_pending_proxy_t *io = NULL;
-    STAILQ_FOREACH(io, &be->io_head, io_next) {
+    // Can't use STAILQ_FOREACH() since return_io_pending() free's the current
+    // io. STAILQ_FOREACH_SAFE maybe?
+    while (!STAILQ_EMPTY(&be->io_head)) {
+        io = STAILQ_FIRST(&be->io_head);
+        STAILQ_REMOVE_HEAD(&be->io_head, io_next);
         // TODO (v2): Unsure if this is the best way of surfacing errors to lua,
         // but will do for V1.
         io->client_resp->status = MCMC_ERR;
+        be->depth--;
         return_io_pending((io_pending_t *)io);
     }
 
     STAILQ_INIT(&be->io_head);
 
+    // reset buffer to blank state.
+    be->rbufused = 0;
     mcmc_disconnect(be->client);
     int status = mcmc_connect(be->client, be->name, be->port, be->connect_flags);
     if (status == MCMC_CONNECTED) {
@@ -890,6 +895,7 @@ static int _flush_pending_write(mcp_backend_t *be) {
                 // short circuit for common case.
                 sent -= io->iovbytes;
             } else {
+                io->iovbytes -= sent;
                 for (int x = 0; x < io->iovcnt; x++) {
                     struct iovec *iov = &io->iov[x];
                     if (sent >= iov->iov_len) {
@@ -974,36 +980,24 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
     if (which & EV_READ) {
         // We do the syscall here before diving into the state machine to allow a
         // common code path for io_uring/epoll
-        int res = 1;
-        int read = 0;
-        while (res > 0) {
-            char *rbuf = NULL;
-            size_t toread = 0;
-            // need to input how much was read since last call
-            // needs _output_ of the buffer to read into and how much.
-            res = proxy_backend_drive_machine(be, read, &rbuf, &toread);
-            P_DEBUG("%s: res: %d toread: %lu\n", __func__, res, toread);
-
-            if (res > 0) {
-                read = recv(mcmc_fd(be->client), rbuf, toread, 0);
-                P_DEBUG("%s: read: %d\n", __func__, read);
-                if (read == 0) {
-                    // not connected or error.
-                    _reset_bad_backend(be, P_BE_FAIL_DISCONNECTED);
-                    return;
-                } else if (read == -1) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break; // sit on epoll again.
-                    } else {
-                        _reset_bad_backend(be, P_BE_FAIL_READING);
-                        return;
-                    }
-                }
-            } else if (res == -1) {
+        int read = recv(mcmc_fd(be->client), be->rbuf + be->rbufused,
+                    READ_BUFFER_SIZE - be->rbufused, 0);
+        if (read > 0) {
+            be->rbufused += read;
+            int res = proxy_backend_drive_machine(be);
+            if (res == -1) {
                 _reset_bad_backend(be, P_BE_FAIL_PARSING);
                 return;
-            } else {
-                break;
+            }
+        } else if (read == 0) {
+            // not connected or error.
+            _reset_bad_backend(be, P_BE_FAIL_DISCONNECTED);
+            return;
+        } else if (read == -1) {
+            // sit on epoll again.
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                _reset_bad_backend(be, P_BE_FAIL_READING);
+                return;
             }
         }
 

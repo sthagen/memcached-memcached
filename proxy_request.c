@@ -23,21 +23,33 @@ static int _process_tokenize(mcp_parser_t *pr, const size_t max) {
     while (s != end) {
         switch (state) {
             case 0:
+                // scanning for first non-space to find a token.
                 if (*s != ' ') {
                     pr->tokens[curtoken] = s - pr->request;
                     if (++curtoken == max) {
-                        goto endloop;
+                        s++;
+                        state = 2;
+                        break;
                     }
                     state = 1;
                 }
                 s++;
                 break;
             case 1:
+                // advance over a token
                 if (*s != ' ') {
                     s++;
                 } else {
                     state = 0;
                 }
+                break;
+            case 2:
+                // hit max tokens before end of the line.
+                // keep advancing so we can place endcap token.
+                if (*s == ' ') {
+                    goto endloop;
+                }
+                s++;
                 break;
         }
     }
@@ -45,7 +57,7 @@ endloop:
 
     // endcap token so we can quickly find the length of any token by looking
     // at the next one.
-    pr->tokens[curtoken] = len;
+    pr->tokens[curtoken] = s - pr->request;
     pr->ntokens = curtoken;
     P_DEBUG("%s: cur_tokens: %d\n", __func__, curtoken);
 
@@ -53,11 +65,13 @@ endloop:
 }
 
 static int _process_token_len(mcp_parser_t *pr, size_t token) {
-    const char *cur = pr->request + pr->tokens[token];
-    int remain = pr->reqlen - pr->tokens[token] - 2; // CRLF
-
-    const char *s = memchr(cur, ' ', remain);
-    return (s != NULL) ? s - cur : remain;
+    const char *s = pr->request + pr->tokens[token];
+    const char *e = pr->request + pr->tokens[token+1];
+    // start of next token is after any space delimiters, so back those out.
+    while (*(e-1) == ' ') {
+        e--;
+    }
+    return e - s;
 }
 
 static int _process_request_key(mcp_parser_t *pr) {
@@ -529,13 +543,23 @@ int mcplib_request(lua_State *L) {
     int type = lua_type(L, 2);
     if (type == LUA_TSTRING) {
         val = luaL_optlstring(L, 2, NULL, &vlen);
+        if (vlen < 2 || memcmp(val+vlen-2, "\r\n", 2) != 0) {
+            proxy_lua_error(L, "value passed to mcp.request must end with \\r\\n");
+        }
     } else if (type == LUA_TUSERDATA) {
-        mcp_resp_t *r = luaL_checkudata(L, 2, "mcp.response");
-        if (r->buf) {
-            val = r->buf;
-            vlen = r->blen;
+        // vlen for requests and responses include the "\r\n" already.
+        mcp_resp_t *r = luaL_testudata(L, 2, "mcp.response");
+        if (r != NULL) {
+            if (r->resp.value) {
+                val = r->resp.value;
+                vlen = r->resp.vlen_read; // paranoia, so we can't overread into memory.
+            }
         } else {
-            // TODO (v2): other response modes unhandled.
+            mcp_request_t *rq = luaL_testudata(L, 2, "mcp.request");
+            if (rq->pr.vbuf) {
+                val = rq->pr.vbuf;
+                vlen = rq->pr.vlen;
+            }
         }
     }
 
@@ -653,15 +677,11 @@ int mcplib_request_token(lua_State *L) {
             lua_pop(L, 1); // got a nil, drop it.
 
             // token not uploaded yet. find the len.
-            char *s = (char *) &rq->pr.request[rq->pr.tokens[token-1]];
-            char *e = s;
-            while (*e != ' ') {
-                e++;
-            }
-            vlen = e - s;
+            const char *start = rq->pr.request + rq->pr.tokens[token-1];
+            vlen = _process_token_len(&rq->pr, token-1);
 
             P_DEBUG("%s: pushing token of len: %lu\n", __func__, vlen);
-            lua_pushlstring(L, s, vlen);
+            lua_pushlstring(L, start, vlen);
             lua_pushvalue(L, -1); // copy
 
             lua_rawseti(L, -3, token); // pops copy.
@@ -683,6 +703,65 @@ int mcplib_request_ntokens(lua_State *L) {
 int mcplib_request_command(lua_State *L) {
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
     lua_pushinteger(L, rq->pr.command);
+    return 1;
+}
+
+int mcplib_request_has_flag(lua_State *L) {
+    mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
+    size_t len = 0;
+    const char *flagstr = luaL_checklstring(L, 2, &len);
+    if (len != 1) {
+        proxy_lua_error(L, "has_flag(): meta flag must be a single character");
+        return 0;
+    }
+    if (flagstr[0] < 65 || flagstr[0] > 122) {
+        proxy_lua_error(L, "has_flag(): invalid flag, must be A-Z,a-z");
+        return 0;
+    }
+    uint64_t flagbit = (uint64_t)1 << (flagstr[0] - 65);
+    if (rq->pr.t.meta.flags & flagbit) {
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+
+    return 1;
+}
+
+int mcplib_request_flag_token(lua_State *L) {
+    mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
+    size_t len = 0;
+    const char *flagstr = luaL_checklstring(L, 2, &len);
+    if (len != 1) {
+        proxy_lua_error(L, "has_flag(): meta flag must be a single character");
+        return 0;
+    }
+    if (flagstr[0] < 65 || flagstr[0] > 122) {
+        proxy_lua_error(L, "has_flag(): invalid flag, must be A-Z,a-z");
+        return 0;
+    }
+    uint64_t flagbit = (uint64_t)1 << (flagstr[0] - 65);
+
+    if (rq->pr.t.meta.flags & flagbit) {
+        // The flag definitely exists, but sadly we need to scan for the
+        // actual flag to see if it has a token.
+        lua_pushboolean(L, 1);
+        for (int x = rq->pr.keytoken+1; x < rq->pr.ntokens; x++) {
+            const char *s = rq->pr.request + rq->pr.tokens[x];
+            if (s[0] == flagstr[0]) {
+                size_t vlen = _process_token_len(&rq->pr, x);
+                if (vlen > 1) {
+                    // strip the flag off the token and return.
+                    lua_pushlstring(L, s+1, vlen-1);
+                    return 2;
+                }
+                break;
+            }
+        }
+    } else {
+        lua_pushboolean(L, 0);
+    }
+
     return 1;
 }
 

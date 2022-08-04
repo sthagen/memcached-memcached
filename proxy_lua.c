@@ -32,6 +32,45 @@ static int mcplib_response_hit(lua_State *L) {
     return 1;
 }
 
+// Caller needs to discern if a vlen is 0 because of a failed response or an
+// OK response that was actually zero. So we always return an integer value
+// here.
+static int mcplib_response_vlen(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+
+    // We do remove the "\r\n" from the value length, so if you're actually
+    // processing the value nothing breaks.
+    if (r->resp.vlen >= 2) {
+        lua_pushinteger(L, r->resp.vlen-2);
+    } else {
+        lua_pushinteger(L, 0);
+    }
+
+    return 1;
+}
+
+// Refer to MCMC_CODE_* defines.
+static int mcplib_response_code(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+
+    lua_pushinteger(L, r->resp.code);
+
+    return 1;
+}
+
+// Get the unparsed response line for handling in lua.
+static int mcplib_response_line(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+
+    if (r->resp.rline != NULL) {
+        lua_pushlstring(L, r->resp.rline, r->resp.rlen);
+    } else {
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
 static int mcplib_response_gc(lua_State *L) {
     mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
 
@@ -104,7 +143,7 @@ static int mcplib_backend(lua_State *L) {
     strncpy(be->name, name, MAX_NAMELEN);
     strncpy(be->port, port, MAX_PORTLEN);
     be->depth = 0;
-    be->rbuf = NULL;
+    be->rbufused = 0;
     be->failed_count = 0;
     STAILQ_INIT(&be->io_head);
     be->state = mcp_backend_read;
@@ -611,6 +650,125 @@ static int mcplib_log(lua_State *L) {
     return 0;
 }
 
+// (request, resp, "detail")
+static int mcplib_log_req(lua_State *L) {
+    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
+    logger *l = t->l;
+    // Not using the LOGGER_LOG macro so we can avoid as much overhead as
+    // possible when logging is disabled.
+    if (! (l->eflags & LOG_PROXYREQS)) {
+        return 0;
+    }
+    int rtype = 0;
+    int rcode = 0;
+    int rstatus = 0;
+    char *rname = NULL;
+    char *rport = NULL;
+
+    mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
+    int type = lua_type(L, 2);
+    if (type == LUA_TUSERDATA) {
+        mcp_resp_t *rs = luaL_checkudata(L, 2, "mcp.response");
+        rtype = rs->resp.type;
+        rcode = rs->resp.code;
+        rstatus = rs->status;
+        rname = rs->be_name;
+        rport = rs->be_port;
+    }
+    size_t dlen = 0;
+    const char *detail = luaL_optlstring(L, 3, NULL, &dlen);
+
+    struct timeval end;
+    gettimeofday(&end, NULL);
+    long elapsed = (end.tv_sec - rq->start.tv_sec) * 1000000 + (end.tv_usec - rq->start.tv_usec);
+
+    logger_log(l, LOGGER_PROXY_REQ, NULL, rq->pr.request, rq->pr.reqlen, elapsed, rtype, rcode, rstatus, detail, dlen, rname, rport);
+
+    return 0;
+}
+
+static inline uint32_t _rotl(const uint32_t x, int k) {
+    return (x << k) | (x >> (32 - k));
+}
+
+// xoroshiro128++ 32bit version.
+static uint32_t _nextrand(uint32_t *s) {
+    const uint32_t result = _rotl(s[0] + s[3], 7) + s[0];
+
+    const uint32_t t = s[1] << 9;
+
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+
+    s[2] ^= t;
+
+    s[3] = _rotl(s[3], 11);
+
+    return result;
+}
+
+
+// (milliseconds, sample_rate, allerrors, request, resp, "detail")
+static int mcplib_log_reqsample(lua_State *L) {
+    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
+    logger *l = t->l;
+    // Not using the LOGGER_LOG macro so we can avoid as much overhead as
+    // possible when logging is disabled.
+    if (! (l->eflags & LOG_PROXYREQS)) {
+        return 0;
+    }
+    int rtype = 0;
+    int rcode = 0;
+    int rstatus = 0;
+    char *rname = NULL;
+    char *rport = NULL;
+
+    int ms = luaL_checkinteger(L, 1);
+    int rate = luaL_checkinteger(L, 2);
+    int allerr = lua_toboolean(L, 3);
+    mcp_request_t *rq = luaL_checkudata(L, 4, "mcp.request");
+    int type = lua_type(L, 5);
+    if (type == LUA_TUSERDATA) {
+        mcp_resp_t *rs = luaL_checkudata(L, 5, "mcp.response");
+        rtype = rs->resp.type;
+        rcode = rs->resp.code;
+        rstatus = rs->status;
+        rname = rs->be_name;
+        rport = rs->be_port;
+    }
+    size_t dlen = 0;
+    const char *detail = luaL_optlstring(L, 6, NULL, &dlen);
+
+    struct timeval end;
+    gettimeofday(&end, NULL);
+    long elapsed = (end.tv_sec - rq->start.tv_sec) * 1000000 + (end.tv_usec - rq->start.tv_usec);
+
+    bool do_log = false;
+    if (allerr && rstatus != MCMC_OK) {
+        do_log = true;
+    } else if (ms > 0 && elapsed > ms * 1000) {
+        do_log = true;
+    } else if (rate > 0) {
+        // slightly biased random-to-rate without adding a loop, which is
+        // completely fine for this use case.
+        uint32_t rnd = (uint64_t)_nextrand(t->proxy_rng) * (uint64_t)rate >> 32;
+        if (rnd == 0) {
+            do_log = true;
+        }
+    }
+
+    if (do_log) {
+        logger_log(l, LOGGER_PROXY_REQ, NULL, rq->pr.request, rq->pr.reqlen, elapsed, rtype, rcode, rstatus, detail, dlen, rname, rport);
+    }
+
+    return 0;
+}
+
+// TODO: slowsample
+// _err versions?
+
 /*** END lua interface to logger ***/
 
 static void proxy_register_defines(lua_State *L) {
@@ -618,6 +776,16 @@ static void proxy_register_defines(lua_State *L) {
     lua_pushinteger(L, x); \
     lua_setfield(L, -2, #x);
 
+    X(MCMC_CODE_STORED);
+    X(MCMC_CODE_EXISTS);
+    X(MCMC_CODE_DELETED);
+    X(MCMC_CODE_TOUCHED);
+    X(MCMC_CODE_VERSION);
+    X(MCMC_CODE_NOT_FOUND);
+    X(MCMC_CODE_NOT_STORED);
+    X(MCMC_CODE_OK);
+    X(MCMC_CODE_NOP);
+    X(MCMC_CODE_MISS);
     X(P_OK);
     X(CMD_ANY);
     X(CMD_ANY_STORAGE);
@@ -646,6 +814,8 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
         {"rtrimkey", mcplib_request_rtrimkey},
         {"token", mcplib_request_token},
         {"ntokens", mcplib_request_ntokens},
+        {"has_flag", mcplib_request_has_flag},
+        {"flag_token", mcplib_request_flag_token},
         {"__tostring", NULL},
         {"__gc", mcplib_request_gc},
         {NULL, NULL}
@@ -654,6 +824,9 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
     const struct luaL_Reg mcplib_response_m[] = {
         {"ok", mcplib_response_ok},
         {"hit", mcplib_response_hit},
+        {"vlen", mcplib_response_vlen},
+        {"code", mcplib_response_code},
+        {"line", mcplib_response_line},
         {"__gc", mcplib_response_gc},
         {NULL, NULL}
     };
@@ -678,6 +851,8 @@ int proxy_register_libs(LIBEVENT_THREAD *t, void *ctx) {
         {"stat", mcplib_stat},
         {"await", mcplib_await},
         {"log", mcplib_log},
+        {"log_req", mcplib_log_req},
+        {"log_reqsample", mcplib_log_reqsample},
         {"backend_connect_timeout", mcplib_backend_connect_timeout},
         {"backend_retry_timeout", mcplib_backend_retry_timeout},
         {"backend_read_timeout", mcplib_backend_read_timeout},
