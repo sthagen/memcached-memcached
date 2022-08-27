@@ -37,6 +37,14 @@
 #endif
 #endif
 
+#if defined(__linux__)
+# define SOCK_COOKIE_ID SO_MARK
+#elif defined(__FreeBSD__)
+# define SOCK_COOKIE_ID SO_USER_COOKIE
+#elif defined(__OpenBSD__)
+# define SOCK_COOKIE_ID SO_RTABLE
+#endif
+
 #include "itoa_ljust.h"
 #include "protocol_binary.h"
 #include "cache.h"
@@ -499,8 +507,8 @@ struct settings {
     double ext_max_frag; /* ideal maximum page fragmentation */
     double slab_automove_freeratio; /* % of memory to hold free as buffer */
     bool ext_drop_unread; /* skip unread items during compaction */
-    /* per-slab-class free chunk limit */
-    unsigned int ext_free_memchunks[MAX_NUMBER_OF_SLAB_CLASSES];
+    /* start flushing to extstore after memory below this */
+    unsigned int ext_global_pool_min;
 #endif
 #ifdef TLS
     bool ssl_enabled; /* indicates whether SSL is enabled */
@@ -524,6 +532,9 @@ struct settings {
     bool proxy_uring; /* if the proxy should use io_uring */
     char *proxy_startfile; /* lua file to run when workers start */
     void *proxy_ctx; /* proxy's state context */
+#endif
+#ifdef SOCK_COOKIE_ID
+    uint32_t sock_cookie_id;
 #endif
 };
 
@@ -852,6 +863,7 @@ struct conn {
     /* This is where the binary header goes */
     protocol_binary_request_header binary_header;
     uint64_t cas; /* the cas to return */
+    uint64_t tag; /* listener stocket tag */
     short cmd; /* current command being processed */
     int opaque;
     int keylen;
@@ -914,7 +926,7 @@ io_queue_t *conn_io_queue_get(conn *c, int type);
 io_queue_cb_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type);
 void conn_io_queue_return(io_pending_t *io);
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size,
-    enum network_transport transport, struct event_base *base, void *ssl);
+    enum network_transport transport, struct event_base *base, void *ssl, uint64_t conntag, enum protocol bproto);
 
 void conn_worker_readd(conn *c);
 extern int daemonize(int nochdir, int noclose);
@@ -945,7 +957,7 @@ void proxy_reload_notify(LIBEVENT_THREAD *t);
 #endif
 void return_io_pending(io_pending_t *io);
 void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags, int read_buffer_size,
-    enum network_transport transport, void *ssl);
+    enum network_transport transport, void *ssl, uint64_t conntag, enum protocol bproto);
 void sidethread_conn_close(conn *c);
 
 /* Lock wrappers for cache functions that are called from main loop. */

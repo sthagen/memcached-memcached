@@ -292,6 +292,9 @@ static void settings_init(void) {
 #endif
     settings.num_napi_ids = 0;
     settings.memory_file = NULL;
+#ifdef SOCK_COOKIE_ID
+    settings.sock_cookie_id = 0;
+#endif
 }
 
 extern pthread_mutex_t conn_lock;
@@ -647,7 +650,8 @@ void conn_io_queue_return(io_pending_t *io) {
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base, void *ssl) {
+                struct event_base *base, void *ssl, uint64_t conntag,
+                enum protocol bproto) {
     conn *c;
 
     assert(sfd >= 0 && sfd < max_fds);
@@ -693,7 +697,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     }
 
     c->transport = transport;
-    c->protocol = settings.binding_protocol;
+    c->protocol = bproto;
+    c->tag = conntag;
 
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
@@ -2054,7 +2059,7 @@ static inline void get_conn_text(const conn *c, const int af,
                     &((struct sockaddr_in6 *)sock_addr)->sin6_addr,
                     addr_text + 1,
                     sizeof(addr_text) - 2)) {
-                strcat(addr_text, "]");
+                strncat(addr_text, "]", 2);
             }
             port = ntohs(((struct sockaddr_in6 *)sock_addr)->sin6_port);
             protoname = IS_UDP(c->transport) ? "udp6" : "tcp6";
@@ -2096,21 +2101,21 @@ static inline void get_conn_text(const conn *c, const int af,
          * has no peer socket address, but there's no portable way
          * to tell for sure.
          */
-        sprintf(addr_text, "<AF %d>", af);
+        snprintf(addr_text, MAXPATHLEN, "<AF %d>", af);
     }
 
     if (port) {
-        sprintf(addr, "%s:%s:%u", protoname, addr_text, port);
+        snprintf(addr, MAXPATHLEN + 11, "%s:%s:%u", protoname, addr_text, port);
     } else {
-        sprintf(addr, "%s:%s", protoname, addr_text);
+        snprintf(addr, MAXPATHLEN + 11, "%s:%s", protoname, addr_text);
     }
 }
 
 static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
     if (!c) {
-        strcpy(addr, "<null>");
+        memcpy(addr, "<null>", 6);
     } else if (c->state == conn_closed) {
-        strcpy(addr, "<closed>");
+        memcpy(addr, "<closed>", 8);
     } else {
         struct sockaddr_in6 local_addr;
         struct sockaddr *sock_addr = (void *)&c->request_addr;
@@ -2143,9 +2148,11 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
     int i;
     char key_str[STAT_KEY_LEN];
     char val_str[STAT_VAL_LEN];
-    size_t extras_len = sizeof("unix:") + sizeof("65535");
+    size_t extras_len = sizeof(":unix:") + sizeof("65535");
     char addr[MAXPATHLEN + extras_len];
     char svr_addr[MAXPATHLEN + extras_len];
+    memset(addr, 0, sizeof(addr));
+    memset(svr_addr, 0, sizeof(svr_addr));
     int klen = 0, vlen = 0;
 
     assert(add_stats);
@@ -3072,7 +3079,7 @@ static void drive_machine(conn *c) {
 #endif
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
-                                     READ_BUFFER_CACHED, c->transport, ssl_v);
+                                     READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
             }
 
             stop = true;
@@ -3472,7 +3479,9 @@ static void maximize_sndbuf(const int sfd) {
 static int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
-                         FILE *portnumber_file, bool ssl_enabled) {
+                         FILE *portnumber_file, bool ssl_enabled,
+                         uint64_t conntag,
+                         enum protocol bproto) {
     int sfd;
     struct linger ling = {0, 0};
     struct addrinfo *ai;
@@ -3531,6 +3540,13 @@ static int server_socket(const char *interface,
                 close(sfd);
                 continue;
             }
+        }
+#endif
+#ifdef SOCK_COOKIE_ID
+        if (settings.sock_cookie_id != 0) {
+            error = setsockopt(sfd, SOL_SOCKET, SOCK_COOKIE_ID, (void *)&settings.sock_cookie_id, sizeof(uint32_t));
+            if (error != 0)
+                perror("setsockopt");
         }
 #endif
 
@@ -3614,12 +3630,12 @@ static int server_socket(const char *interface,
                 }
                 dispatch_conn_new(per_thread_fd, conn_read,
                                   EV_READ | EV_PERSIST,
-                                  UDP_READ_BUFFER_SIZE, transport, NULL);
+                                  UDP_READ_BUFFER_SIZE, transport, NULL, conntag, bproto);
             }
         } else {
             if (!(listen_conn_add = conn_new(sfd, conn_listening,
                                              EV_READ | EV_PERSIST, 1,
-                                             transport, main_base, NULL))) {
+                                             transport, main_base, NULL, conntag, bproto))) {
                 fprintf(stderr, "failed to create listening connection\n");
                 exit(EXIT_FAILURE);
             }
@@ -3642,6 +3658,7 @@ static int server_socket(const char *interface,
 static int server_sockets(int port, enum network_transport transport,
                           FILE *portnumber_file) {
     bool ssl_enabled = false;
+    uint64_t conntag = 0;
 
 #ifdef TLS
     const char *notls = "notls";
@@ -3649,7 +3666,7 @@ static int server_sockets(int port, enum network_transport transport,
 #endif
 
     if (settings.inter == NULL) {
-        return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled);
+        return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled, conntag, settings.binding_protocol);
     } else {
         // tokenize them and bind to each one of them..
         char *b;
@@ -3680,6 +3697,77 @@ static int server_sockets(int port, enum network_transport transport,
             }
 #endif
 
+            // Allow forcing the protocol of this listener.
+            const char *protostr = "proto";
+            enum protocol bproto = settings.binding_protocol;
+            if (strncmp(p, protostr, strlen(protostr)) == 0) {
+                p += strlen(protostr);
+                if (*p == '[') {
+                    char *e = strchr(p, ']');
+                    if (e == NULL) {
+                        fprintf(stderr, "Invalid protocol spec: \"%s\"\n", p);
+                        free(list);
+                        return 1;
+                    }
+                    char *st = ++p; // skip '[';
+                    *e = '\0';
+                    size_t len = e - st;
+                    p = ++e; // skip ']'
+                    p++; // skip an assumed ':'
+
+                    if (strncmp(st, "ascii", len) == 0) {
+                        bproto = ascii_prot;
+                    } else if (strncmp(st, "binary", len) == 0) {
+                        bproto = binary_prot;
+                    } else if (strncmp(st, "negotiating", len) == 0) {
+                        bproto = negotiating_prot;
+                    } else if (strncmp(st, "proxy", len) == 0) {
+#ifdef PROXY
+                        if (settings.proxy_enabled) {
+                            bproto = proxy_prot;
+                        } else {
+                            fprintf(stderr, "Proxy must be enabled to use: \"%s\"\n", list);
+                            free(list);
+                            return 1;
+                        }
+#else
+                        fprintf(stderr, "Server not built with proxy: \"%s\"\n", list);
+                        free(list);
+                        return 1;
+#endif
+                    }
+                }
+            }
+
+            const char *tagstr = "tag";
+            if (strncmp(p, tagstr, strlen(tagstr)) == 0) {
+                p += strlen(tagstr);
+                if (*p == '[') {
+                    char *e = strchr(p, ']');
+                    if (e == NULL) {
+                        fprintf(stderr, "Invalid tag in socket config: \"%s\"\n", p);
+                        free(list);
+                        return 1;
+                    }
+                    char *st = ++p; // skip '['
+                    *e = '\0';
+                    size_t len = e - st;
+                    p = ++e; // skip ']'
+                    p++; // skip an assumed ':'
+
+                    // validate the tag and copy it in.
+                    if (len > 8 || len < 1) {
+                        fprintf(stderr, "Listener tags must be between 1 and 8 characters: \"%s\"\n", st);
+                        free(list);
+                        return 1;
+                    }
+
+                    // C programmers love turning string comparisons into
+                    // integer comparisons.
+                    memcpy(&conntag, st, len);
+                }
+            }
+
             char *h = NULL;
             if (*p == '[') {
                 // expecting it to be an IPv6 address enclosed in []
@@ -3705,7 +3793,7 @@ static int server_sockets(int port, enum network_transport transport,
                     *s = '\0';
                     ++s;
                     if (!safe_strtol(s, &the_port)) {
-                        fprintf(stderr, "Invalid port number: \"%s\"", s);
+                        fprintf(stderr, "Invalid port number: \"%s\"\n", s);
                         free(list);
                         return 1;
                     }
@@ -3718,7 +3806,7 @@ static int server_sockets(int port, enum network_transport transport,
             if (strcmp(p, "*") == 0) {
                 p = NULL;
             }
-            ret |= server_socket(p, the_port, transport, portnumber_file, ssl_enabled);
+            ret |= server_socket(p, the_port, transport, portnumber_file, ssl_enabled, conntag, bproto);
             if (ret != 0 && errno_save == 0) errno_save = errno;
         }
         free(list);
@@ -3798,7 +3886,7 @@ static int server_socket_unix(const char *path, int access_mask) {
     }
     if (!(listen_conn = conn_new(sfd, conn_listening,
                                  EV_READ | EV_PERSIST, 1,
-                                 local_transport, main_base, NULL))) {
+                                 local_transport, main_base, NULL, 0, settings.binding_protocol))) {
         fprintf(stderr, "failed to create listening connection\n");
         exit(EXIT_FAILURE);
     }
@@ -4029,6 +4117,9 @@ static void usage(void) {
     printf("   - relaxed_privileges:  running tests requires extra privileges. (default: %s)\n",
            flag_enabled_disabled(settings.relaxed_privileges));
 #endif
+#endif
+#ifdef SOCK_COOKIE_ID
+    printf("   - sock_cookie_id:      attributes an ID to a socket for ip filtering/firewalls \n");
 #endif
 #ifdef EXTSTORE
     printf("\n   - External storage (ext_*) related options (see: https://memcached.org/extstore)\n");
@@ -4759,6 +4850,9 @@ int main (int argc, char **argv) {
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
 #endif
+#ifdef SOCK_COOKIE_ID
+        COOKIE_ID,
+#endif
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -4818,6 +4912,9 @@ int main (int argc, char **argv) {
 #endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
+#endif
+#ifdef SOCK_COOKIE_ID
+        [COOKIE_ID] = "sock_cookie_id",
 #endif
         NULL
     };
@@ -5584,6 +5681,11 @@ int main (int argc, char **argv) {
 #ifdef MEMCACHED_DEBUG
             case RELAXED_PRIVILEGES:
                 settings.relaxed_privileges = true;
+                break;
+#endif
+#ifdef SOCK_COOKIE_ID
+            case COOKIE_ID:
+                (void)safe_strtoul(subopts_value, &settings.sock_cookie_id);
                 break;
 #endif
             default:
