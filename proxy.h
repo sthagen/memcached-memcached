@@ -78,6 +78,7 @@
 #define MCP_THREAD_UPVALUE 1
 #define MCP_ATTACH_UPVALUE 2
 #define MCP_BACKEND_UPVALUE 3
+#define MCP_CONTEXT_UPVALUE 4
 
 // all possible commands.
 #define CMD_FIELDS \
@@ -135,19 +136,11 @@ enum proxy_cmd_types {
     CMD_TYPE_META, // m*'s.
 };
 
-enum proxy_be_failures {
-    P_BE_FAIL_TIMEOUT = 0,
-    P_BE_FAIL_DISCONNECTED,
-    P_BE_FAIL_CONNECTING,
-    P_BE_FAIL_WRITING,
-    P_BE_FAIL_READING,
-    P_BE_FAIL_PARSING,
-};
-
 typedef struct _io_pending_proxy_t io_pending_proxy_t;
 typedef struct proxy_event_thread_s proxy_event_thread_t;
 
 #ifdef HAVE_LIBURING
+// TODO: pass in cqe->res instead of cqe?
 typedef void (*proxy_event_cb)(void *udata, struct io_uring_cqe *cqe);
 typedef struct {
     void *udata;
@@ -250,6 +243,8 @@ enum mcp_backend_states {
     mcp_backend_next, // advance to the next IO
 };
 
+typedef struct mcp_backend_wrap_s mcp_backend_wrap_t;
+typedef struct mcp_backend_label_s mcp_backend_label_t;
 typedef struct mcp_backend_s mcp_backend_t;
 typedef struct mcp_request_s mcp_request_t;
 typedef struct mcp_parser_s mcp_parser_t;
@@ -286,33 +281,51 @@ struct mcp_parser_s {
 #define MAX_REQ_TOKENS 2
 struct mcp_request_s {
     mcp_parser_t pr; // non-lua-specific parser handling.
-    struct timeval start; // time this object was created.
     mcp_backend_t *be; // backend handling this request.
     bool ascii_multiget; // ascii multiget mode. (hide errors/END)
-    bool was_modified; // need to rewrite the request
-    int tokent_ref; // reference to token table if modified.
     char request[];
 };
 
 typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
+#define MAX_LABELLEN 512
 #define MAX_NAMELEN 255
 #define MAX_PORTLEN 6
 // TODO (v2): IOV_MAX tends to be 1000+ which would allow for more batching but we
 // don't have a good temporary space and don't want to malloc/free on every
 // write. transmit() uses the stack but we can't do that for uring's use case.
-#if (IOV_MAX > 128)
-#define BE_IOV_MAX 128
+#if (IOV_MAX > 1024)
+#define BE_IOV_MAX 1024
 #else
 #define BE_IOV_MAX IOV_MAX
 #endif
+// lua descriptor object: passed to pools, which create wrappers.
+struct mcp_backend_label_s {
+    char name[MAX_NAMELEN+1];
+    char port[MAX_PORTLEN+1];
+    char label[MAX_LABELLEN+1];
+    size_t llen; // cache label length for small speedup in pool creation.
+};
+
+// lua object wrapper meant to own a malloc'ed conn structure
+// when this object is created, it ships its connection to the real owner
+// (worker, IO thread, etc)
+// when this object is garbage collected, it ships a notice to the owner
+// thread to stop using and free the backend conn memory.
+struct mcp_backend_wrap_s {
+    mcp_backend_t *be;
+};
+
+// FIXME: inline the mcmc client data.
+// TODO: event_thread -> something? union of owner type?
 struct mcp_backend_s {
     int depth;
     int failed_count; // number of fails (timeouts) in a row
-    pthread_mutex_t mutex; // covers stack.
     proxy_event_thread_t *event_thread; // event thread owning this backend.
     void *client; // mcmc client
     STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
+    STAILQ_ENTRY(mcp_backend_s) beconn_next; // stack for connecting conns
     io_head_t io_head; // stack of requests.
+    io_pending_proxy_t *io_next; // next request to write.
     char *rbuf; // statically allocated read buffer.
     size_t rbufused; // currently active bytes in the buffer
     struct event event; // libevent
@@ -323,7 +336,9 @@ struct mcp_backend_s {
 #endif
     enum mcp_backend_states state; // readback state machine
     int connect_flags; // flags to pass to mcmc_connect
+    bool transferred; // if beconn has been shipped to owner thread.
     bool connecting; // in the process of an asynch connection.
+    bool validating; // in process of validating a new backend connection.
     bool can_write; // recently got a WANT_WRITE or are connecting.
     bool stacked; // if backend already queued for syscalls.
     bool bad; // timed out, marked as bad.
@@ -332,28 +347,36 @@ struct mcp_backend_s {
     char port[MAX_PORTLEN+1];
 };
 typedef STAILQ_HEAD(be_head_s, mcp_backend_s) be_head_t;
+typedef STAILQ_HEAD(beconn_head_s, mcp_backend_s) beconn_head_t;
 
 struct proxy_event_thread_s {
     pthread_t thread_id;
     struct event_base *base;
     struct event notify_event; // listen event for the notify pipe/eventfd.
     struct event clock_event; // timer for updating event thread data.
+    struct event beconn_event; // listener for backends in connect state
 #ifdef HAVE_LIBURING
     struct io_uring ring;
     proxy_event_t ur_notify_event; // listen on eventfd.
+    proxy_event_t ur_benotify_event; // listen on eventfd for backend connections.
     proxy_event_t ur_clock_event; // timer for updating event thread data.
     eventfd_t event_counter;
+    eventfd_t beevent_counter;
     bool use_uring;
 #endif
     pthread_mutex_t mutex; // covers stack.
     pthread_cond_t cond; // condition to wait on while stack drains.
     io_head_t io_head_in; // inbound requests to process.
     be_head_t be_head; // stack of backends for processing.
+    beconn_head_t beconn_head_in; // stack of backends for connection processing.
 #ifdef USE_EVENTFD
-    int event_fd;
+    int event_fd; // for request ingestion
+    int be_event_fd; // for backend ingestion
 #else
     int notify_receive_fd;
     int notify_send_fd;
+    int be_notify_receive_fd;
+    int be_notify_send_fd;
 #endif
     proxy_ctx_t *ctx; // main context.
     struct proxy_tunables tunables; // periodically copied from main ctx
@@ -370,6 +393,8 @@ typedef struct {
     mcmc_resp_t resp;
     char *buf; // response line + potentially value.
     size_t blen; // total size of the value to read.
+    struct timeval start; // time this object was created.
+    long elapsed; // time elapsed once handled.
     int status; // status code from mcmc_read()
     int bread; // amount of bytes read into value so far.
     uint8_t cmd; // from parser (pr.command)
@@ -401,13 +426,14 @@ struct _io_pending_proxy_t {
     bool ascii_multiget; // passed on from mcp_r_t
     bool is_await; // are we an await object?
     bool await_first; // are we the main route for an await object?
+    bool await_background; // dummy IO for backgrounded awaits
 };
 
 // Note: does *be have to be a sub-struct? how stable are userdata pointers?
 // https://stackoverflow.com/questions/38718475/lifetime-of-lua-userdata-pointers
 // - says no.
 typedef struct {
-    int ref; // luaL_ref reference.
+    int ref; // luaL_ref reference of backend_wrap_t obj.
     mcp_backend_t *be;
 } mcp_pool_be_t;
 
@@ -443,6 +469,8 @@ enum mcp_await_e {
     AWAIT_ANY, // any response, including errors,
     AWAIT_OK, // any non-error response
     AWAIT_FIRST, // return the result from the first pool
+    AWAIT_FASTGOOD, // returns on first hit or majority non-error
+    AWAIT_BACKGROUND, // returns as soon as background jobs are dispatched
 };
 int mcplib_await(lua_State *L);
 int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref);
@@ -473,10 +501,11 @@ int mcplib_open_dist_ring_hash(lua_State *L);
 int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
 mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_t *p, const char *key, size_t len);
 void mcp_request_attach(lua_State *L, mcp_request_t *rq, io_pending_proxy_t *p);
+int mcp_request_render(mcp_request_t *rq, int idx, const char *tok, size_t len);
 void proxy_lua_error(lua_State *L, const char *s);
 void proxy_lua_ferror(lua_State *L, const char *fmt, ...);
 int _start_proxy_config_threads(proxy_ctx_t *ctx);
-int proxy_thread_loadconf(LIBEVENT_THREAD *thr);
+int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr);
 
 // TODO (v2): more .h files, perhaps?
 int mcplib_open_hash_xxhash(lua_State *L);

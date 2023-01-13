@@ -347,7 +347,8 @@ struct slab_stats {
     X(proxy_conn_requests) \
     X(proxy_conn_errors) \
     X(proxy_conn_oom) \
-    X(proxy_req_active)
+    X(proxy_req_active) \
+    X(proxy_await_active)
 #endif
 
 /**
@@ -492,7 +493,6 @@ struct settings {
     bool drop_privileges;   /* Whether or not to drop unnecessary process privileges */
     bool watch_enabled; /* allows watch commands to be dropped */
     bool relaxed_privileges;   /* Relax process restrictions when running testapp */
-    bool meta_response_old; /* use "OK" instead of "HD". for response code TEMPORARY! */
 #ifdef EXTSTORE
     unsigned int ext_io_threadcount; /* number of IO threads to run. */
     unsigned int ext_page_size; /* size in megabytes of storage pages. */
@@ -995,6 +995,7 @@ void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
+void thread_setname(pthread_t thread, const char *name);
 LIBEVENT_THREAD *get_worker_thread(int id);
 
 /* Stat processing functions */

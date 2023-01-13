@@ -49,6 +49,8 @@ int mcplib_await(lua_State *L) {
             case AWAIT_ANY:
             case AWAIT_OK:
             case AWAIT_FIRST:
+            case AWAIT_FASTGOOD:
+            case AWAIT_BACKGROUND:
                 break;
             default:
                 proxy_lua_error(L, "invalid type argument tp mcp.await");
@@ -99,6 +101,7 @@ static void mcp_queue_await_io(conn *c, lua_State *Lc, mcp_request_t *rq, int aw
     // reserve one uservalue for a lua-supplied response.
     mcp_resp_t *r = lua_newuserdatauv(Lc, sizeof(mcp_resp_t), 1);
     memset(r, 0, sizeof(mcp_resp_t));
+    gettimeofday(&r->start, NULL);
     // Set noreply mode.
     // TODO (v2): the response "inherits" the request's noreply mode, which isn't
     // strictly correct; we should inherit based on the request that spawned
@@ -175,12 +178,47 @@ static void mcp_queue_await_io(conn *c, lua_State *Lc, mcp_request_t *rq, int aw
     return;
 }
 
+static void mcp_queue_await_dummy_io(conn *c, lua_State *Lc, int await_ref) {
+    io_queue_t *q = conn_io_queue_get(c, IO_QUEUE_PROXY);
+
+    io_pending_proxy_t *p = do_cache_alloc(c->thread->io_cache);
+    if (p == NULL) {
+        WSTAT_INCR(c, proxy_conn_oom, 1);
+        proxy_lua_error(Lc, "out of memory allocating from IO cache");
+        return;
+    }
+
+    // this is a re-cast structure, so assert that we never outsize it.
+    assert(sizeof(io_pending_t) >= sizeof(io_pending_proxy_t));
+    memset(p, 0, sizeof(io_pending_proxy_t));
+    // set up back references.
+    p->io_queue_type = IO_QUEUE_PROXY;
+    p->thread = c->thread;
+    p->c = c;
+    p->resp = NULL;
+
+    // await specific
+    p->is_await = true;
+    p->await_ref = await_ref;
+    p->await_background = true;
+
+    // Dummy IO has no backend, and no request attached.
+
+    // All we need to do is link into the batch chain.
+    p->next = q->stack_ctx;
+    q->stack_ctx = p;
+    P_DEBUG("%s: queued\n", __func__);
+
+    return;
+}
+
 // TODO (v2): need to get this code running under pcall().
 // It looks like a bulk of this code can move into mcplib_await(),
 // and then here post-yield we can add the conn and coro_ref to the right
 // places. Else these errors currently crash the daemon.
 int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref) {
     P_DEBUG("%s: start\n", __func__);
+    WSTAT_INCR(c, proxy_await_active, 1);
     mcp_await_t *aw = lua_touserdata(L, -1);
     int await_ref = luaL_ref(L, LUA_REGISTRYINDEX); // await is popped.
     assert(aw != NULL);
@@ -222,6 +260,12 @@ int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref) {
     }
     P_DEBUG("%s: argtable len: %d\n", __func__, n);
 
+    if (aw->type == AWAIT_BACKGROUND) {
+        mcp_queue_await_dummy_io(c, L, await_ref);
+        aw->pending++;
+        aw->wait_for = 0;
+    }
+
     lua_pop(L, 1); // remove table key.
     aw->resp = resp; // cuddle the current mc_resp to fill later
 
@@ -260,13 +304,19 @@ int mcplib_await_return(io_pending_proxy_t *p) {
     // TODO (v2): for GOOD or OK cases, it might be better to return the
     // last object as valid if there are otherwise zero valids?
     // Think we just have to count valids...
-    if (!aw->completed) {
+    if (aw->type == AWAIT_BACKGROUND) {
+        // in the background case, we never want to collect responses.
+        if (p->await_background) {
+            // found the dummy IO, complete and return conn to worker.
+            completing = true;
+        }
+    } else if (!aw->completed) {
         valid = true; // always collect results unless we are completed.
         if (aw->wait_for > 0) {
             bool is_good = false;
             switch (aw->type) {
                 case AWAIT_GOOD:
-                    if (p->client_resp->status == MCMC_OK && p->client_resp->resp.code != MCMC_CODE_MISS) {
+                    if (p->client_resp->status == MCMC_OK && p->client_resp->resp.code != MCMC_CODE_END) {
                         is_good = true;
                     }
                     break;
@@ -285,6 +335,19 @@ int mcplib_await_return(io_pending_proxy_t *p) {
                         // user only wants the first pool's result.
                         valid = false;
                     }
+                    break;
+                case AWAIT_FASTGOOD:
+                    if (p->client_resp->status == MCMC_OK) {
+                        // End early on a hit.
+                        if (p->client_resp->resp.code != MCMC_CODE_END) {
+                            aw->wait_for = 0;
+                        } else {
+                            is_good = true;
+                        }
+                    }
+                    break;
+                case AWAIT_BACKGROUND:
+                    // In background mode we don't wait for any response.
                     break;
             }
 
@@ -318,12 +381,20 @@ int mcplib_await_return(io_pending_proxy_t *p) {
         // couldn't find a table.insert() equivalent; so this is
         // inserting into the length + 1 position manually.
         //dump_stack(L);
-        lua_rawseti(L, 1, lua_rawlen(L, 1) + 1); // pops mcpres
+        lua_rawseti(L, -2, lua_rawlen(L, 1) + 1); // pops mcpres
         lua_pop(L, 1); // pops restable
     }
 
     // lose our internal mcpres reference regardless.
-    luaL_unref(L, LUA_REGISTRYINDEX, p->mcpres_ref);
+    // also tag the elapsed time into the response.
+    if (p->mcpres_ref) {
+        struct timeval end;
+        gettimeofday(&end, NULL);
+        p->client_resp->elapsed = (end.tv_sec - p->client_resp->start.tv_sec) * 1000000 +
+            (end.tv_usec - p->client_resp->start.tv_usec);
+
+        luaL_unref(L, LUA_REGISTRYINDEX, p->mcpres_ref);
+    }
     // our await_ref is shared, so we don't need to release it.
 
     if (completing) {
@@ -354,6 +425,7 @@ int mcplib_await_return(io_pending_proxy_t *p) {
         luaL_unref(L, LUA_REGISTRYINDEX, aw->argtable_ref);
         luaL_unref(L, LUA_REGISTRYINDEX, aw->req_ref);
         luaL_unref(L, LUA_REGISTRYINDEX, p->await_ref);
+        WSTAT_DECR(p->c, proxy_await_active, 1);
     }
 
     // Just remove anything we could have left on the primary VM stack

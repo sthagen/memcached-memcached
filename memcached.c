@@ -84,7 +84,7 @@ static int try_read_command_udp(conn *c);
 static enum try_read_result try_read_network(conn *c);
 static enum try_read_result try_read_udp(conn *c);
 
-static int start_conn_timeout_thread();
+static int start_conn_timeout_thread(void);
 
 /* stats */
 static void stats_init(void);
@@ -374,7 +374,7 @@ static void *conn_timeout_thread(void *arg) {
     return NULL;
 }
 
-static int start_conn_timeout_thread() {
+static int start_conn_timeout_thread(void) {
     int ret;
 
     if (settings.idle_timeout == 0)
@@ -387,6 +387,7 @@ static int start_conn_timeout_thread() {
             strerror(ret));
         return -1;
     }
+    thread_setname(conn_timeout_tid, "mc-idletimeout");
 
     return 0;
 }
@@ -1808,6 +1809,7 @@ void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("proxy_conn_errors", "%llu", (unsigned long long)thread_stats.proxy_conn_errors);
         APPEND_STAT("proxy_conn_oom", "%llu", (unsigned long long)thread_stats.proxy_conn_oom);
         APPEND_STAT("proxy_req_active", "%llu", (unsigned long long)thread_stats.proxy_req_active);
+        APPEND_STAT("proxy_await_active", "%llu", (unsigned long long)thread_stats.proxy_await_active);
     }
 #endif
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
@@ -1887,7 +1889,7 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     storage_stats(add_stats, c);
 #endif
 #ifdef PROXY
-    proxy_stats(add_stats, c);
+    proxy_stats(settings.proxy_ctx, add_stats, c);
 #endif
 #ifdef TLS
     if (settings.ssl_enabled) {
@@ -3658,7 +3660,6 @@ static int server_socket(const char *interface,
 static int server_sockets(int port, enum network_transport transport,
                           FILE *portnumber_file) {
     bool ssl_enabled = false;
-    uint64_t conntag = 0;
 
 #ifdef TLS
     const char *notls = "notls";
@@ -3666,7 +3667,7 @@ static int server_sockets(int port, enum network_transport transport,
 #endif
 
     if (settings.inter == NULL) {
-        return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled, conntag, settings.binding_protocol);
+        return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled, 0, settings.binding_protocol);
     } else {
         // tokenize them and bind to each one of them..
         char *b;
@@ -3682,6 +3683,7 @@ static int server_sockets(int port, enum network_transport transport,
         for (char *p = strtok_r(list, ";,", &b);
             p != NULL;
             p = strtok_r(NULL, ";,", &b)) {
+            uint64_t conntag = 0;
             int the_port = port;
 #ifdef TLS
             ssl_enabled = settings.ssl_enabled;
@@ -4219,39 +4221,6 @@ static void usage_license(void) {
     "THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n"
     "(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE\n"
     "OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n"
-    "\n"
-    "\n"
-    "This product includes software developed by Niels Provos.\n"
-    "\n"
-    "[ libevent ]\n"
-    "\n"
-    "Copyright 2000-2003 Niels Provos <provos@citi.umich.edu>\n"
-    "All rights reserved.\n"
-    "\n"
-    "Redistribution and use in source and binary forms, with or without\n"
-    "modification, are permitted provided that the following conditions\n"
-    "are met:\n"
-    "1. Redistributions of source code must retain the above copyright\n"
-    "   notice, this list of conditions and the following disclaimer.\n"
-    "2. Redistributions in binary form must reproduce the above copyright\n"
-    "   notice, this list of conditions and the following disclaimer in the\n"
-    "   documentation and/or other materials provided with the distribution.\n"
-    "3. All advertising materials mentioning features or use of this software\n"
-    "   must display the following acknowledgement:\n"
-    "      This product includes software developed by Niels Provos.\n"
-    "4. The name of the author may not be used to endorse or promote products\n"
-    "   derived from this software without specific prior written permission.\n"
-    "\n"
-    "THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR\n"
-    "IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES\n"
-    "OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.\n"
-    "IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,\n"
-    "INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT\n"
-    "NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,\n"
-    "DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY\n"
-    "THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT\n"
-    "(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF\n"
-    "THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.\n"
     );
 
     return;
@@ -4308,7 +4277,6 @@ static void remove_pidfile(const char *pid_file) {
 
 static void sig_handler(const int sig) {
     stop_main_loop = EXIT_NORMALLY;
-    printf("Signal handled: %s.\n", strsignal(sig));
 }
 
 static void sighup_handler(const int sig) {
@@ -4316,7 +4284,6 @@ static void sighup_handler(const int sig) {
 }
 
 static void sig_usrhandler(const int sig) {
-    printf("Graceful shutdown signal handled: %s.\n", strsignal(sig));
     stop_main_loop = GRACE_STOP;
 }
 
@@ -4830,7 +4797,6 @@ int main (int argc, char **argv) {
         DROP_PRIVILEGES,
         RESP_OBJ_MEM_LIMIT,
         READ_BUF_MEM_LIMIT,
-        META_RESPONSE_OLD,
 #ifdef TLS
         SSL_CERT,
         SSL_KEY,
@@ -4893,7 +4859,6 @@ int main (int argc, char **argv) {
         [DROP_PRIVILEGES] = "drop_privileges",
         [RESP_OBJ_MEM_LIMIT] = "resp_obj_mem_limit",
         [READ_BUF_MEM_LIMIT] = "read_buf_mem_limit",
-        [META_RESPONSE_OLD] = "meta_response_old",
 #ifdef TLS
         [SSL_CERT] = "ssl_chain_cert",
         [SSL_KEY] = "ssl_key",
@@ -5499,9 +5464,6 @@ int main (int argc, char **argv) {
                 start_lru_maintainer = false;
                 settings.lru_segmented = false;
                 break;
-            case META_RESPONSE_OLD:
-                settings.meta_response_old = true;
-                break;
 #ifdef TLS
             case SSL_CERT:
                 if (subopts_value == NULL) {
@@ -6093,7 +6055,7 @@ int main (int argc, char **argv) {
     /* start up worker threads if MT mode */
 #ifdef PROXY
     if (settings.proxy_enabled) {
-        proxy_init(settings.proxy_uring);
+        settings.proxy_ctx = proxy_init(settings.proxy_uring);
         if (proxy_load_config(settings.proxy_ctx) != 0) {
             exit(EXIT_FAILURE);
         }
@@ -6267,16 +6229,24 @@ int main (int argc, char **argv) {
             fprintf(stderr, "Gracefully stopping\n");
         break;
         case EXIT_NORMALLY:
-            // Don't need to print anything to STDERR for a normal shutdown.
+            // Don't need to print anything to STDERR for a normal shutdown except
+            // if we want to.
+
+            if (settings.verbose) {
+                fprintf(stderr, "Exiting normally\n");
+            }
+
         break;
         default:
             fprintf(stderr, "Exiting on error\n");
         break;
     }
 
-    stop_threads();
-    if (settings.memory_file != NULL && stop_main_loop == GRACE_STOP) {
-        restart_mmap_close();
+    if (stop_main_loop == GRACE_STOP) {
+        stop_threads();
+        if (settings.memory_file != NULL) {
+            restart_mmap_close();
+        }
     }
 
     /* remove the PID file if we're a daemon */

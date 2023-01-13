@@ -62,11 +62,7 @@ static void _finalize_mset(conn *c, enum store_item_type ret) {
 
     switch (ret) {
     case STORED:
-      if (settings.meta_response_old) {
-          memcpy(p, "OK", 2);
-      } else {
-          memcpy(p, "HD", 2);
-      }
+      memcpy(p, "HD", 2);
       // Only place noreply is used for meta cmds is a nominal response.
       if (c->noreply) {
           resp->skip = true;
@@ -795,7 +791,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
 #endif
 #ifdef PROXY
     } else if (strcmp(subcommand, "proxy") == 0) {
-        process_proxy_stats(&append_stats, c);
+        process_proxy_stats(settings.proxy_ctx, &append_stats, c);
 #endif
     } else {
         /* getting here means that the subcommand is either engine specific or
@@ -1075,11 +1071,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
     // NOTE: final token has length == 0.
     // KEY_TOKEN == 1. 0 is command.
 
-    if (ntokens == 3) {
-        // TODO: any way to fix this?
-        out_errstring(c, "CLIENT_ERROR bad command line format");
-        return;
-    } else if (ntokens > MFLAG_MAX_OPT_LENGTH) {
+    if (ntokens > MFLAG_MAX_OPT_LENGTH) {
         // TODO: ensure the command tokenizer gives us at least this many
         out_errstring(c, "CLIENT_ERROR options flags are too long");
         return;
@@ -1140,11 +1132,7 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
             memcpy(p, "VA ", 3);
             p = itoa_u32(it->nbytes-2, p+3);
         } else {
-            if (settings.meta_response_old) {
-                memcpy(p, "OK", 2);
-            } else {
-                memcpy(p, "HD", 2);
-            }
+            memcpy(p, "HD", 2);
             p += 2;
         }
 
@@ -1338,7 +1326,32 @@ static void process_mget_command(conn *c, token_t *tokens, const size_t ntokens)
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         // This gets elided in noreply mode.
-        out_string(c, "EN");
+        if (c->noreply)
+            resp->skip = true;
+        memcpy(p, "EN", 2);
+        p += 2;
+        for (i = KEY_TOKEN+1; i < ntokens-1; i++) {
+            switch (tokens[i].value[0]) {
+                // TODO: macro perhaps?
+                case 'O':
+                    if (tokens[i].length > MFLAG_MAX_OPAQUE_LENGTH) {
+                        errstr = "CLIENT_ERROR opaque token too long";
+                        goto error;
+                    }
+                    META_SPACE(p);
+                    memcpy(p, tokens[i].value, tokens[i].length);
+                    p += tokens[i].length;
+                    break;
+                case 'k':
+                    META_KEY(p, key, nkey, of.key_binary);
+                    break;
+            }
+        }
+        resp->wbytes = p - resp->wbuf;
+        memcpy(resp->wbuf + resp->wbytes, "\r\n", 2);
+        resp->wbytes += 2;
+        resp_add_iov(resp, resp->wbuf, resp->wbytes);
+        conn_set_state(c, conn_new_cmd);
     }
     return;
 error:
@@ -1560,8 +1573,8 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
     char *errstr = "CLIENT_ERROR bad command line format";
     assert(c != NULL);
     mc_resp *resp = c->resp;
-    // reserve 3 bytes for status code
-    char *p = resp->wbuf + 3;
+    // reserve bytes for status code
+    char *p = resp->wbuf + 2;
 
     WANT_TOKENS_MIN(ntokens, 3);
 
@@ -1617,7 +1630,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
             c->thread->stats.delete_misses++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
-            memcpy(resp->wbuf, "EX ", 3);
+            memcpy(resp->wbuf, "EX", 2);
             goto cleanup;
         }
 
@@ -1637,11 +1650,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
             // Clients can noreply nominal responses.
             if (c->noreply)
                 resp->skip = true;
-            if (settings.meta_response_old) {
-                memcpy(resp->wbuf, "OK ", 3);
-            } else {
-                memcpy(resp->wbuf, "HD ", 3);
-            }
+            memcpy(resp->wbuf, "HD", 2);
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
@@ -1651,11 +1660,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
             STORAGE_delete(c->thread->storage, it);
             if (c->noreply)
                 resp->skip = true;
-            if (settings.meta_response_old) {
-                memcpy(resp->wbuf, "OK ", 3);
-            } else {
-                memcpy(resp->wbuf, "HD ", 3);
-            }
+            memcpy(resp->wbuf, "HD", 2);
         }
         goto cleanup;
     } else {
@@ -1663,7 +1668,7 @@ static void process_mdelete_command(conn *c, token_t *tokens, const size_t ntoke
         c->thread->stats.delete_misses++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        memcpy(resp->wbuf, "NF ", 3);
+        memcpy(resp->wbuf, "NF", 2);
         goto cleanup;
     }
 cleanup:
@@ -1758,11 +1763,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
     case OK:
         if (c->noreply)
             resp->skip = true;
-        if (settings.meta_response_old) {
-            memcpy(resp->wbuf, "OK ", 3);
-        } else {
-            memcpy(resp->wbuf, "HD ", 3);
-        }
+        // *it was filled, set the status below.
         break;
     case NON_NUMERIC:
         errstr = "CLIENT_ERROR cannot increment or decrement non-numeric value";
@@ -1785,7 +1786,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
                     item_created = true;
                 } else {
                     // Not sure how we can get here if we're holding the lock.
-                    memcpy(resp->wbuf, "NS ", 3);
+                    memcpy(resp->wbuf, "NS", 2);
                 }
             } else {
                 errstr = "SERVER_ERROR Out of memory allocating new item";
@@ -1800,14 +1801,14 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
             }
             pthread_mutex_unlock(&c->thread->stats.mutex);
             // won't have a valid it here.
-            memcpy(p, "NF ", 3);
-            p += 3;
+            memcpy(p, "NF", 2);
+            p += 2;
         }
         break;
     case DELTA_ITEM_CAS_MISMATCH:
         // also returns without a valid it.
-        memcpy(p, "EX ", 3);
-        p += 3;
+        memcpy(p, "EX", 2);
+        p += 2;
         break;
     }
 
@@ -1820,11 +1821,7 @@ static void process_marithmetic_command(conn *c, token_t *tokens, const size_t n
             memcpy(p, "VA ", 3);
             p = itoa_u32(vlen, p+3);
         } else {
-            if (settings.meta_response_old) {
-                memcpy(p, "OK", 2);
-            } else {
-                memcpy(p, "HD", 2);
-            }
+            memcpy(p, "HD", 2);
             p += 2;
         }
 

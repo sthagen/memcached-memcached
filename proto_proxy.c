@@ -20,12 +20,11 @@ static void proxy_out_errstring(mc_resp *resp, const char *str);
 // functions starting with _ are breakouts for the public functions.
 
 // see also: process_extstore_stats()
-// FIXME (v2): get context off of conn? global variables
-void proxy_stats(ADD_STAT add_stats, conn *c) {
-    if (!settings.proxy_enabled) {
+void proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
+    if (arg == NULL) {
        return;
     }
-    proxy_ctx_t *ctx = settings.proxy_ctx;
+    proxy_ctx_t *ctx = arg;
     STAT_L(ctx);
 
     APPEND_STAT("proxy_config_reloads", "%llu", (unsigned long long)ctx->global_stats.config_reloads);
@@ -36,14 +35,14 @@ void proxy_stats(ADD_STAT add_stats, conn *c) {
     STAT_UL(ctx);
 }
 
-void process_proxy_stats(ADD_STAT add_stats, conn *c) {
+void process_proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
     char key_str[STAT_KEY_LEN];
     struct proxy_int_stats istats = {0};
 
-    if (!settings.proxy_enabled) {
+    if (!arg) {
         return;
     }
-    proxy_ctx_t *ctx = settings.proxy_ctx;
+    proxy_ctx_t *ctx = arg;
     STAT_L(ctx);
 
     // prepare aggregated counters.
@@ -51,6 +50,7 @@ void process_proxy_stats(ADD_STAT add_stats, conn *c) {
     uint64_t counters[us->num_stats];
     memset(counters, 0, sizeof(counters));
 
+    // TODO (v3): more globals to remove and/or change API method.
     // aggregate worker thread counters.
     for (int x = 0; x < settings.num_threads; x++) {
         LIBEVENT_THREAD *t = get_worker_thread(x);
@@ -99,10 +99,8 @@ void process_proxy_stats(ADD_STAT add_stats, conn *c) {
 }
 
 // start the centralized lua state and config thread.
-// TODO (v2): return ctx ptr. avoid global vars.
-void proxy_init(bool use_uring) {
+void *proxy_init(bool use_uring) {
     proxy_ctx_t *ctx = calloc(1, sizeof(proxy_ctx_t));
-    settings.proxy_ctx = ctx;
     ctx->use_uring = use_uring;
 
     pthread_mutex_init(&ctx->config_lock, NULL);
@@ -130,7 +128,7 @@ void proxy_init(bool use_uring) {
     ctx->proxy_state = L;
     luaL_openlibs(L);
     // NOTE: might need to differentiate the libs yes?
-    proxy_register_libs(NULL, L);
+    proxy_register_libs(ctx, NULL, L);
 
     // Create/start the backend threads, which we need before servers
     // start getting created.
@@ -148,6 +146,11 @@ void proxy_init(bool use_uring) {
             perror("failed to create backend notify eventfd");
             exit(1);
         }
+        t->be_event_fd = eventfd(0, EFD_NONBLOCK);
+        if (t->be_event_fd == -1) {
+            perror("failed to create backend notify eventfd");
+            exit(1);
+        }
 #else
         int fds[2];
         if (pipe(fds)) {
@@ -157,11 +160,19 @@ void proxy_init(bool use_uring) {
 
         t->notify_receive_fd = fds[0];
         t->notify_send_fd = fds[1];
+
+        if (pipe(fds)) {
+            perror("can't create proxy backend connection notify pipe");
+            exit(1);
+        }
+        t->be_notify_receive_fd = fds[0];
+        t->be_notify_send_fd = fds[1];
 #endif
         proxy_init_evthread_events(t);
 
         // incoming request queue.
         STAILQ_INIT(&t->io_head_in);
+        STAILQ_INIT(&t->beconn_head_in);
         pthread_mutex_init(&t->mutex, NULL);
         pthread_cond_init(&t->cond, NULL);
 
@@ -176,13 +187,18 @@ void proxy_init(bool use_uring) {
 #else
         pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
 #endif // HAVE_LIBURING
+        thread_setname(t->thread_id, "mc-prx-io");
     }
 
     _start_proxy_config_threads(ctx);
+    return ctx;
 }
 
 // Initialize the VM for an individual worker thread.
-void proxy_thread_init(LIBEVENT_THREAD *thr) {
+void proxy_thread_init(void *ctx, LIBEVENT_THREAD *thr) {
+    assert(ctx != NULL);
+    assert(thr != NULL);
+
     // Create the hook table.
     thr->proxy_hooks = calloc(CMD_SIZE, sizeof(struct proxy_hook));
     if (thr->proxy_hooks == NULL) {
@@ -199,14 +215,14 @@ void proxy_thread_init(LIBEVENT_THREAD *thr) {
     lua_State *L = luaL_newstate();
     thr->L = L;
     luaL_openlibs(L);
-    proxy_register_libs(thr, L);
+    proxy_register_libs(ctx, thr, L);
     // TODO: srand on time? do we need to bother?
     for (int x = 0; x < 3; x++) {
         thr->proxy_rng[x] = rand();
     }
 
     // kick off the configuration.
-    if (proxy_thread_loadconf(thr) != 0) {
+    if (proxy_thread_loadconf(ctx, thr) != 0) {
         exit(EXIT_FAILURE);
     }
 }
@@ -284,7 +300,13 @@ void proxy_return_cb(io_pending_t *pending) {
     if (p->is_await) {
         mcplib_await_return(p);
     } else {
+        struct timeval end;
         lua_State *Lc = p->coro;
+
+        // stamp the elapsed time into the response object.
+        gettimeofday(&end, NULL);
+        p->client_resp->elapsed = (end.tv_sec - p->client_resp->start.tv_sec) * 1000000 +
+            (end.tv_usec - p->client_resp->start.tv_usec);
 
         // in order to resume we need to remove the objects that were
         // originally returned
@@ -403,8 +425,9 @@ void complete_nread_proxy(conn *c) {
     conn_set_state(c, conn_new_cmd);
 
     // Grab our coroutine.
+    // Leave the reference alone in case we error out, so the conn cleanup
+    // routine can handle it properly.
     lua_rawgeti(L, LUA_REGISTRYINDEX, c->proxy_coro_ref);
-    luaL_unref(L, LUA_REGISTRYINDEX, c->proxy_coro_ref);
     lua_State *Lc = lua_tothread(L, -1);
     mcp_request_t *rq = luaL_checkudata(Lc, -1, "mcp.request");
 
@@ -423,6 +446,7 @@ void complete_nread_proxy(conn *c) {
     rq->pr.vbuf = c->item;
     c->item = NULL;
     c->item_malloced = false;
+    luaL_unref(L, LUA_REGISTRYINDEX, c->proxy_coro_ref);
     c->proxy_coro_ref = 0;
 
     proxy_run_coroutine(Lc, c->resp, NULL, c);
@@ -494,7 +518,7 @@ static void _set_noreply_mode(mc_resp *resp, mcp_resp_t *r) {
             }
             break;
         case RESP_MODE_METAQUIET:
-            if (r->resp.code == MCMC_CODE_MISS) {
+            if (r->resp.code == MCMC_CODE_END) {
                 resp->skip = true;
             } else if (r->cmd != CMD_MG && r->resp.code == MCMC_CODE_OK) {
                 // FIXME (v2): mcmc's parser needs to help us out a bit more
@@ -822,6 +846,7 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     memset(r, 0, sizeof(mcp_resp_t));
     r->buf = NULL;
     r->blen = 0;
+    gettimeofday(&r->start, NULL);
     // Set noreply mode.
     // TODO (v2): the response "inherits" the request's noreply mode, which isn't
     // strictly correct; we should inherit based on the request that spawned

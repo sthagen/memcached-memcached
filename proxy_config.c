@@ -78,6 +78,11 @@ static void *_proxy_manager_thread(void *arg) {
             luaL_unref(L, LUA_REGISTRYINDEX, p->self_ref);
         }
         pthread_mutex_unlock(&ctx->config_lock);
+        // force lua garbage collection so any resources close out quickly.
+        lua_gc(L, LUA_GCCOLLECT);
+        // twice because objects with garbage collector handlers are only
+        // marked on the first collection cycle.
+        lua_gc(L, LUA_GCCOLLECT);
 
         // done.
         pthread_mutex_lock(&ctx->manager_lock);
@@ -167,16 +172,18 @@ int _start_proxy_config_threads(proxy_ctx_t *ctx) {
         pthread_mutex_unlock(&ctx->config_lock);
         return -1;
     }
+    thread_setname(ctx->config_tid, "mc-prx-config");
     pthread_mutex_unlock(&ctx->config_lock);
 
     pthread_mutex_lock(&ctx->manager_lock);
     if ((ret = pthread_create(&ctx->manager_tid, NULL,
                     _proxy_manager_thread, ctx)) != 0) {
-        fprintf(stderr, "Failed to start proxy configuration thread: %s\n",
+        fprintf(stderr, "Failed to start proxy manager thread: %s\n",
                 strerror(ret));
         pthread_mutex_unlock(&ctx->manager_lock);
         return -1;
     }
+    thread_setname(ctx->manager_tid, "mc-prx-manager");
     pthread_mutex_unlock(&ctx->manager_lock);
 
     return 0;
@@ -333,7 +340,7 @@ static void _copy_config_table(lua_State *from, lua_State *to) {
 void proxy_worker_reload(void *arg, LIBEVENT_THREAD *thr) {
     proxy_ctx_t *ctx = arg;
     pthread_mutex_lock(&ctx->worker_lock);
-    if (proxy_thread_loadconf(thr) != 0) {
+    if (proxy_thread_loadconf(ctx, thr) != 0) {
         ctx->worker_failed = true;
     }
     ctx->worker_done = true;
@@ -343,10 +350,9 @@ void proxy_worker_reload(void *arg, LIBEVENT_THREAD *thr) {
 
 // FIXME (v2): need to test how to recover from an actual error here. error message
 // needs to go somewhere useful, counters added, etc.
-int proxy_thread_loadconf(LIBEVENT_THREAD *thr) {
+int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr) {
     lua_State *L = thr->L;
     // load the precompiled config function.
-    proxy_ctx_t *ctx = settings.proxy_ctx;
     struct _dumpbuf *db = ctx->proxy_code;
     struct _dumpbuf db2; // copy because the helper modifies it.
     memcpy(&db2, db, sizeof(struct _dumpbuf));

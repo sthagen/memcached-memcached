@@ -387,6 +387,8 @@ static void create_worker(void *(*func)(void *), void *arg) {
                 strerror(ret));
         exit(1);
     }
+
+    thread_setname(((LIBEVENT_THREAD*)arg)->thread_id, "mc-worker");
 }
 
 /*
@@ -490,7 +492,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     // TODO: maybe register hooks to be called here from sub-packages? ie;
     // extstore, TLS, proxy.
     if (settings.proxy_enabled) {
-        proxy_thread_init(me);
+        proxy_thread_init(settings.proxy_ctx, me);
     }
 #endif
     thread_io_queue_add(me, IO_QUEUE_NONE, NULL, NULL, NULL, NULL, NULL);
@@ -628,6 +630,17 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
         cqi_free(me->ev_queue, item);
     }
 }
+
+// Interface is slightly different on various platforms.
+// On linux, at least, the len limit is 16 bytes.
+#define THR_NAME_MAXLEN 16
+void thread_setname(pthread_t thread, const char *name) {
+assert(strlen(name) < THR_NAME_MAXLEN);
+#if defined(__linux__)
+pthread_setname_np(thread, name);
+#endif
+}
+#undef THR_NAME_MAXLEN
 
 // NOTE: need better encapsulation.
 // used by the proxy module to iterate the worker threads.
@@ -918,11 +931,11 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
 
 /******************************* GLOBAL STATS ******************************/
 
-void STATS_LOCK() {
+void STATS_LOCK(void) {
     pthread_mutex_lock(&stats_lock);
 }
 
-void STATS_UNLOCK() {
+void STATS_UNLOCK(void) {
     pthread_mutex_unlock(&stats_lock);
 }
 
