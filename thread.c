@@ -86,7 +86,7 @@ static pthread_mutex_t worker_hang_lock;
 static pthread_mutex_t *item_locks;
 /* size of the item lock hash table */
 static uint32_t item_lock_count;
-unsigned int item_lock_hashpower;
+static unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
@@ -482,12 +482,11 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     // me->storage is set just before this function is called.
     if (me->storage) {
         thread_io_queue_add(me, IO_QUEUE_EXTSTORE, me->storage,
-            storage_submit_cb, storage_complete_cb, NULL, storage_finalize_cb);
+            storage_submit_cb);
     }
 #endif
 #ifdef PROXY
-    thread_io_queue_add(me, IO_QUEUE_PROXY, settings.proxy_ctx, proxy_submit_cb,
-            proxy_complete_cb, proxy_return_cb, proxy_finalize_cb);
+    thread_io_queue_add(me, IO_QUEUE_PROXY, settings.proxy_ctx, proxy_submit_cb);
 
     // TODO: maybe register hooks to be called here from sub-packages? ie;
     // extstore, TLS, proxy.
@@ -495,7 +494,7 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         proxy_thread_init(settings.proxy_ctx, me);
     }
 #endif
-    thread_io_queue_add(me, IO_QUEUE_NONE, NULL, NULL, NULL, NULL, NULL);
+    thread_io_queue_add(me, IO_QUEUE_NONE, NULL, NULL);
 }
 
 /*
@@ -809,7 +808,7 @@ void sidethread_conn_close(conn *c) {
 /*
  * Allocates a new item.
  */
-item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
+item *item_alloc(const char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
     item *it;
     /* do_item_alloc handles its own locks */
     it = do_item_alloc(key, nkey, flags, exptime, nbytes);
@@ -820,12 +819,12 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
  * Returns an item if it hasn't been marked as expired,
  * lazy-expiring as needed.
  */
-item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update) {
+item *item_get(const char *key, const size_t nkey, LIBEVENT_THREAD *t, const bool do_update) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_get(key, nkey, hv, c, do_update);
+    it = do_item_get(key, nkey, hv, t, do_update);
     item_unlock(hv);
     return it;
 }
@@ -833,20 +832,20 @@ item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update
 // returns an item with the item lock held.
 // lock will still be held even if return is NULL, allowing caller to replace
 // an item atomically if desired.
-item *item_get_locked(const char *key, const size_t nkey, conn *c, const bool do_update, uint32_t *hv) {
+item *item_get_locked(const char *key, const size_t nkey, LIBEVENT_THREAD *t, const bool do_update, uint32_t *hv) {
     item *it;
     *hv = hash(key, nkey);
     item_lock(*hv);
-    it = do_item_get(key, nkey, *hv, c, do_update);
+    it = do_item_get(key, nkey, *hv, t, do_update);
     return it;
 }
 
-item *item_touch(const char *key, size_t nkey, uint32_t exptime, conn *c) {
+item *item_touch(const char *key, size_t nkey, uint32_t exptime, LIBEVENT_THREAD *t) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_touch(key, nkey, exptime, hv, c);
+    it = do_item_touch(key, nkey, exptime, hv, t);
     item_unlock(hv);
     return it;
 }
@@ -901,7 +900,7 @@ void item_unlink(item *item) {
 /*
  * Does arithmetic on a numeric item value.
  */
-enum delta_result_type add_delta(conn *c, const char *key,
+enum delta_result_type add_delta(LIBEVENT_THREAD *t, const char *key,
                                  const size_t nkey, bool incr,
                                  const int64_t delta, char *buf,
                                  uint64_t *cas) {
@@ -910,7 +909,7 @@ enum delta_result_type add_delta(conn *c, const char *key,
 
     hv = hash(key, nkey);
     item_lock(hv);
-    ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv, NULL);
+    ret = do_add_delta(t, key, nkey, incr, delta, buf, cas, hv, NULL);
     item_unlock(hv);
     return ret;
 }
@@ -918,13 +917,13 @@ enum delta_result_type add_delta(conn *c, const char *key,
 /*
  * Stores an item in the cache (high level, obeys set/add/replace semantics)
  */
-enum store_item_type store_item(item *item, int comm, conn* c) {
+enum store_item_type store_item(item *item, int comm, LIBEVENT_THREAD *t, uint64_t *cas, bool cas_stale) {
     enum store_item_type ret;
     uint32_t hv;
 
     hv = hash(ITEM_key(item), item->nkey);
     item_lock(hv);
-    ret = do_store_item(item, comm, c, hv);
+    ret = do_store_item(item, comm, t, hv, cas, cas_stale);
     item_unlock(hv);
     return ret;
 }
@@ -1092,6 +1091,7 @@ void memcached_thread_init(int nthreads, void *arg) {
 #ifdef EXTSTORE
         threads[i].storage = arg;
 #endif
+        threads[i].thread_baseid = i;
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats_state.reserved_fds += 5;

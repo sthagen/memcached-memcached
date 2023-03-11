@@ -40,14 +40,18 @@ static void proxy_backend_handler(const int fd, const short which, void *arg);
 static void proxy_beconn_handler(const int fd, const short which, void *arg);
 static void proxy_event_handler(evutil_socket_t fd, short which, void *arg);
 static void proxy_event_beconn(evutil_socket_t fd, short which, void *arg);
-static void proxy_event_updater(evutil_socket_t fd, short which, void *arg);
 static int _prep_pending_write(mcp_backend_t *be);
-static bool _post_pending_write(mcp_backend_t *be, ssize_t sent);
+static void _post_pending_write(mcp_backend_t *be, ssize_t sent);
 static int _flush_pending_write(mcp_backend_t *be);
 static void _cleanup_backend(mcp_backend_t *be);
 static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err);
 static void _backend_failed(mcp_backend_t *be);
-static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t, event_callback_fn callback);
+static void _set_main_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval *t, event_callback_fn callback);
+static void _stop_main_event(mcp_backend_t *be);
+static void _start_write_event(mcp_backend_t *be);
+static void _stop_write_event(mcp_backend_t *be);
+static void _start_timeout_event(mcp_backend_t *be);
+static void _stop_timeout_event(mcp_backend_t *be);
 static int proxy_backend_drive_machine(mcp_backend_t *be);
 
 /* Helper routines common to io_uring and libevent modes */
@@ -129,17 +133,8 @@ static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
         // paranoia about moving items between lists.
         io->io_next.stqe_next = NULL;
 
-        // Need to check on await's before looking at backends, in case it
-        // doesn't have one.
-        // Here we're letting an await resume without waiting on the network.
-        if (io->await_background) {
-            return_io_pending((io_pending_t *)io);
-            continue;
-        }
-
         mcp_backend_t *be = io->backend;
         // So the backend can retrieve its event base.
-        be->event_thread = t;
         if (be->bad) {
             P_DEBUG("%s: fast failing request to bad backend\n", __func__);
             io->client_resp->status = MCMC_ERR;
@@ -147,9 +142,6 @@ static int _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
             continue;
         }
         STAILQ_INSERT_TAIL(&be->io_head, io, io_next);
-        if (be->io_next == NULL) {
-            be->io_next = io; // set write flush starting point.
-        }
         be->depth++;
         io_count++;
         if (!be->stacked) {
@@ -174,10 +166,7 @@ static void _proxy_evthr_evset_be_conn(mcp_backend_t *be, struct __kernel_timesp
 static void _proxy_evthr_evset_be_readvalidate(mcp_backend_t *be, char *buf, size_t len, struct __kernel_timespec *ts);
 static void _proxy_evthr_evset_notifier(proxy_event_thread_t *t);
 static void _proxy_evthr_evset_benotifier(proxy_event_thread_t *t);
-static void _proxy_evthr_evset_clock(proxy_event_thread_t *t);
-static void proxy_event_updater_ur(void *udata, struct io_uring_cqe *cqe);
 static void _backend_failed_ur(mcp_backend_t *be);
-struct __kernel_timespec updater_ts = {.tv_sec = 3, .tv_nsec = 0};
 
 static void _flush_pending_write_ur(mcp_backend_t *be) {
     // Allow us to be called with an empty stack to prevent dev errors.
@@ -188,7 +177,7 @@ static void _flush_pending_write_ur(mcp_backend_t *be) {
     int iovcnt = _prep_pending_write(be);
 
     // TODO: write timeout.
-    _proxy_evthr_evset_be_writev(be, iovcnt, &be->event_thread->tunables.read_ur);
+    _proxy_evthr_evset_be_writev(be, iovcnt, &be->tunables.read_ur);
 }
 
 // TODO: we shouldn't handle reads if a write is pending, so postwrite should
@@ -203,7 +192,7 @@ static void proxy_backend_postwrite_ur(void *udata, struct io_uring_cqe *cqe) {
         // FIXME: sent == 0 is disconnected? I keep forgetting.
         if (sent == -EAGAIN || sent == -EWOULDBLOCK) {
             // didn't do any writing, wait for a writeable socket.
-            _proxy_evthr_evset_be_wrpoll(be, &be->event_thread->tunables.read_ur);
+            _proxy_evthr_evset_be_wrpoll(be, &be->tunables.read_ur);
         } else {
             _reset_bad_backend(be, P_BE_FAIL_WRITING);
             _backend_failed_ur(be);
@@ -212,29 +201,17 @@ static void proxy_backend_postwrite_ur(void *udata, struct io_uring_cqe *cqe) {
 
     if (_post_pending_write(be, sent)) {
         // commands were flushed, set read handler.
-        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->event_thread->tunables.read_ur);
+        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->tunables.read_ur);
     }
 
     if (be->io_next) {
         // still have unflushed commands, re-run write command.
         // writev can't "block if EAGAIN" in io_uring so far as I can tell, so
         // we have to switch to polling mode here.
-        _proxy_evthr_evset_be_wrpoll(be, &be->event_thread->tunables.read_ur);
+        _proxy_evthr_evset_be_wrpoll(be, &be->tunables.read_ur);
     }
 
     // TODO: if rbufused != 0, push through drive machine?
-}
-
-static void proxy_event_updater_ur(void *udata, struct io_uring_cqe *cqe) {
-    proxy_event_thread_t *t = udata;
-    proxy_ctx_t *ctx = t->ctx;
-
-    _proxy_evthr_evset_clock(t);
-
-    // we reuse the "global stats" lock since it's hardly ever used.
-    STAT_L(ctx);
-    memcpy(&t->tunables, &ctx->tunables, sizeof(t->tunables));
-    STAT_UL(ctx);
 }
 
 // No-op at the moment. when the linked timeout fires uring returns the
@@ -248,7 +225,7 @@ static void proxy_backend_timeout_handler_ur(void *udata, struct io_uring_cqe *c
 
 static void proxy_backend_retry_handler_ur(void *udata, struct io_uring_cqe *cqe) {
     mcp_backend_t *be = udata;
-    _proxy_evthr_evset_be_conn(be, &be->event_thread->tunables.connect_ur);
+    _proxy_evthr_evset_be_conn(be, &be->tunables.connect_ur);
 }
 
 static void _proxy_evthr_evset_be_retry(mcp_backend_t *be) {
@@ -262,19 +239,19 @@ static void _proxy_evthr_evset_be_retry(mcp_backend_t *be) {
     sqe = io_uring_get_sqe(&be->event_thread->ring);
     // TODO (v2): NULL?
 
-    io_uring_prep_timeout(sqe, &be->event_thread->tunables.retry_ur, 0, 0);
+    io_uring_prep_timeout(sqe, &be->tunables.retry_ur, 0, 0);
     io_uring_sqe_set_data(sqe, &be->ur_te_ev);
     be->ur_te_ev.set = true;
 }
 
 static void _backend_failed_ur(mcp_backend_t *be) {
-    if (++be->failed_count > be->event_thread->tunables.backend_failure_limit) {
+    if (++be->failed_count > be->tunables.backend_failure_limit) {
         P_DEBUG("%s: marking backend as bad\n", __func__);
         be->bad = true;
         _proxy_evthr_evset_be_retry(be);
         STAT_INCR(be->event_thread->ctx, backend_marked_bad, 1);
     } else {
-        _proxy_evthr_evset_be_conn(be, &be->event_thread->tunables.connect_ur);
+        _proxy_evthr_evset_be_conn(be, &be->tunables.connect_ur);
         STAT_INCR(be->event_thread->ctx, backend_failed, 1);
     }
 }
@@ -301,7 +278,7 @@ static void proxy_backend_handler_ur(void *udata, struct io_uring_cqe *cqe) {
 
     // TODO (v2): when exactly do we need to reset the backend handler?
     if (!STAILQ_EMPTY(&be->io_head)) {
-        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->event_thread->tunables.read_ur);
+        _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->tunables.read_ur);
     }
 }
 
@@ -311,7 +288,7 @@ static void proxy_backend_wrhandler_ur(void *udata, struct io_uring_cqe *cqe) {
     be->can_write = true;
     _flush_pending_write_ur(be);
 
-    _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->event_thread->tunables.read_ur);
+    _proxy_evthr_evset_be_read(be, be->rbuf+be->rbufused, READ_BUFFER_SIZE-be->rbufused, &be->tunables.read_ur);
 }
 
 // a backend with an outstanding new connection has become writeable.
@@ -355,7 +332,7 @@ static void proxy_backend_beconn_ur(void *udata, struct io_uring_cqe *cqe) {
 
     // TODO: make validation optional.
     // set next handler on recv for validity check.
-    _proxy_evthr_evset_be_readvalidate(be, be->rbuf, READ_BUFFER_SIZE, &be->event_thread->tunables.read_ur);
+    _proxy_evthr_evset_be_readvalidate(be, be->rbuf, READ_BUFFER_SIZE, &be->tunables.read_ur);
 }
 
 // TODO: share more code with proxy_beconn_handler
@@ -438,7 +415,6 @@ static void proxy_beconn_handler_ur(void *udata, struct io_uring_cqe *cqe) {
             _cleanup_backend(be);
         } else {
             be->transferred = true;
-            be->event_thread = t;
             int status = mcmc_connect(be->client, be->name, be->port, be->connect_flags);
             if (status == MCMC_CONNECTING || status == MCMC_CONNECTED) {
                 // if we're already connected for some reason, still push it
@@ -446,7 +422,7 @@ static void proxy_beconn_handler_ur(void *udata, struct io_uring_cqe *cqe) {
                 // will auto-wake because the socket is writeable.
                 be->connecting = true;
                 be->can_write = false;
-                _proxy_evthr_evset_be_conn(be, &t->tunables.connect_ur);
+                _proxy_evthr_evset_be_conn(be, &be->tunables.connect_ur);
             } else {
                 _reset_bad_backend(be, P_BE_FAIL_CONNECTING);
                 _backend_failed_ur(be);
@@ -657,17 +633,6 @@ static void _proxy_evthr_evset_be_read(mcp_backend_t *be, char *buf, size_t len,
     io_uring_sqe_set_data(sqe, NULL);
 }*/
 
-static void _proxy_evthr_evset_clock(proxy_event_thread_t *t) {
-    struct io_uring_sqe *sqe;
-
-    sqe = io_uring_get_sqe(&t->ring);
-    // FIXME (v2): NULL?
-
-    io_uring_prep_timeout(sqe, &updater_ts, 0, 0);
-    io_uring_sqe_set_data(sqe, &t->ur_clock_event);
-    t->ur_clock_event.set = true;
-}
-
 static void _proxy_evthr_evset_benotifier(proxy_event_thread_t *t) {
     struct io_uring_sqe *sqe;
     P_DEBUG("%s: setting: %d\n", __func__, t->ur_benotify_event.set);
@@ -748,28 +713,6 @@ void *proxy_event_thread_ur(void *arg) {
 }
 #endif // HAVE_LIBURING
 
-// We need to get timeout/retry/etc updates to the event thread(s)
-// occasionally. I'd like to have a better inteface around this where updates
-// are shipped directly; but this is good enough to start with.
-static void proxy_event_updater(evutil_socket_t fd, short which, void *arg) {
-    proxy_event_thread_t *t = arg;
-    proxy_ctx_t *ctx = t->ctx;
-
-    // TODO (v2): double check how much of this boilerplate is still necessary?
-    // reschedule the clock event.
-    evtimer_del(&t->clock_event);
-
-    evtimer_set(&t->clock_event, proxy_event_updater, t);
-    event_base_set(t->base, &t->clock_event);
-    struct timeval rate = {.tv_sec = 3, .tv_usec = 0};
-    evtimer_add(&t->clock_event, &rate);
-
-    // we reuse the "global stats" lock since it's hardly ever used.
-    STAT_L(ctx);
-    memcpy(&t->tunables, &ctx->tunables, sizeof(t->tunables));
-    STAT_UL(ctx);
-}
-
 static void _cleanup_backend(mcp_backend_t *be) {
 #ifdef HAVE_LIBURING
     if (be->event_thread->use_uring) {
@@ -777,12 +720,17 @@ static void _cleanup_backend(mcp_backend_t *be) {
     } else {
 #endif
     // remove any pending events.
-    int pending = 0;
-    if (event_initialized(&be->event)) {
-        pending = event_pending(&be->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
-    }
+    int pending = event_pending(&be->main_event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
     if ((pending & (EV_READ|EV_WRITE|EV_TIMEOUT)) != 0) {
-        event_del(&be->event); // an error to call event_del() without event.
+        event_del(&be->main_event); // an error to call event_del() without event.
+    }
+    pending = event_pending(&be->write_event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
+    if ((pending & (EV_READ|EV_WRITE|EV_TIMEOUT)) != 0) {
+        event_del(&be->write_event); // an error to call event_del() without event.
+    }
+    pending = event_pending(&be->timeout_event, EV_TIMEOUT, NULL);
+    if ((pending & (EV_TIMEOUT)) != 0) {
+        event_del(&be->timeout_event); // an error to call event_del() without event.
     }
 #ifdef HAVE_LIBURING
     }
@@ -820,7 +768,6 @@ static void proxy_event_beconn(evutil_socket_t fd, short which, void *arg) {
 #endif
 
     beconn_head_t head;
-    struct timeval tmp_time = t->tunables.connect;
 
     STAILQ_INIT(&head);
     pthread_mutex_lock(&t->mutex);
@@ -845,19 +792,64 @@ static void proxy_event_beconn(evutil_socket_t fd, short which, void *arg) {
             _cleanup_backend(be);
         } else {
             be->transferred = true;
-            be->event_thread = t;
+            // assign the initial events to the backend, so we don't have to
+            // constantly check if they were initialized yet elsewhere.
+            // note these events will not fire until event_add() is called.
             int status = mcmc_connect(be->client, be->name, be->port, be->connect_flags);
+            event_assign(&be->main_event, be->event_thread->base, mcmc_fd(be->client), EV_WRITE|EV_TIMEOUT, proxy_beconn_handler, be);
+            event_assign(&be->write_event, be->event_thread->base, mcmc_fd(be->client), EV_WRITE|EV_TIMEOUT, proxy_backend_handler, be);
+            event_assign(&be->timeout_event, be->event_thread->base, -1, EV_TIMEOUT, proxy_backend_handler, be);
+
             if (status == MCMC_CONNECTING || status == MCMC_CONNECTED) {
                 // if we're already connected for some reason, still push it
                 // through the connection handler to keep the code unified. It
                 // will auto-wake because the socket is writeable.
                 be->connecting = true;
                 be->can_write = false;
-                _set_event(be, t->base, EV_WRITE|EV_TIMEOUT, tmp_time, proxy_beconn_handler);
+                // kick off the event we intialized above.
+                event_add(&be->main_event, &be->tunables.connect);
             } else {
                 _reset_bad_backend(be, P_BE_FAIL_CONNECTING);
                 _backend_failed(be);
             }
+        }
+    }
+}
+
+void proxy_run_backend_queue(be_head_t *head) {
+    mcp_backend_t *be;
+    STAILQ_FOREACH(be, head, be_next) {
+        be->stacked = false;
+        int flags = 0;
+
+        if (be->bad) {
+            // flush queue if backend is still bad.
+            // TODO: duplicated from _reset_bad_backend()
+            io_pending_proxy_t *io = NULL;
+            while (!STAILQ_EMPTY(&be->io_head)) {
+                io = STAILQ_FIRST(&be->io_head);
+                STAILQ_REMOVE_HEAD(&be->io_head, io_next);
+                io->client_resp->status = MCMC_ERR;
+                be->depth--;
+                return_io_pending((io_pending_t *)io);
+            }
+        } else if (be->connecting || be->validating) {
+            P_DEBUG("%s: deferring IO pending connecting (%s:%s)\n", __func__, be->name, be->port);
+        } else {
+            flags = _flush_pending_write(be);
+
+            if (flags == -1) {
+                _reset_bad_backend(be, P_BE_FAIL_WRITING);
+                _backend_failed(be);
+            } else if (flags & EV_WRITE) {
+                // only get here because we need to kick off the write handler
+                _start_write_event(be);
+            }
+
+            if (be->pending_read) {
+                _start_timeout_event(be);
+            }
+
         }
     }
 }
@@ -893,29 +885,7 @@ static void proxy_event_handler(evutil_socket_t fd, short which, void *arg) {
     }
 
     // Re-walk each backend and check set event as required.
-    mcp_backend_t *be = NULL;
-    struct timeval tmp_time = t->tunables.read;
-
-    // FIXME (v2): _set_event() is buggy, see notes on function.
-    STAILQ_FOREACH(be, &t->be_head, be_next) {
-        be->stacked = false;
-        int flags = 0;
-
-        if (be->connecting || be->validating) {
-            P_DEBUG("%s: deferring IO pending connecting (%s:%s)\n", __func__, be->name, be->port);
-        } else {
-            flags = _flush_pending_write(be);
-
-            if (flags == -1) {
-                _reset_bad_backend(be, P_BE_FAIL_WRITING);
-                _backend_failed(be);
-            } else {
-                flags = be->can_write ? EV_READ|EV_TIMEOUT : EV_READ|EV_WRITE|EV_TIMEOUT;
-                _set_event(be, t->base, flags, tmp_time, proxy_backend_handler);
-            }
-        }
-    }
-
+    proxy_run_backend_queue(&t->be_head);
 }
 
 void *proxy_event_thread(void *arg) {
@@ -930,28 +900,58 @@ void *proxy_event_thread(void *arg) {
     return NULL;
 }
 
-// FIXME (v2): if we use the newer API the various pending checks can be adjusted.
-static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval t, event_callback_fn callback) {
-    // FIXME (v2): chicken and egg.
-    // can't check if pending if the structure is was calloc'ed (sigh)
-    // don't want to double test here. should be able to event_assign but
-    // not add anything during initialization, but need the owner thread's
-    // event base.
-    int pending = 0;
-    if (event_initialized(&be->event)) {
-        pending = event_pending(&be->event, EV_READ|EV_WRITE|EV_TIMEOUT, NULL);
-    }
-    if ((pending & (EV_READ|EV_WRITE|EV_TIMEOUT)) != 0) {
-            event_del(&be->event); // replace existing event.
+static void _set_main_event(mcp_backend_t *be, struct event_base *base, int flags, struct timeval *t, event_callback_fn callback) {
+    int pending = event_pending(&be->main_event, EV_READ|EV_WRITE, NULL);
+    if ((pending & (EV_READ|EV_WRITE)) != 0) {
+        event_del(&be->main_event); // replace existing event.
     }
 
-    // if we can't write, we could be connecting.
-    // TODO (v2): always check for READ in case some commands were sent
-    // successfully? The flags could be tracked on *be and reset in the
-    // handler, perhaps?
-    event_assign(&be->event, base, mcmc_fd(be->client),
+    event_assign(&be->main_event, base, mcmc_fd(be->client),
             flags, callback, be);
-    event_add(&be->event, &t);
+    event_add(&be->main_event, t);
+}
+
+static void _stop_main_event(mcp_backend_t *be) {
+    int pending = event_pending(&be->main_event, EV_READ|EV_WRITE, NULL);
+    if ((pending & (EV_READ|EV_WRITE|EV_TIMEOUT)) == 0) {
+        return;
+    }
+    event_del(&be->write_event);
+}
+
+static void _start_write_event(mcp_backend_t *be) {
+    int pending = event_pending(&be->main_event, EV_WRITE, NULL);
+    if ((pending & (EV_WRITE|EV_TIMEOUT)) != 0) {
+        return;
+    }
+    // FIXME: wasn't there a write timeout?
+    event_add(&be->write_event, &be->tunables.read);
+}
+
+static void _stop_write_event(mcp_backend_t *be) {
+    int pending = event_pending(&be->main_event, EV_WRITE, NULL);
+    if ((pending & (EV_WRITE|EV_TIMEOUT)) == 0) {
+        return;
+    }
+    event_del(&be->write_event);
+}
+
+// handle the read timeouts with a side event, so we can stick with a
+// persistent listener (optimization + catch disconnects faster)
+static void _start_timeout_event(mcp_backend_t *be) {
+    int pending = event_pending(&be->timeout_event, EV_TIMEOUT, NULL);
+    if ((pending & (EV_TIMEOUT)) != 0) {
+        return;
+    }
+    event_add(&be->timeout_event, &be->tunables.read);
+}
+
+static void _stop_timeout_event(mcp_backend_t *be) {
+    int pending = event_pending(&be->timeout_event, EV_TIMEOUT, NULL);
+    if ((pending & (EV_TIMEOUT)) == 0) {
+        return;
+    }
+    event_del(&be->timeout_event);
 }
 
 // NOTES:
@@ -966,6 +966,7 @@ static void _set_event(mcp_backend_t *be, struct event_base *base, int flags, st
 static int proxy_backend_drive_machine(mcp_backend_t *be) {
     bool stop = false;
     io_pending_proxy_t *p = NULL;
+    struct timeval end;
     int flags = 0;
 
     p = STAILQ_FIRST(&be->io_head);
@@ -1037,6 +1038,11 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
 
             if (p->ascii_multiget && r->resp.type == MCMC_RESP_END) {
                 // Ascii multiget hack mode; consume END's
+                be->rbufused -= r->resp.reslen;
+                if (be->rbufused > 0) {
+                    memmove(be->rbuf, be->rbuf+r->resp.reslen, be->rbufused);
+                }
+
                 be->state = mcp_backend_next;
                 break;
             }
@@ -1134,7 +1140,7 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
             memcpy(r->buf+r->bread, be->rbuf, tocopy);
             r->bread += tocopy;
 
-            if (r->bread >= r->resp.vlen) {
+            if (r->bread >= r->blen) {
                 // all done copying data.
                 if (r->resp.type == MCMC_RESP_GET) {
                     be->state = mcp_backend_read_end;
@@ -1160,6 +1166,13 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
             // set the head here. when we break the head will be correct.
             STAILQ_REMOVE_HEAD(&be->io_head, io_next);
             be->depth--;
+            be->pending_read--;
+
+            // stamp the elapsed time into the response object.
+            gettimeofday(&end, NULL);
+            p->client_resp->elapsed = (end.tv_sec - p->client_resp->start.tv_sec) * 1000000 +
+                (end.tv_usec - p->client_resp->start.tv_usec);
+
             // have to do the q->count-- and == 0 and redispatch_conn()
             // stuff here. The moment we call return_io here we
             // don't own *p anymore.
@@ -1204,68 +1217,7 @@ static int proxy_backend_drive_machine(mcp_backend_t *be) {
     return flags;
 }
 
-// All we need to do here is schedule the backend to attempt to connect again.
-static void proxy_backend_retry_handler(const int fd, const short which, void *arg) {
-    mcp_backend_t *be = arg;
-    assert(which & EV_TIMEOUT);
-    struct timeval tmp_time = be->event_thread->tunables.retry;
-    _set_event(be, be->event_thread->base, EV_WRITE|EV_TIMEOUT, tmp_time, proxy_beconn_handler);
-}
-
-// currently just for timeouts, but certain errors should consider a backend
-// to be "bad" as well.
-// must be called after _reset_bad_backend(), so the backend is currently
-// clear.
-// TODO (v2): currently only notes for "bad backends" in cases of timeouts or
-// connect failures. We need a specific connect() handler that executes a
-// "version" call to at least check that the backend isn't speaking garbage.
-// In theory backends can fail such that responses are constantly garbage,
-// but it's more likely an app is doing something bad and culling the backend
-// may prevent any other clients from talking to that backend. In
-// that case we need to track if clients are causing errors consistently and
-// block them instead. That's more challenging so leaving a note instead
-// of doing this now :)
-static void _backend_failed(mcp_backend_t *be) {
-    struct timeval tmp_time = be->event_thread->tunables.retry;
-    if (++be->failed_count > be->event_thread->tunables.backend_failure_limit) {
-        P_DEBUG("%s: marking backend as bad\n", __func__);
-        be->bad = true;
-       _set_event(be, be->event_thread->base, EV_TIMEOUT, tmp_time, proxy_backend_retry_handler);
-        STAT_INCR(be->event_thread->ctx, backend_marked_bad, 1);
-    } else {
-        STAT_INCR(be->event_thread->ctx, backend_failed, 1);
-        _set_event(be, be->event_thread->base, EV_WRITE|EV_TIMEOUT, tmp_time, proxy_beconn_handler);
-    }
-}
-
-// TODO (v2): add a second argument for assigning a specific error to all pending
-// IO's (ie; timeout).
-// The backend has gotten into a bad state (timed out, protocol desync, or
-// some other supposedly unrecoverable error: purge the queue and
-// cycle the socket.
-// Note that some types of errors may not require flushing the queue and
-// should be fixed as they're figured out.
-// _must_ be called from within the event thread.
-static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err) {
-    io_pending_proxy_t *io = NULL;
-    // Can't use STAILQ_FOREACH() since return_io_pending() free's the current
-    // io. STAILQ_FOREACH_SAFE maybe?
-    while (!STAILQ_EMPTY(&be->io_head)) {
-        io = STAILQ_FIRST(&be->io_head);
-        STAILQ_REMOVE_HEAD(&be->io_head, io_next);
-        // TODO (v2): Unsure if this is the best way of surfacing errors to lua,
-        // but will do for V1.
-        io->client_resp->status = MCMC_ERR;
-        be->depth--;
-        return_io_pending((io_pending_t *)io);
-    }
-
-    STAILQ_INIT(&be->io_head);
-    be->io_next = NULL; // also reset the write offset.
-
-    // reset buffer to blank state.
-    be->rbufused = 0;
-    mcmc_disconnect(be->client);
+static void _backend_reconnect(mcp_backend_t *be) {
     int status = mcmc_connect(be->client, be->name, be->port, be->connect_flags);
     if (status == MCMC_CONNECTED) {
         // TODO (v2): unexpected but lets let it be here.
@@ -1285,8 +1237,82 @@ static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err) {
         be->connecting = false;
         be->can_write = true;
     }
+    // re-create the write handler for the new file descriptor.
+    // the main event will be re-assigned after this call.
+    event_assign(&be->write_event, be->event_thread->base, mcmc_fd(be->client), EV_WRITE|EV_TIMEOUT, proxy_backend_handler, be);
+    // do not need to re-assign the timer event because it's not tied to fd
+}
 
-    LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_BE_ERROR, NULL, proxy_be_failure_text[err], be->name, be->port);
+// All we need to do here is schedule the backend to attempt to connect again.
+static void proxy_backend_retry_handler(const int fd, const short which, void *arg) {
+    mcp_backend_t *be = arg;
+    assert(which & EV_TIMEOUT);
+    struct timeval tmp_time = be->tunables.retry;
+    _backend_reconnect(be);
+    _set_main_event(be, be->event_thread->base, EV_WRITE, &tmp_time, proxy_beconn_handler);
+}
+
+// must be called after _reset_bad_backend(), so the backend is currently
+// clear.
+// TODO (v2): extra counter for "backend connect tries" so it's still possible
+// to see dead backends exist
+static void _backend_failed(mcp_backend_t *be) {
+    struct timeval tmp_time = be->tunables.retry;
+    if (++be->failed_count > be->tunables.backend_failure_limit) {
+        if (!be->bad) {
+            P_DEBUG("%s: marking backend as bad\n", __func__);
+            STAT_INCR(be->event_thread->ctx, backend_marked_bad, 1);
+            LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_BE_ERROR, NULL, "markedbad", be->name, be->port, 0, NULL, 0);
+        }
+        be->bad = true;
+       _set_main_event(be, be->event_thread->base, EV_TIMEOUT, &tmp_time, proxy_backend_retry_handler);
+    } else {
+        STAT_INCR(be->event_thread->ctx, backend_failed, 1);
+        _backend_reconnect(be);
+        _set_main_event(be, be->event_thread->base, EV_WRITE, &tmp_time, proxy_beconn_handler);
+    }
+}
+
+// TODO (v2): add a second argument for assigning a specific error to all pending
+// IO's (ie; timeout).
+// The backend has gotten into a bad state (timed out, protocol desync, or
+// some other supposedly unrecoverable error: purge the queue and
+// cycle the socket.
+// Note that some types of errors may not require flushing the queue and
+// should be fixed as they're figured out.
+// _must_ be called from within the event thread.
+static int _reset_bad_backend(mcp_backend_t *be, enum proxy_be_failures err) {
+    io_pending_proxy_t *io = NULL;
+    // Can't use STAILQ_FOREACH() since return_io_pending() free's the current
+    // io. STAILQ_FOREACH_SAFE maybe?
+    int depth = be->depth;
+    while (!STAILQ_EMPTY(&be->io_head)) {
+        io = STAILQ_FIRST(&be->io_head);
+        STAILQ_REMOVE_HEAD(&be->io_head, io_next);
+        // TODO (v2): Unsure if this is the best way of surfacing errors to lua,
+        // but will do for V1.
+        io->client_resp->status = MCMC_ERR;
+        be->depth--;
+        return_io_pending((io_pending_t *)io);
+    }
+
+    STAILQ_INIT(&be->io_head);
+    be->io_next = NULL; // also reset the write offset.
+
+    // Only log if we don't already know it's messed up.
+    if (!be->bad) {
+        LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_BE_ERROR, NULL, proxy_be_failure_text[err], be->name, be->port, depth, be->rbuf, be->rbufused);
+    }
+
+    // reset buffer to blank state.
+    be->rbufused = 0;
+    be->pending_read = 0;
+    // allow the _backend_failed() routine to connect when ready.
+    _stop_write_event(be);
+    _stop_main_event(be);
+    _stop_timeout_event(be);
+    mcmc_disconnect(be->client);
+    // we leave the main event alone, because be_failed() always overwrites.
 
     return 0;
 }
@@ -1297,9 +1323,10 @@ static int _prep_pending_write(mcp_backend_t *be) {
     int iovused = 0;
     if (be->io_next == NULL) {
         // separate pointer for how far into the list we've flushed.
-        be->io_next = STAILQ_FIRST(&be->io_head);
+        io = STAILQ_FIRST(&be->io_head);
+    } else {
+        io = be->io_next;
     }
-    io = be->io_next;
     assert(io != NULL);
     for (; io; io = STAILQ_NEXT(io, io_next)) {
         // TODO (v2): paranoia for now, but this check should never fire
@@ -1318,16 +1345,16 @@ static int _prep_pending_write(mcp_backend_t *be) {
 }
 
 // returns true if any pending writes were fully flushed.
-static bool _post_pending_write(mcp_backend_t *be, ssize_t sent) {
+static void _post_pending_write(mcp_backend_t *be, ssize_t sent) {
     io_pending_proxy_t *io = be->io_next;
-    assert(io != NULL);
+    if (io == NULL) {
+        io = STAILQ_FIRST(&be->io_head);
+    }
 
-    bool did_flush = false;
     for (; io; io = STAILQ_NEXT(io, io_next)) {
         bool flushed = true;
         if (io->flushed)
             continue;
-
         if (sent >= io->iovbytes) {
             // short circuit for common case.
             sent -= io->iovbytes;
@@ -1348,11 +1375,10 @@ static bool _post_pending_write(mcp_backend_t *be, ssize_t sent) {
             }
         }
         io->flushed = flushed;
-
         if (flushed) {
-            did_flush = flushed;
-            be->io_next = STAILQ_NEXT(io, io_next);
+            be->pending_read++;
         }
+
         if (sent <= 0) {
             // really shouldn't be negative, though.
             assert(sent >= 0);
@@ -1360,7 +1386,12 @@ static bool _post_pending_write(mcp_backend_t *be, ssize_t sent) {
         }
     } // for
 
-    return did_flush;
+    // resume the flush from this point.
+    if (io != NULL && !io->flushed) {
+        be->io_next = io;
+    } else {
+        be->io_next = NULL;
+    }
 }
 
 static int _flush_pending_write(mcp_backend_t *be) {
@@ -1374,11 +1405,10 @@ static int _flush_pending_write(mcp_backend_t *be) {
 
     ssize_t sent = writev(mcmc_fd(be->client), be->write_iovs, iovcnt);
     if (sent > 0) {
-        if (_post_pending_write(be, sent)) {
-            flags |= EV_READ;
-        }
+        _post_pending_write(be, sent);
         // still have unflushed pending IO's, check for write and re-loop.
         if (be->io_next) {
+            be->can_write = false;
             flags |= EV_WRITE;
         }
     } else if (sent == -1) {
@@ -1398,7 +1428,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
     assert(arg != NULL);
     mcp_backend_t *be = arg;
     int flags = EV_TIMEOUT;
-    struct timeval tmp_time = be->event_thread->tunables.read;
+    struct timeval tmp_time = be->tunables.read;
 
     if (which & EV_TIMEOUT) {
         P_DEBUG("%s: backend timed out while connecting\n", __func__);
@@ -1414,7 +1444,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
             if (_proxy_beconn_checkconnect(be) == -1) {
                 return;
             }
-            _set_event(be, be->event_thread->base, EV_READ, tmp_time, proxy_beconn_handler);
+            _set_main_event(be, be->event_thread->base, EV_READ, &tmp_time, proxy_beconn_handler);
         }
 
         // TODO: currently never taken, until validation is made optional.
@@ -1426,6 +1456,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
                 return;
             }
             flags |= res;
+            // FIXME: set write event?
         }
     }
 
@@ -1442,7 +1473,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
                 // Needed more data for a version line, somehow. I feel like
                 // this should set off some alarms, but it is possible.
                 if (r.code == MCMC_WANT_READ) {
-                    _set_event(be, be->event_thread->base, EV_READ, tmp_time, proxy_beconn_handler);
+                    _set_main_event(be, be->event_thread->base, EV_READ, &tmp_time, proxy_beconn_handler);
                     return;
                 }
 
@@ -1471,7 +1502,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
                 _backend_failed(be);
                 return;
             }
-            _set_event(be, be->event_thread->base, EV_READ, tmp_time, proxy_beconn_handler);
+            _set_main_event(be, be->event_thread->base, EV_READ, &tmp_time, proxy_beconn_handler);
             return;
         }
 
@@ -1482,14 +1513,18 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
             _backend_failed(be);
             return;
         }
-        flags |= res;
+        if (flags & EV_WRITE) {
+            _start_write_event(be);
+        }
+        if (be->pending_read) {
+            _start_timeout_event(be);
+        }
     }
 
-    // Still pending requests to read or write.
-    if (!be->validating && !STAILQ_EMPTY(&be->io_head)) {
-        _set_event(be, be->event_thread->base, flags, tmp_time, proxy_backend_handler);
+    // switch to the primary persistent read event.
+    if (!be->validating) {
+        _set_main_event(be, be->event_thread->base, EV_READ|EV_PERSIST, NULL, proxy_backend_handler);
     }
-
 }
 
 // The libevent backend callback handler.
@@ -1497,8 +1532,6 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
 // state.
 static void proxy_backend_handler(const int fd, const short which, void *arg) {
     mcp_backend_t *be = arg;
-    int flags = EV_TIMEOUT;
-    struct timeval tmp_time = be->event_thread->tunables.read;
 
     if (which & EV_TIMEOUT) {
         P_DEBUG("%s: timeout received, killing backend queue\n", __func__);
@@ -1515,10 +1548,14 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
             _backend_failed(be);
             return;
         }
-        flags |= res;
+        if (res & EV_WRITE) {
+            _start_write_event(be);
+        }
     }
 
     if (which & EV_READ) {
+        // got a read event, always kill the pending read timer.
+        _stop_timeout_event(be);
         // We do the syscall here before diving into the state machine to allow a
         // common code path for io_uring/epoll
         int read = recv(mcmc_fd(be->client), be->rbuf + be->rbufused,
@@ -1552,17 +1589,60 @@ static void proxy_backend_handler(const int fd, const short which, void *arg) {
 #endif
     }
 
-    // Still pending requests to read or write.
-    if (!STAILQ_EMPTY(&be->io_head)) {
-        flags |= EV_READ; // FIXME (v2): might not be necessary here, but ensures we get a disconnect event.
-        _set_event(be, be->event_thread->base, flags, tmp_time, proxy_backend_handler);
+    if (be->pending_read) {
+        _start_timeout_event(be);
     }
 }
 
 // TODO (v2): IORING_SETUP_ATTACH_WQ port from bench_event once we have multiple
 // event threads.
-void proxy_init_evthread_events(proxy_event_thread_t *t) {
+// TODO: this either needs a restructure or split into two funcs:
+// 1) for the IO thread which creates its own ring/event base
+// 2) for the worker thread which reuses the event base.
+// io_uring will probably only work for the IO thread which makes further
+// exceptions.
+void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct event_base *base) {
+    t->ctx = ctx;
+#ifdef USE_EVENTFD
+    t->event_fd = eventfd(0, EFD_NONBLOCK);
+    if (t->event_fd == -1) {
+        perror("failed to create backend notify eventfd");
+        exit(1);
+    }
+    t->be_event_fd = eventfd(0, EFD_NONBLOCK);
+    if (t->be_event_fd == -1) {
+        perror("failed to create backend notify eventfd");
+        exit(1);
+    }
+#else
+    int fds[2];
+    if (pipe(fds)) {
+        perror("can't create proxy backend notify pipe");
+        exit(1);
+    }
+
+    t->notify_receive_fd = fds[0];
+    t->notify_send_fd = fds[1];
+
+    if (pipe(fds)) {
+        perror("can't create proxy backend connection notify pipe");
+        exit(1);
+    }
+    t->be_notify_receive_fd = fds[0];
+    t->be_notify_send_fd = fds[1];
+#endif
+
+    // incoming request queue.
+    STAILQ_INIT(&t->io_head_in);
+    STAILQ_INIT(&t->beconn_head_in);
+    pthread_mutex_init(&t->mutex, NULL);
+    pthread_cond_init(&t->cond, NULL);
+
+    // initialize the event system.
+
 #ifdef HAVE_LIBURING
+    fprintf(stderr, "Sorry, io_uring not supported right now\n");
+    abort();
     bool use_uring = t->ctx->use_uring;
     struct io_uring_params p = {0};
     assert(t->event_fd); // uring only exists where eventfd also does.
@@ -1610,12 +1690,6 @@ void proxy_init_evthread_events(proxy_event_thread_t *t) {
             t->ur_benotify_event.set = false;
             _proxy_evthr_evset_benotifier(t);
 
-            // periodic data updater for event thread
-            t->ur_clock_event.cb = proxy_event_updater_ur;
-            t->ur_clock_event.udata = t;
-            t->ur_clock_event.set = false;
-            _proxy_evthr_evset_clock(t);
-
             t->use_uring = true;
             return;
         } else {
@@ -1628,14 +1702,19 @@ void proxy_init_evthread_events(proxy_event_thread_t *t) {
     }
 #endif
 
-    struct event_config *ev_config;
-    ev_config = event_config_new();
-    event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
-    t->base = event_base_new_with_config(ev_config);
-    event_config_free(ev_config);
-    if (! t->base) {
-        fprintf(stderr, "Can't allocate event base\n");
-        exit(1);
+    if (base == NULL) {
+        struct event_config *ev_config;
+        ev_config = event_config_new();
+        event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
+        t->base = event_base_new_with_config(ev_config);
+        event_config_free(ev_config);
+        if (! t->base) {
+            fprintf(stderr, "Can't allocate event base\n");
+            exit(1);
+        }
+    } else {
+        // reusing an event base from a worker thread.
+        t->base = base;
     }
 
     // listen for notifications.
@@ -1652,11 +1731,6 @@ void proxy_init_evthread_events(proxy_event_thread_t *t) {
     event_set(&t->beconn_event, t->be_notify_receive_fd,
           EV_READ | EV_PERSIST, proxy_event_beconn, t);
 #endif
-
-    evtimer_set(&t->clock_event, proxy_event_updater, t);
-    event_base_set(t->base, &t->clock_event);
-    struct timeval rate = {.tv_sec = 3, .tv_usec = 0};
-    evtimer_add(&t->clock_event, &rate);
 
     event_base_set(t->base, &t->notify_event);
     if (event_add(&t->notify_event, 0) == -1) {

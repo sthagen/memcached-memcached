@@ -2,6 +2,7 @@
 #define PROXY_H
 
 #include "memcached.h"
+#include "extstore.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -42,15 +43,15 @@
 
 #define WSTAT_L(t) pthread_mutex_lock(&t->stats.mutex);
 #define WSTAT_UL(t) pthread_mutex_unlock(&t->stats.mutex);
-#define WSTAT_INCR(c, stat, amount) { \
-    pthread_mutex_lock(&c->thread->stats.mutex); \
-    c->thread->stats.stat += amount; \
-    pthread_mutex_unlock(&c->thread->stats.mutex); \
+#define WSTAT_INCR(t, stat, amount) { \
+    pthread_mutex_lock(&t->stats.mutex); \
+    t->stats.stat += amount; \
+    pthread_mutex_unlock(&t->stats.mutex); \
 }
-#define WSTAT_DECR(c, stat, amount) { \
-    pthread_mutex_lock(&c->thread->stats.mutex); \
-    c->thread->stats.stat -= amount; \
-    pthread_mutex_unlock(&c->thread->stats.mutex); \
+#define WSTAT_DECR(t, stat, amount) { \
+    pthread_mutex_lock(&t->stats.mutex); \
+    t->stats.stat -= amount; \
+    pthread_mutex_unlock(&t->stats.mutex); \
 }
 #define STAT_L(ctx) pthread_mutex_lock(&ctx->stats_lock);
 #define STAT_UL(ctx) pthread_mutex_unlock(&ctx->stats_lock);
@@ -79,6 +80,10 @@
 #define MCP_ATTACH_UPVALUE 2
 #define MCP_BACKEND_UPVALUE 3
 #define MCP_CONTEXT_UPVALUE 4
+
+#define MCP_YIELD_POOL 1
+#define MCP_YIELD_AWAIT 2
+#define MCP_YIELD_LOCAL 3
 
 // all possible commands.
 #define CMD_FIELDS \
@@ -192,7 +197,7 @@ typedef STAILQ_HEAD(pool_head_s, mcp_pool_s) pool_head_t;
 typedef struct {
     lua_State *proxy_state;
     void *proxy_code;
-    proxy_event_thread_t *proxy_threads;
+    proxy_event_thread_t *proxy_io_thread;
     pthread_mutex_t config_lock;
     pthread_cond_t config_cond;
     pthread_t config_tid;
@@ -205,6 +210,7 @@ typedef struct {
     bool worker_done; // signal variable for the worker lock/cond system.
     bool worker_failed; // covered by worker_lock as well.
     bool use_uring; // use IO_URING for backend connections.
+    bool loading; // bool indicating an active config load.
     struct proxy_global_stats global_stats;
     struct proxy_user_stats user_stats;
     struct proxy_tunables tunables; // NOTE: updates covered by stats_lock
@@ -304,6 +310,7 @@ struct mcp_backend_label_s {
     char port[MAX_PORTLEN+1];
     char label[MAX_LABELLEN+1];
     size_t llen; // cache label length for small speedup in pool creation.
+    struct proxy_tunables tunables;
 };
 
 // lua object wrapper meant to own a malloc'ed conn structure
@@ -318,7 +325,8 @@ struct mcp_backend_wrap_s {
 // FIXME: inline the mcmc client data.
 // TODO: event_thread -> something? union of owner type?
 struct mcp_backend_s {
-    int depth;
+    int depth; // total number of requests in queue
+    int pending_read; // number of requests written to socket, pending read.
     int failed_count; // number of fails (timeouts) in a row
     proxy_event_thread_t *event_thread; // event thread owning this backend.
     void *client; // mcmc client
@@ -328,7 +336,10 @@ struct mcp_backend_s {
     io_pending_proxy_t *io_next; // next request to write.
     char *rbuf; // statically allocated read buffer.
     size_t rbufused; // currently active bytes in the buffer
-    struct event event; // libevent
+    struct event main_event; // libevent: changes role, mostly for main read events
+    struct event write_event; // libevent: only used when socket wbuf full
+    struct event timeout_event; // libevent: alarm for pending reads
+    struct proxy_tunables tunables;
 #ifdef HAVE_LIBURING
     proxy_event_t ur_rd_ev; // liburing.
     proxy_event_t ur_wr_ev; // need a separate event/cb for writing/polling
@@ -342,6 +353,7 @@ struct mcp_backend_s {
     bool can_write; // recently got a WANT_WRITE or are connecting.
     bool stacked; // if backend already queued for syscalls.
     bool bad; // timed out, marked as bad.
+    bool use_io_thread; // note if this backend is worker-local or not.
     struct iovec write_iovs[BE_IOV_MAX]; // iovs to stage batched writes
     char name[MAX_NAMELEN+1];
     char port[MAX_PORTLEN+1];
@@ -353,13 +365,11 @@ struct proxy_event_thread_s {
     pthread_t thread_id;
     struct event_base *base;
     struct event notify_event; // listen event for the notify pipe/eventfd.
-    struct event clock_event; // timer for updating event thread data.
     struct event beconn_event; // listener for backends in connect state
 #ifdef HAVE_LIBURING
     struct io_uring ring;
     proxy_event_t ur_notify_event; // listen on eventfd.
     proxy_event_t ur_benotify_event; // listen on eventfd for backend connections.
-    proxy_event_t ur_clock_event; // timer for updating event thread data.
     eventfd_t event_counter;
     eventfd_t beevent_counter;
     bool use_uring;
@@ -379,7 +389,6 @@ struct proxy_event_thread_s {
     int be_notify_send_fd;
 #endif
     proxy_ctx_t *ctx; // main context.
-    struct proxy_tunables tunables; // periodically copied from main ctx
 };
 
 enum mcp_resp_mode {
@@ -392,6 +401,8 @@ enum mcp_resp_mode {
 typedef struct {
     mcmc_resp_t resp;
     char *buf; // response line + potentially value.
+    mc_resp *cresp; // client mc_resp object during extstore fetches.
+    LIBEVENT_THREAD *thread; // cresp's owner thread needed for extstore cleanup.
     size_t blen; // total size of the value to read.
     struct timeval start; // time this object was created.
     long elapsed; // time elapsed once handled.
@@ -405,28 +416,50 @@ typedef struct {
 
 // re-cast an io_pending_t into this more descriptive structure.
 // the first few items _must_ match the original struct.
+#define IO_PENDING_TYPE_PROXY 0
+#define IO_PENDING_TYPE_EXTSTORE 1
 struct _io_pending_proxy_t {
     int io_queue_type;
     LIBEVENT_THREAD *thread;
     conn *c;
-    mc_resp *resp;  // original struct ends here
+    mc_resp *resp;
+    io_queue_cb return_cb; // called on worker thread.
+    io_queue_cb finalize_cb; // called back on the worker thread.
+    // original struct ends here
 
-    struct _io_pending_proxy_t *next; // stack for IO submission
-    STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
+    int io_type; // extstore IO or backend IO
     int coro_ref; // lua registry reference to the coroutine
-    int mcpres_ref; // mcp.res reference used for await()
     lua_State *coro; // pointer directly to the coroutine
-    mcp_backend_t *backend; // backend server to request from
-    struct iovec iov[2]; // request string + tail buffer
-    int iovcnt; // 1 or 2...
-    unsigned int iovbytes; // total bytes in the iovec
-    int await_ref; // lua reference if we were an await object
-    mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
-    bool flushed; // whether we've fully written this request to a backend.
-    bool ascii_multiget; // passed on from mcp_r_t
-    bool is_await; // are we an await object?
-    bool await_first; // are we the main route for an await object?
-    bool await_background; // dummy IO for backgrounded awaits
+    union {
+        // extstore IO.
+        struct {
+            obj_io eio;
+            item *hdr_it;
+            mc_resp *tresp; // temporary mc_resp for storage to fill.
+            int gettype;
+            int iovec_data;
+            bool miss;
+            bool badcrc;
+            bool active;
+        };
+        // backend request IO
+        struct {
+            struct _io_pending_proxy_t *next; // stack for IO submission
+            STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
+            int mcpres_ref; // mcp.res reference used for await()
+            mcp_backend_t *backend; // backend server to request from
+            struct iovec iov[2]; // request string + tail buffer
+            int iovcnt; // 1 or 2...
+            unsigned int iovbytes; // total bytes in the iovec
+            int await_ref; // lua reference if we were an await object
+            mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
+            bool flushed; // whether we've fully written this request to a backend.
+            bool ascii_multiget; // passed on from mcp_r_t
+            bool is_await; // are we an await object?
+            bool await_first; // are we the main route for an await object?
+            bool await_background; // dummy IO for backgrounded awaits
+        };
+    };
 };
 
 // Note: does *be have to be a sub-struct? how stable are userdata pointers?
@@ -447,21 +480,25 @@ struct mcp_pool_s {
     proxy_ctx_t *ctx; // main context.
     STAILQ_ENTRY(mcp_pool_s) next; // stack for deallocator.
     char key_filter_conf[KEY_HASH_FILTER_MAX+1];
+    char beprefix[MAX_LABELLEN+1]; // TODO: should probably be shorter.
     uint64_t hash_seed; // calculated from a string.
     int refcount;
     int phc_ref;
     int self_ref; // TODO (v2): double check that this is needed.
     int pool_size;
+    bool use_iothread;
     mcp_pool_be_t pool[];
 };
 
 typedef struct {
     mcp_pool_t *main; // ptr to original
+    mcp_pool_be_t *pool; // ptr to main->pool starting offset for owner thread.
 } mcp_pool_proxy_t;
 
 // networking interface
-void proxy_init_evthread_events(proxy_event_thread_t *t);
+void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct event_base *base);
 void *proxy_event_thread(void *arg);
+void proxy_run_backend_queue(be_head_t *head);
 
 // await interface
 enum mcp_await_e {
@@ -473,8 +510,13 @@ enum mcp_await_e {
     AWAIT_BACKGROUND, // returns as soon as background jobs are dispatched
 };
 int mcplib_await(lua_State *L);
+int mcplib_await_logerrors(lua_State *L);
 int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref);
 int mcplib_await_return(io_pending_proxy_t *p);
+
+// internal request interface
+int mcplib_internal(lua_State *L);
+int mcplib_internal_run(lua_State *L, conn *c, mc_resp *top_resp, int coro_ref);
 
 // user stats interface
 int mcplib_add_stat(lua_State *L);
@@ -499,11 +541,12 @@ int mcplib_open_dist_jump_hash(lua_State *L);
 int mcplib_open_dist_ring_hash(lua_State *L);
 
 int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, conn *c);
-mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_t *p, const char *key, size_t len);
+mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_proxy_t *pp, const char *key, size_t len);
 void mcp_request_attach(lua_State *L, mcp_request_t *rq, io_pending_proxy_t *p);
 int mcp_request_render(mcp_request_t *rq, int idx, const char *tok, size_t len);
 void proxy_lua_error(lua_State *L, const char *s);
 void proxy_lua_ferror(lua_State *L, const char *fmt, ...);
+void proxy_out_errstring(mc_resp *resp, const char *str);
 int _start_proxy_config_threads(proxy_ctx_t *ctx);
 int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr);
 

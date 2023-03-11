@@ -424,9 +424,9 @@ static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
         c->rbuf = do_cache_alloc(c->thread->rbuf_cache);
         if (!c->rbuf) {
-            THR_STATS_LOCK(c);
+            THR_STATS_LOCK(c->thread);
             c->thread->stats.read_buf_oom++;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_UNLOCK(c->thread);
             return false;
         }
         c->rsize = READ_BUFFER_SIZE;
@@ -569,7 +569,7 @@ void conn_worker_readd(conn *c) {
     }
 }
 
-void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb ret_cb, io_queue_cb fin_cb) {
+void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb) {
     io_queue_cb_t *q = t->io_queues;
     while (q->type != IO_QUEUE_NONE) {
         q++;
@@ -577,9 +577,6 @@ void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack
     q->type = type;
     q->ctx = ctx;
     q->submit_cb = cb;
-    q->complete_cb = com_cb;
-    q->finalize_cb = fin_cb;
-    q->return_cb   = ret_cb;
     return;
 }
 
@@ -626,26 +623,9 @@ io_queue_t *conn_io_queue_get(conn *c, int type) {
     return NULL;
 }
 
-// called after returning to the main worker thread.
-// users of the queue need to distinguish if the IO was actually consumed or
-// not and handle appropriately.
-static void conn_io_queue_complete(conn *c) {
-    io_queue_t *q = c->io_queues;
-    io_queue_cb_t *qcb = c->thread->io_queues;
-    while (q->type != IO_QUEUE_NONE) {
-        if (q->stack_ctx) {
-            qcb->complete_cb(q);
-        }
-        qcb++;
-        q++;
-    }
-}
-
 // called to return a single IO object to the original worker thread.
 void conn_io_queue_return(io_pending_t *io) {
-    io_queue_cb_t *q = thread_io_queue_get(io->thread, io->io_queue_type);
-    q->return_cb(io);
-    return;
+    io->return_cb(io);
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
@@ -1077,7 +1057,9 @@ static mc_resp* resp_allocate(conn *c) {
 
         if (resp != NULL) {
             b->refcount++;
-            resp->free = false;
+            memset(resp, 0, sizeof(*resp));
+            resp->free = false; // redundant, for clarity.
+            resp->bundle = b;
             if (b->refcount == MAX_RESP_PER_BUNDLE) {
                 assert(b->prev == NULL);
                 // We only allocate off the head. Assign new head.
@@ -1095,20 +1077,21 @@ static mc_resp* resp_allocate(conn *c) {
         assert(th->open_bundle == NULL);
         b = do_cache_alloc(th->rbuf_cache);
         if (b) {
-            THR_STATS_LOCK(c);
-            c->thread->stats.response_obj_bytes += READ_BUFFER_SIZE;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_LOCK(th);
+            th->stats.response_obj_bytes += READ_BUFFER_SIZE;
+            THR_STATS_UNLOCK(th);
             b->next_check = 1;
             b->refcount = 1;
             for (int i = 0; i < MAX_RESP_PER_BUNDLE; i++) {
-                b->r[i].bundle = b;
                 b->r[i].free = true;
             }
             b->next = 0;
             b->prev = 0;
             th->open_bundle = b;
             resp = &b->r[0];
-            resp->free = false;
+            memset(resp, 0, sizeof(*resp));
+            resp->free = false; // redundant. for clarity.
+            resp->bundle = b;
         } else {
             return NULL;
         }
@@ -1117,8 +1100,7 @@ static mc_resp* resp_allocate(conn *c) {
     return resp;
 }
 
-static void resp_free(conn *c, mc_resp *resp) {
-    LIBEVENT_THREAD *th = c->thread;
+void resp_free(LIBEVENT_THREAD *th, mc_resp *resp) {
     mc_resp_bundle *b = resp->bundle;
 
     resp->free = true;
@@ -1143,9 +1125,9 @@ static void resp_free(conn *c, mc_resp *resp) {
 
             // Now completely done with this buffer.
             do_cache_free(th->rbuf_cache, b);
-            THR_STATS_LOCK(c);
-            c->thread->stats.response_obj_bytes -= READ_BUFFER_SIZE;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_LOCK(th);
+            th->stats.response_obj_bytes -= READ_BUFFER_SIZE;
+            THR_STATS_UNLOCK(th);
         }
     } else {
         mc_resp_bundle **head = &th->open_bundle;
@@ -1161,30 +1143,25 @@ static void resp_free(conn *c, mc_resp *resp) {
         }
 
     }
+    THR_STATS_LOCK(th);
+    th->stats.response_obj_count--;
+    THR_STATS_UNLOCK(th);
 }
 
 bool resp_start(conn *c) {
     mc_resp *resp = resp_allocate(c);
     if (!resp) {
-        THR_STATS_LOCK(c);
+        THR_STATS_LOCK(c->thread);
         c->thread->stats.response_obj_oom++;
-        THR_STATS_UNLOCK(c);
+        THR_STATS_UNLOCK(c->thread);
         return false;
     }
+
     // handling the stats counters here to simplify testing
-    THR_STATS_LOCK(c);
+    THR_STATS_LOCK(c->thread);
     c->thread->stats.response_obj_count++;
-    THR_STATS_UNLOCK(c);
-    // Skip zeroing the bundle pointer at the start.
-    // TODO: this line is here temporarily to make the code easy to disable.
-    // when it's more mature, move the memset into resp_allocate() and have it
-    // set the bundle pointer on allocate so this line isn't as complex.
-    memset((char *)resp + sizeof(mc_resp_bundle*), 0, sizeof(*resp) - sizeof(mc_resp_bundle*));
-    // TODO: this next line works. memset _does_ show up significantly under
-    // perf reports due to zeroing out the entire resp->wbuf. before swapping
-    // the lines more validation work should be done to ensure wbuf's aren't
-    // accidentally reused without being written to.
-    //memset((char *)resp + sizeof(mc_resp_bundle*), 0, offsetof(mc_resp, wbuf));
+    THR_STATS_UNLOCK(c->thread);
+
     if (!c->resp_head) {
         c->resp_head = resp;
     }
@@ -1203,6 +1180,30 @@ bool resp_start(conn *c) {
     return true;
 }
 
+mc_resp *resp_start_unlinked(conn *c) {
+    mc_resp *resp = resp_allocate(c);
+    if (!resp) {
+        THR_STATS_LOCK(c->thread);
+        c->thread->stats.response_obj_oom++;
+        THR_STATS_UNLOCK(c->thread);
+        return false;
+    }
+
+    // handling the stats counters here to simplify testing
+    THR_STATS_LOCK(c->thread);
+    c->thread->stats.response_obj_count++;
+    THR_STATS_UNLOCK(c->thread);
+
+    if (IS_UDP(c->transport)) {
+        // need to hold on to some data for async responses.
+        c->resp->request_id = c->request_id;
+        c->resp->request_addr = c->request_addr;
+        c->resp->request_addr_size = c->request_addr_size;
+    }
+
+    return resp;
+}
+
 // returns next response in chain.
 mc_resp* resp_finish(conn *c, mc_resp *resp) {
     mc_resp *next = resp->next;
@@ -1215,11 +1216,11 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
         free(resp->write_and_free);
     }
     if (resp->io_pending) {
+        io_pending_t *io = resp->io_pending;
         // If we had a pending IO, tell it to internally clean up then return
         // the main object back to our thread cache.
-        io_queue_cb_t *qcb = thread_io_queue_get(c->thread, resp->io_pending->io_queue_type);
-        qcb->finalize_cb(resp->io_pending);
-        do_cache_free(c->thread->io_cache, resp->io_pending);
+        io->finalize_cb(io);
+        do_cache_free(c->thread->io_cache, io);
         resp->io_pending = NULL;
     }
     if (c->resp_head == resp) {
@@ -1228,10 +1229,7 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
     if (c->resp == resp) {
         c->resp = NULL;
     }
-    resp_free(c, resp);
-    THR_STATS_LOCK(c);
-    c->thread->stats.response_obj_count--;
-    THR_STATS_UNLOCK(c);
+    resp_free(c->thread, resp);
     return next;
 }
 
@@ -1565,9 +1563,9 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
  *
  * Returns the state of storage.
  */
-enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
+enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const uint32_t hv, uint64_t *cas, bool cas_stale) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
+    item *old_it = do_item_get(key, it->nkey, hv, t, DONT_UPDATE);
     enum store_item_type stored = NOT_STORED;
 
     enum cas_result { CAS_NONE, CAS_MATCH, CAS_BADVAL, CAS_STALE, CAS_MISS };
@@ -1587,7 +1585,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             cas_res = CAS_NONE;
         } else if (it_cas == old_cas) {
             cas_res = CAS_MATCH;
-        } else if (c->set_stale && it_cas < old_cas) {
+        } else if (cas_stale && it_cas < old_cas) {
             cas_res = CAS_STALE;
         } else {
             cas_res = CAS_BADVAL;
@@ -1603,9 +1601,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                     // cas validates
                     // it and old_it may belong to different classes.
                     // I'm updating the stats for the one that's getting pushed out
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+                    pthread_mutex_unlock(&t->stats.mutex);
                     do_store = true;
                 } else if (cas_res == CAS_STALE) {
                     // if we're allowed to set a stale value, CAS must be lower than
@@ -1618,15 +1616,15 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                         it->it_flags |= ITEM_TOKEN_SENT;
                     }
 
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+                    pthread_mutex_unlock(&t->stats.mutex);
                     do_store = true;
                 } else {
                     // NONE or BADVAL are the same for CAS cmd
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+                    pthread_mutex_unlock(&t->stats.mutex);
 
                     if (settings.verbose > 1) {
                         fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
@@ -1674,7 +1672,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         }
 
         if (do_store) {
-            STORAGE_delete(c->thread->storage, old_it);
+            STORAGE_delete(t->storage, old_it);
             item_replace(old_it, it, hv);
             stored = STORED;
         }
@@ -1699,9 +1697,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             case NREAD_CAS:
                 // LRU expired
                 stored = NOT_FOUND;
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.cas_misses++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                pthread_mutex_lock(&t->stats.mutex);
+                t->stats.cas_misses++;
+                pthread_mutex_unlock(&t->stats.mutex);
                 break;
             case NREAD_REPLACE:
             case NREAD_APPEND:
@@ -1716,12 +1714,12 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         }
     }
 
-    if (stored == STORED) {
-        c->cas = ITEM_get_cas(it);
+    if (stored == STORED && cas != NULL) {
+        *cas = ITEM_get_cas(it);
     }
-    LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
+    LOGGER_LOG(t->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
             stored, comm, ITEM_key(it), it->nkey, it->nbytes, it->exptime,
-            ITEM_clsid(it), c->sfd);
+            ITEM_clsid(it), t->cur_sfd);
 
     return stored;
 }
@@ -2126,6 +2124,7 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
         if (c->state == conn_listening ||
                 (IS_UDP(c->transport) &&
                  c->state == conn_read)) {
+            memset(&local_addr, 0, sizeof(local_addr));
             socklen_t local_addr_len = sizeof(local_addr);
 
             if (getsockname(c->sfd,
@@ -2139,6 +2138,7 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
         if (c->state != conn_listening && !(IS_UDP(c->transport) &&
                  c->state == conn_read)) {
             struct sockaddr_storage svr_sock_addr;
+            memset(&svr_sock_addr, 0, sizeof(svr_sock_addr));
             socklen_t svr_addr_len = sizeof(svr_sock_addr);
             getsockname(c->sfd, (struct sockaddr *)&svr_sock_addr, &svr_addr_len);
             get_conn_text(c, svr_sock_addr.ss_family, svr_addr, (struct sockaddr *)&svr_sock_addr);
@@ -2187,12 +2187,12 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
 }
 
 #define IT_REFCOUNT_LIMIT 60000
-item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
+item* limited_get(const char *key, size_t nkey, LIBEVENT_THREAD *t, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
     item *it;
     if (should_touch) {
-        it = item_touch(key, nkey, exptime, c);
+        it = item_touch(key, nkey, exptime, t);
     } else {
-        it = item_get(key, nkey, c, do_update);
+        it = item_get(key, nkey, t, do_update);
     }
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         item_remove(it);
@@ -2208,9 +2208,9 @@ item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should
 // locked, caller can directly change what it needs.
 // though it might eventually be a better interface to sink it all into
 // items.c.
-item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32_t *hv, bool *overflow) {
+item* limited_get_locked(const char *key, size_t nkey, LIBEVENT_THREAD *t, bool do_update, uint32_t *hv, bool *overflow) {
     item *it;
-    it = item_get_locked(key, nkey, c, do_update, hv);
+    it = item_get_locked(key, nkey, t, do_update, hv);
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         do_item_remove(it);
         it = NULL;
@@ -2233,7 +2233,7 @@ item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32
  *
  * returns a response string to send back to the client.
  */
-enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+enum delta_result_type do_add_delta(LIBEVENT_THREAD *t, const char *key, const size_t nkey,
                                     const bool incr, const int64_t delta,
                                     char *buf, uint64_t *cas,
                                     const uint32_t hv,
@@ -2243,7 +2243,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     int res;
     item *it;
 
-    it = do_item_get(key, nkey, hv, c, DONT_UPDATE);
+    it = do_item_get(key, nkey, hv, t, DONT_UPDATE);
     if (!it) {
         return DELTA_ITEM_NOT_FOUND;
     }
@@ -2273,23 +2273,23 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     if (incr) {
         value += delta;
-        MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
+        //MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
     } else {
         if(delta > value) {
             value = 0;
         } else {
             value -= delta;
         }
-        MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
+        //MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
     }
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&t->stats.mutex);
     if (incr) {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
+        t->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
     } else {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
+        t->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
     }
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_unlock(&t->stats.mutex);
 
     itoa_u64(value, buf);
     res = strlen(buf);
@@ -3379,7 +3379,6 @@ static void drive_machine(conn *c) {
             break;
         case conn_io_queue:
             /* Complete our queued IO's from within the worker thread. */
-            conn_io_queue_complete(c);
             conn_set_state(c, conn_mwrite);
             break;
         case conn_max_state:
@@ -4908,9 +4907,6 @@ int main (int argc, char **argv) {
     }
 #endif
 
-    /* Run regardless of initializing it later */
-    init_lru_maintainer();
-
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
 
@@ -6056,9 +6052,6 @@ int main (int argc, char **argv) {
 #ifdef PROXY
     if (settings.proxy_enabled) {
         settings.proxy_ctx = proxy_init(settings.proxy_uring);
-        if (proxy_load_config(settings.proxy_ctx) != 0) {
-            exit(EXIT_FAILURE);
-        }
     }
 #endif
 #ifdef EXTSTORE
@@ -6068,6 +6061,14 @@ int main (int argc, char **argv) {
 #else
     memcached_thread_init(settings.num_threads, NULL);
     init_lru_crawler(NULL);
+#endif
+
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        if (proxy_first_confload(settings.proxy_ctx) != 0) {
+            exit(EXIT_FAILURE);
+        }
+    }
 #endif
 
     if (start_assoc_maint && start_assoc_maintenance_thread() == -1) {

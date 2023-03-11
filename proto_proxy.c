@@ -14,7 +14,6 @@
 #define PROCESS_NORMAL false
 static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool multiget);
 static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
-static void proxy_out_errstring(mc_resp *resp, const char *str);
 
 /******** EXTERNAL FUNCTIONS ******/
 // functions starting with _ are breakouts for the public functions.
@@ -130,65 +129,22 @@ void *proxy_init(bool use_uring) {
     // NOTE: might need to differentiate the libs yes?
     proxy_register_libs(ctx, NULL, L);
 
-    // Create/start the backend threads, which we need before servers
+    // Create/start the IO thread, which we need before servers
     // start getting created.
-    // Supporting N event threads should be possible, but it will be a
-    // low number of N to avoid too many wakeup syscalls.
-    // For now we hardcode to 1.
-    proxy_event_thread_t *threads = calloc(1, sizeof(proxy_event_thread_t));
-    ctx->proxy_threads = threads;
-    for (int i = 0; i < 1; i++) {
-        proxy_event_thread_t *t = &threads[i];
-        t->ctx = ctx;
-#ifdef USE_EVENTFD
-        t->event_fd = eventfd(0, EFD_NONBLOCK);
-        if (t->event_fd == -1) {
-            perror("failed to create backend notify eventfd");
-            exit(1);
-        }
-        t->be_event_fd = eventfd(0, EFD_NONBLOCK);
-        if (t->be_event_fd == -1) {
-            perror("failed to create backend notify eventfd");
-            exit(1);
-        }
-#else
-        int fds[2];
-        if (pipe(fds)) {
-            perror("can't create proxy backend notify pipe");
-            exit(1);
-        }
-
-        t->notify_receive_fd = fds[0];
-        t->notify_send_fd = fds[1];
-
-        if (pipe(fds)) {
-            perror("can't create proxy backend connection notify pipe");
-            exit(1);
-        }
-        t->be_notify_receive_fd = fds[0];
-        t->be_notify_send_fd = fds[1];
-#endif
-        proxy_init_evthread_events(t);
-
-        // incoming request queue.
-        STAILQ_INIT(&t->io_head_in);
-        STAILQ_INIT(&t->beconn_head_in);
-        pthread_mutex_init(&t->mutex, NULL);
-        pthread_cond_init(&t->cond, NULL);
-
-        memcpy(&t->tunables, &ctx->tunables, sizeof(t->tunables));
+    proxy_event_thread_t *t = calloc(1, sizeof(proxy_event_thread_t));
+    ctx->proxy_io_thread = t;
+    proxy_init_event_thread(t, ctx, NULL);
 
 #ifdef HAVE_LIBURING
-        if (t->use_uring) {
-            pthread_create(&t->thread_id, NULL, proxy_event_thread_ur, t);
-        } else {
-            pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
-        }
-#else
+    if (t->use_uring) {
+        pthread_create(&t->thread_id, NULL, proxy_event_thread_ur, t);
+    } else {
         pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
-#endif // HAVE_LIBURING
-        thread_setname(t->thread_id, "mc-prx-io");
     }
+#else
+    pthread_create(&t->thread_id, NULL, proxy_event_thread, t);
+#endif // HAVE_LIBURING
+    thread_setname(t->thread_id, "mc-prx-io");
 
     _start_proxy_config_threads(ctx);
     return ctx;
@@ -221,18 +177,20 @@ void proxy_thread_init(void *ctx, LIBEVENT_THREAD *thr) {
         thr->proxy_rng[x] = rand();
     }
 
-    // kick off the configuration.
-    if (proxy_thread_loadconf(ctx, thr) != 0) {
-        exit(EXIT_FAILURE);
-    }
+    // Create a proxy event thread structure to piggyback on the worker.
+    proxy_event_thread_t *t = calloc(1, sizeof(proxy_event_thread_t));
+    thr->proxy_event_thread = t;
+    proxy_init_event_thread(t, ctx, thr->base);
 }
 
 // ctx_stack is a stack of io_pending_proxy_t's.
 void proxy_submit_cb(io_queue_t *q) {
-    proxy_event_thread_t *e = ((proxy_ctx_t *)q->ctx)->proxy_threads;
+    proxy_event_thread_t *e = ((proxy_ctx_t *)q->ctx)->proxy_io_thread;
     io_pending_proxy_t *p = q->stack_ctx;
     io_head_t head;
+    be_head_t w_head; // worker local stack.
     STAILQ_INIT(&head);
+    STAILQ_INIT(&w_head);
 
     // NOTE: responses get returned in the correct order no matter what, since
     // mc_resp's are linked.
@@ -246,11 +204,21 @@ void proxy_submit_cb(io_queue_t *q) {
     // So for now we build the secondary list with an STAILQ, which
     // can be transplanted/etc.
     while (p) {
-        // insert into tail so head is oldest request.
-        STAILQ_INSERT_TAIL(&head, p, io_next);
+        mcp_backend_t *be;
+        P_DEBUG("%s: queueing req for backend: %p\n", __func__, (void *)p);
         if (p->is_await) {
             // need to not count await objects multiple times.
-            if (p->await_first) {
+            if (p->await_background) {
+                P_DEBUG("%s: fast-returning await_background object: %p\n", __func__, (void *)p);
+                // intercept await backgrounds
+                // this call cannot recurse if we're on the worker thread,
+                // since the worker thread has to finish executing this
+                // function in order to pick up the returned IO.
+                q->count++;
+                return_io_pending((io_pending_t *)p);
+                p = p->next;
+                continue;
+            } else if (p->await_first) {
                 q->count++;
             }
             // funny workaround: awaiting IOP's don't count toward
@@ -259,6 +227,24 @@ void proxy_submit_cb(io_queue_t *q) {
         } else {
             q->count++;
         }
+        be = p->backend;
+
+        if (be->use_io_thread) {
+            // insert into tail so head is oldest request.
+            STAILQ_INSERT_TAIL(&head, p, io_next);
+        } else {
+            // emulate some of handler_dequeue()
+            STAILQ_INSERT_TAIL(&be->io_head, p, io_next);
+            if (be->io_next == NULL) {
+                be->io_next = p;
+            }
+            be->depth++;
+            if (!be->stacked) {
+                be->stacked = true;
+                be->be_next.stqe_next = NULL; // paranoia
+                STAILQ_INSERT_TAIL(&w_head, be, be_next);
+            }
+        }
 
         p = p->next;
     }
@@ -266,31 +252,35 @@ void proxy_submit_cb(io_queue_t *q) {
     // clear out the submit queue so we can re-queue new IO's inline.
     q->stack_ctx = NULL;
 
-    // Transfer request stack to event thread.
-    pthread_mutex_lock(&e->mutex);
-    STAILQ_CONCAT(&e->io_head_in, &head);
-    // No point in holding the lock since we're not doing a cond signal.
-    pthread_mutex_unlock(&e->mutex);
+    if (!STAILQ_EMPTY(&head)) {
+        P_DEBUG("%s: submitting queue to IO thread\n", __func__);
+        // Transfer request stack to event thread.
+        pthread_mutex_lock(&e->mutex);
+        STAILQ_CONCAT(&e->io_head_in, &head);
+        // No point in holding the lock since we're not doing a cond signal.
+        pthread_mutex_unlock(&e->mutex);
 
-    // Signal to check queue.
+        // Signal to check queue.
 #ifdef USE_EVENTFD
-    uint64_t u = 1;
-    // TODO (v2): check result? is it ever possible to get a short write/failure
-    // for an eventfd?
-    if (write(e->event_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
-        assert(1 == 0);
-    }
+        uint64_t u = 1;
+        // TODO (v2): check result? is it ever possible to get a short write/failure
+        // for an eventfd?
+        if (write(e->event_fd, &u, sizeof(uint64_t)) != sizeof(uint64_t)) {
+            assert(1 == 0);
+        }
 #else
-    if (write(e->notify_send_fd, "w", 1) <= 0) {
-        assert(1 == 0);
-    }
+        if (write(e->notify_send_fd, "w", 1) <= 0) {
+            assert(1 == 0);
+        }
 #endif
+    }
 
+    if (!STAILQ_EMPTY(&w_head)) {
+        P_DEBUG("%s: running inline worker queue\n", __func__);
+        // emulating proxy_event_handler
+        proxy_run_backend_queue(&w_head);
+    }
     return;
-}
-
-void proxy_complete_cb(io_queue_t *q) {
-    // empty/unused.
 }
 
 // called from worker thread after an individual IO has been returned back to
@@ -300,13 +290,7 @@ void proxy_return_cb(io_pending_t *pending) {
     if (p->is_await) {
         mcplib_await_return(p);
     } else {
-        struct timeval end;
         lua_State *Lc = p->coro;
-
-        // stamp the elapsed time into the response object.
-        gettimeofday(&end, NULL);
-        p->client_resp->elapsed = (end.tv_sec - p->client_resp->start.tv_sec) * 1000000 +
-            (end.tv_usec - p->client_resp->start.tv_usec);
 
         // in order to resume we need to remove the objects that were
         // originally returned
@@ -341,6 +325,14 @@ void proxy_finalize_cb(io_pending_t *pending) {
     if (p->coro_ref) {
         // Note: lua registry is the same for main thread or a coroutine.
         luaL_unref(p->coro, LUA_REGISTRYINDEX, p->coro_ref);
+    }
+
+    if (p->io_type == IO_PENDING_TYPE_EXTSTORE && p->hdr_it) {
+        // TODO: lock once, worst case this hashes/locks twice.
+        if (p->miss) {
+            item_unlink(p->hdr_it);
+        }
+        item_remove(p->hdr_it);
     }
     return;
 }
@@ -407,7 +399,7 @@ void proxy_cleanup_conn(conn *c) {
     lua_State *L = thr->L;
     luaL_unref(L, LUA_REGISTRYINDEX, c->proxy_coro_ref);
     c->proxy_coro_ref = 0;
-    WSTAT_DECR(c, proxy_req_active, 1);
+    WSTAT_DECR(thr, proxy_req_active, 1);
 }
 
 // we buffered a SET of some kind.
@@ -473,7 +465,7 @@ void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
 }
 
 // Need a custom function so we can prefix lua strings easily.
-static void proxy_out_errstring(mc_resp *resp, const char *str) {
+void proxy_out_errstring(mc_resp *resp, const char *str) {
     size_t len;
     const static char error_prefix[] = "SERVER_ERROR ";
     const static int error_prefix_len = sizeof(error_prefix) - 1;
@@ -550,12 +542,43 @@ int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, con
     size_t rlen = 0;
 
     if (cores == LUA_OK) {
-        WSTAT_DECR(c, proxy_req_active, 1);
+        WSTAT_DECR(c->thread, proxy_req_active, 1);
         int type = lua_type(Lc, 1);
+        P_DEBUG("%s: coroutine completed. return type: %d\n", __func__, type);
         if (type == LUA_TUSERDATA) {
             mcp_resp_t *r = luaL_checkudata(Lc, 1, "mcp.response");
             _set_noreply_mode(resp, r);
-            if (r->buf) {
+            if (r->status != MCMC_OK) {
+                proxy_out_errstring(resp, "backend failure");
+            } else if (r->cresp) {
+                mc_resp *tresp = r->cresp;
+                // The internal cache handler has created a resp we want to swap in
+                // here. It would be fastest to swap *resp's position in the
+                // link but if the set is deep this would instead be slow, so
+                // we copy over details from this temporary resp instead.
+                assert(c != NULL);
+
+                // So far all we fill is the wbuf and some iov's? so just copy
+                // that + the UDP info?
+                memcpy(resp->wbuf, tresp->wbuf, tresp->iov[0].iov_len);
+                for (int x = 0; x < tresp->iovcnt; x++) {
+                    resp->iov[x] = tresp->iov[x];
+                }
+                resp->iovcnt = tresp->iovcnt;
+                resp->chunked_total = tresp->chunked_total;
+                resp->chunked_data_iov = tresp->chunked_data_iov;
+                // copy UDP headers...
+                resp->request_id = tresp->request_id;
+                resp->udp_sequence = tresp->udp_sequence;
+                resp->udp_total = tresp->udp_total;
+                resp->request_addr = tresp->request_addr;
+                resp->request_addr_size = tresp->request_addr_size;
+                resp->item = tresp->item; // will be populated if not extstore fetch
+                resp->skip = tresp->skip;
+
+                // we let the mcp_resp gc handler free up tresp and any
+                // associated io_pending's of its own later.
+            } else if (r->buf) {
                 // response set from C.
                 // FIXME (v2): write_and_free() ? it's a bit wrong for here.
                 resp->write_and_free = r->buf;
@@ -569,11 +592,10 @@ int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, con
                 memcpy(resp->wbuf, s, l);
                 resp_add_iov(resp, resp->wbuf, l);
                 lua_pop(Lc, 1);
-            } else if (r->status != MCMC_OK) {
-                proxy_out_errstring(resp, "backend failure");
             } else {
                 // Empty response: used for ascii multiget emulation.
             }
+
         } else if (type == LUA_TSTRING) {
             // response is a raw string from lua.
             const char *s = lua_tolstring(Lc, 1, &rlen);
@@ -584,54 +606,75 @@ int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, con
         } else {
             proxy_out_errstring(resp, "bad response");
         }
-    } else if (cores == LUA_YIELD) {
-        if (nresults == 1) {
-            // TODO (v2): try harder to validate; but we have so few yield cases
-            // that I'm going to shortcut this here. A single yielded result
-            // means it's probably an await(), so attempt to process this.
-            if (p != NULL) {
-                int coro_ref = p->coro_ref;
-                mc_resp *resp = p->resp;
-                assert((void *)p == (void *)resp->io_pending);
-                resp->io_pending = NULL;
-                c = p->c;
-                do_cache_free(c->thread->io_cache, p);
-                mcplib_await_run(c, resp, Lc, coro_ref);
-            } else {
-                // coroutine object sitting on the _main_ VM right now, so we grab
-                // the reference from there, which also pops it.
-                int coro_ref = luaL_ref(c->thread->L, LUA_REGISTRYINDEX);
-                mcplib_await_run(c, c->resp, Lc, coro_ref);
-            }
-        } else {
-            // need to remove and free the io_pending, since c->resp owns it.
-            // so we call mcp_queue_io() again and let it override the
-            // mc_resp's io_pending object.
 
-            int coro_ref = 0;
-            mc_resp *resp;
-            if (p != NULL) {
-                coro_ref = p->coro_ref;
-                resp = p->resp;
-                c = p->c;
-                do_cache_free(p->c->thread->io_cache, p);
-                // *p is now dead.
-            } else {
-                // yielding from a top level call to the coroutine,
-                // so we need to grab a reference to the coroutine thread.
-                // TODO (v2): make this more explicit?
-                // we only need to get the reference here, and error conditions
-                // should instead drop it, but now it's not obvious to users that
-                // we're reaching back into the main thread's stack.
-                assert(c != NULL);
-                coro_ref = luaL_ref(c->thread->L, LUA_REGISTRYINDEX);
-                resp = c->resp;
-            }
-            // TODO (v2): c only used for cache alloc? push the above into the func?
-            mcp_queue_io(c, resp, coro_ref, Lc);
+    } else if (cores == LUA_YIELD) {
+        int coro_ref = 0;
+        int yield_type = lua_tointeger(Lc, -1);
+        P_DEBUG("%s: coroutine yielded. return type: %d\n", __func__, yield_type);
+        assert(yield_type != 0);
+        lua_pop(Lc, 1);
+
+        // need to remove and free the io_pending, since c->resp owns it.
+        // so we call mcp_queue_io() again and let it override the
+        // mc_resp's io_pending object.
+        //
+        // p is not null only when being called from proxy_return_cb(),
+        // a pending IO is returning to resume.
+        if (p != NULL) {
+            coro_ref = p->coro_ref;
+            assert((void *)p == (void *)resp->io_pending);
+            resp->io_pending = NULL;
+            c = p->c;
+            // *p is now dead.
+            do_cache_free(c->thread->io_cache, p);
+        } else {
+            // coroutine object sitting on the _main_ VM right now, so we grab
+            // the reference from there, which also pops it.
+            assert(c != NULL);
+            coro_ref = luaL_ref(c->thread->L, LUA_REGISTRYINDEX);
         }
+
+        int res = 0;
+        switch (yield_type) {
+            case MCP_YIELD_AWAIT:
+                mcplib_await_run(c, resp, Lc, coro_ref);
+                break;
+            case MCP_YIELD_POOL:
+                // TODO (v2): c only used for cache alloc?
+                mcp_queue_io(c, resp, coro_ref, Lc);
+                break;
+            case MCP_YIELD_LOCAL:
+                // stack should be: rq, res
+                res = mcplib_internal_run(Lc, c, resp, coro_ref);
+                if (res == 0) {
+                    // stack should still be: rq, res
+                    // TODO: turn this function into a for loop that re-runs on
+                    // certain status codes, to avoid recursive depth here.
+                    //
+                    // FIXME: this dance with the coroutine reference is
+                    // annoying. In this case we immediately resume, so no *io
+                    // was generated, so we won't do the above coro_ref swap, so
+                    // we'll try to take the coro_ref again and fail.
+                    // The ref is only actually used in proxy_await
+                    // It should instead be stashed on the top mc_resp object
+                    // (ideally removing c->proxy_coro_ref at the same time)
+                    // and unref'ed when the resp is cleaned up.
+                    lua_rawgeti(c->thread->L, LUA_REGISTRYINDEX, coro_ref);
+                    luaL_unref(c->thread->L, LUA_REGISTRYINDEX, coro_ref);
+                    proxy_run_coroutine(Lc, resp, NULL, c);
+                } else if (res > 0) {
+                    // internal run queued for extstore.
+                } else {
+                    assert(res < 0);
+                    proxy_out_errstring(resp, "bad request");
+                }
+                break;
+            default:
+                abort();
+        }
+
     } else {
-        WSTAT_DECR(c, proxy_req_active, 1);
+        WSTAT_DECR(c->thread, proxy_req_active, 1);
         P_DEBUG("%s: Failed to run coroutine: %s\n", __func__, lua_tostring(Lc, -1));
         LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_ERROR, NULL, lua_tostring(Lc, -1));
         proxy_out_errstring(resp, "lua failure");
@@ -654,7 +697,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     // permanent solution.
     int ret = process_request(&pr, command, cmdlen);
     if (ret != 0) {
-        WSTAT_INCR(c, proxy_conn_errors, 1);
+        WSTAT_INCR(c->thread, proxy_conn_errors, 1);
         if (!resp_start(c)) {
             conn_set_state(c, conn_closing);
             return;
@@ -761,7 +804,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     // We test the command length all the way down here because multigets can
     // be very long, and they're chopped up by now.
     if (cmdlen >= MCP_REQUEST_MAXLEN) {
-        WSTAT_INCR(c, proxy_conn_errors, 1);
+        WSTAT_INCR(c->thread, proxy_conn_errors, 1);
         if (!resp_start(c)) {
             conn_set_state(c, conn_closing);
             return;
@@ -809,7 +852,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
         if (c->item == NULL) {
             lua_settop(L, 0);
             proxy_out_errstring(c->resp, "out of memory");
-            WSTAT_DECR(c, proxy_req_active, 1);
+            WSTAT_DECR(c->thread, proxy_req_active, 1);
             return;
         }
         c->item_malloced = true;
@@ -876,7 +919,7 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
 
     io_pending_proxy_t *p = do_cache_alloc(c->thread->io_cache);
     if (p == NULL) {
-        WSTAT_INCR(c, proxy_conn_oom, 1);
+        WSTAT_INCR(c->thread, proxy_conn_oom, 1);
         proxy_lua_error(Lc, "out of memory allocating from IO cache");
         return;
     }
@@ -892,6 +935,8 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     p->client_resp = r;
     p->flushed = false;
     p->ascii_multiget = rq->ascii_multiget;
+    p->return_cb = proxy_return_cb;
+    p->finalize_cb = proxy_finalize_cb;
     resp->io_pending = (io_pending_t *)p;
 
     // top of the main thread should be our coroutine.

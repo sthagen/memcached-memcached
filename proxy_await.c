@@ -9,8 +9,10 @@ typedef struct mcp_await_s {
     int argtable_ref; // need to hold refs to any potential hash selectors
     int restable_ref; // table of result objects
     int coro_ref; // reference to parent coroutine
+    int detail_ref; // reference to detail string.
     enum mcp_await_e type;
     bool completed; // have we completed the parent coroutine or not
+    bool logerr; // create log_req entries for error responses
     mcp_request_t *rq;
     mc_resp *resp; // the top level mc_resp to fill in (as if we were an iop)
 } mcp_await_t;
@@ -23,12 +25,13 @@ typedef struct mcp_await_s {
 // local restable = mcp.await(request, pools, num_wait)
 // NOTE: need to hold onto the pool objects since those hold backend
 // references. Here we just keep a reference to the argument table.
-int mcplib_await(lua_State *L) {
+static int _mcplib_await(lua_State *L, bool logerr) {
     mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
     luaL_checktype(L, 2, LUA_TTABLE);
     int n = 0; // length of table of pools
     int wait_for = 0; // 0 means wait for all responses
     enum mcp_await_e type = AWAIT_GOOD;
+    int detail_ref = 0;
 
     lua_pushnil(L); // init table key
     while (lua_next(L, 2) != 0) {
@@ -39,6 +42,11 @@ int mcplib_await(lua_State *L) {
 
     if (n <= 0) {
         proxy_lua_error(L, "mcp.await arguments must have at least one pool");
+    }
+
+    if (lua_isstring(L, 5)) {
+        // pops the detail string.
+        detail_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     }
 
     if (lua_isnumber(L, 4)) {
@@ -86,10 +94,22 @@ int mcplib_await(lua_State *L) {
     aw->argtable_ref = argtable_ref;
     aw->rq = rq;
     aw->req_ref = req_ref;
+    aw->detail_ref = detail_ref;
     aw->type = type;
+    aw->logerr = logerr;
     P_DEBUG("%s: about to yield [len: %d]\n", __func__, n);
 
-    return lua_yield(L, 1);
+    lua_pushinteger(L, MCP_YIELD_AWAIT);
+    return lua_yield(L, 2);
+}
+
+// default await, no logging.
+int mcplib_await(lua_State *L) {
+    return _mcplib_await(L, false);
+}
+
+int mcplib_await_logerrors(lua_State *L) {
+    return _mcplib_await(L, true);
 }
 
 static void mcp_queue_await_io(conn *c, lua_State *Lc, mcp_request_t *rq, int await_ref, bool await_first) {
@@ -131,7 +151,7 @@ static void mcp_queue_await_io(conn *c, lua_State *Lc, mcp_request_t *rq, int aw
 
     io_pending_proxy_t *p = do_cache_alloc(c->thread->io_cache);
     if (p == NULL) {
-        WSTAT_INCR(c, proxy_conn_oom, 1);
+        WSTAT_INCR(c->thread, proxy_conn_oom, 1);
         proxy_lua_error(Lc, "out of memory allocating from IO cache");
         return;
     }
@@ -147,6 +167,8 @@ static void mcp_queue_await_io(conn *c, lua_State *Lc, mcp_request_t *rq, int aw
     p->client_resp = r;
     p->flushed = false;
     p->ascii_multiget = rq->ascii_multiget;
+    p->return_cb = proxy_return_cb;
+    p->finalize_cb = proxy_finalize_cb;
 
     // io_p needs to hold onto its own response reference, because we may or
     // may not include it in the final await() result.
@@ -183,7 +205,7 @@ static void mcp_queue_await_dummy_io(conn *c, lua_State *Lc, int await_ref) {
 
     io_pending_proxy_t *p = do_cache_alloc(c->thread->io_cache);
     if (p == NULL) {
-        WSTAT_INCR(c, proxy_conn_oom, 1);
+        WSTAT_INCR(c->thread, proxy_conn_oom, 1);
         proxy_lua_error(Lc, "out of memory allocating from IO cache");
         return;
     }
@@ -201,6 +223,8 @@ static void mcp_queue_await_dummy_io(conn *c, lua_State *Lc, int await_ref) {
     p->is_await = true;
     p->await_ref = await_ref;
     p->await_background = true;
+    p->return_cb = proxy_return_cb;
+    p->finalize_cb = proxy_finalize_cb;
 
     // Dummy IO has no backend, and no request attached.
 
@@ -218,7 +242,7 @@ static void mcp_queue_await_dummy_io(conn *c, lua_State *Lc, int await_ref) {
 // places. Else these errors currently crash the daemon.
 int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref) {
     P_DEBUG("%s: start\n", __func__);
-    WSTAT_INCR(c, proxy_await_active, 1);
+    WSTAT_INCR(c->thread, proxy_await_active, 1);
     mcp_await_t *aw = lua_touserdata(L, -1);
     int await_ref = luaL_ref(L, LUA_REGISTRYINDEX); // await is popped.
     assert(aw != NULL);
@@ -235,7 +259,11 @@ int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref) {
     const char *key = MCP_PARSER_KEY(rq->pr);
     size_t len = rq->pr.klen;
     int n = 0;
-    bool await_first = true;
+    // TODO (v3) await_first is used as a marker for upping the "wait for
+    // IO's" queue count, which means we need to force it off if we're in
+    // background mode, else we would accidentally wait for a response anyway.
+    // This note is for finding a less convoluted method for this.
+    bool await_first = (aw->type == AWAIT_BACKGROUND) ? false : true;
     // loop arg table and run each hash selector
     lua_pushnil(L); // -> 3
     while (lua_next(L, 1) != 0) {
@@ -245,11 +273,10 @@ int mcplib_await_run(conn *c, mc_resp *resp, lua_State *L, int coro_ref) {
         if (pp == NULL) {
             proxy_lua_error(L, "mcp.await must be supplied with a pool");
         }
-        mcp_pool_t *p = pp->main;
 
         // NOTE: rq->be is only held to help pass the backend into the IOP in
         // mcp_queue call. Could be a local variable and an argument too.
-        rq->be = mcplib_pool_proxy_call_helper(L, p, key, len);
+        rq->be = mcplib_pool_proxy_call_helper(L, pp, key, len);
 
         mcp_queue_await_io(c, L, rq, await_ref, await_first);
         await_first = false;
@@ -362,7 +389,7 @@ int mcplib_await_return(io_pending_proxy_t *p) {
     }
 
     // note that post-completion, we stop gathering responses into the
-    // resposne table... because it's already been returned.
+    // response table... because it's already been returned.
     // So "valid" can only be true if also !completed
     if (aw->pending == 0) {
         if (!aw->completed) {
@@ -392,6 +419,30 @@ int mcplib_await_return(io_pending_proxy_t *p) {
         gettimeofday(&end, NULL);
         p->client_resp->elapsed = (end.tv_sec - p->client_resp->start.tv_sec) * 1000000 +
             (end.tv_usec - p->client_resp->start.tv_usec);
+
+        // instructed to generate log_req entries for each failed request,
+        // this is useful to do here as these can be asynchronous.
+        // NOTE: this may be a temporary feature.
+        if (aw->logerr && p->client_resp->status != MCMC_OK && aw->completed) {
+            size_t dlen = 0;
+            const char *detail = NULL;
+            logger *l = p->thread->l;
+            // only process logs if someone is listening.
+            if (l->eflags & LOG_PROXYREQS) {
+                lua_rawgeti(L, LUA_REGISTRYINDEX, aw->req_ref);
+                mcp_request_t *rq = lua_touserdata(L, -1);
+                lua_pop(L, 1); // references still held, just clearing stack.
+                mcp_resp_t *rs = p->client_resp;
+
+                if (aw->detail_ref) {
+                    lua_rawgeti(L, LUA_REGISTRYINDEX, aw->detail_ref);
+                    detail = luaL_tolstring(L, -1, &dlen);
+                    lua_pop(L, 1);
+                }
+
+                logger_log(l, LOGGER_PROXY_REQ, NULL, rq->pr.request, rq->pr.reqlen, rs->elapsed, rs->resp.type, rs->resp.code, rs->status, detail, dlen, rs->be_name, rs->be_port);
+            }
+        }
 
         luaL_unref(L, LUA_REGISTRYINDEX, p->mcpres_ref);
     }
@@ -425,7 +476,10 @@ int mcplib_await_return(io_pending_proxy_t *p) {
         luaL_unref(L, LUA_REGISTRYINDEX, aw->argtable_ref);
         luaL_unref(L, LUA_REGISTRYINDEX, aw->req_ref);
         luaL_unref(L, LUA_REGISTRYINDEX, p->await_ref);
-        WSTAT_DECR(p->c, proxy_await_active, 1);
+        if (aw->detail_ref) {
+            luaL_unref(L, LUA_REGISTRYINDEX, aw->detail_ref);
+        }
+        WSTAT_DECR(p->thread, proxy_await_active, 1);
     }
 
     // Just remove anything we could have left on the primary VM stack
