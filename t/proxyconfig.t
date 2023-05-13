@@ -38,6 +38,17 @@ sub mock_server {
     return $srv;
 }
 
+sub accept_backend {
+    my $srv = shift;
+    my $be = $srv->accept();
+    $be->autoflush(1);
+    ok(defined $be, "mock backend created");
+    like(<$be>, qr/version/, "received version command");
+    print $be "VERSION 1.0.0-mock\r\n";
+
+    return $be;
+}
+
 # Put a version command down the pipe to ensure the socket is clear.
 # client version commands skip the proxy code
 sub check_version {
@@ -60,7 +71,7 @@ sub wait_reload {
 }
 
 my @mocksrvs = ();
-diag "making mock servers";
+#diag "making mock servers";
 for my $port (11511, 11512, 11513) {
     my $srv = mock_server($port);
     ok(defined $srv, "mock server created");
@@ -70,12 +81,12 @@ for my $port (11511, 11512, 11513) {
 diag "testing failure to start";
 write_modefile("invalid syntax");
 eval {
-    my $p_srv = new_memcached('-o proxy_config=./t/proxyconfig.lua -l 127.0.0.1', 11510);
+    my $p_srv = new_memcached('-o proxy_config=./t/proxyconfig.lua');
 };
 ok($@ && $@ =~ m/Failed to connect/, "server successfully not started");
 
 write_modefile('return "none"');
-my $p_srv = new_memcached('-o proxy_config=./t/proxyconfig.lua -l 127.0.0.1', 11510);
+my $p_srv = new_memcached('-o proxy_config=./t/proxyconfig.lua');
 my $ps = $p_srv->sock;
 $ps->autoflush(1);
 
@@ -104,26 +115,18 @@ my %keymap = ();
 my $keycount = 100;
 {
     # set up server backend sockets.
-    for my $msrv ($mocksrvs[0], $mocksrvs[1], $mocksrvs[2]) {
-        my $be = $msrv->accept();
-        $be->autoflush(1);
-        ok(defined $be, "mock backend created");
-        push(@mbe, $be);
-    }
-
     my $s = IO::Select->new();
-
-    for my $be (@mbe) {
+    for my $msrv ($mocksrvs[0], $mocksrvs[1], $mocksrvs[2]) {
+        my $be = accept_backend($msrv);
         $s->add($be);
-        like(<$be>, qr/version/, "received version command");
-        print $be "VERSION 1.0.0-mock\r\n";
+        push(@mbe, $be);
     }
 
     # Try sending something.
     my $cmd = "mg foo v\r\n";
     print $ps $cmd;
     my @readable = $s->can_read(0.25);
-    is(scalar @readable, 1, "only one backend became readable");
+    is(scalar @readable, 1, "only one backend became readable after mg");
     my $be = shift @readable;
     is(scalar <$be>, $cmd, "metaget passthrough");
     print $be "EN\r\n";
@@ -133,7 +136,7 @@ my $keycount = 100;
     for my $key (0 .. $keycount) {
         print $ps "mg /test/$key\r\n";
         my @readable = $s->can_read(0.25);
-        is(scalar @readable, 1, "only one backend became readable");
+        is(scalar @readable, 1, "only one backend became readable for this key");
         my $be = shift @readable;
         for (0 .. 2) {
             if ($be == $mbe[$_]) {
@@ -154,9 +157,8 @@ my @holdbe = (); # avoid having the backends immediately disconnect and pollute 
     $p_srv->reload();
     wait_reload($watcher);
 
-    # sleep a short time; b1 should have a very short timeout and the
-    # others are long.
-    select(undef, undef, undef, 0.5);
+    my $watch_s = IO::Select->new();
+    $watch_s->add($watcher);
 
     my $s = IO::Select->new();
     for my $msrv (@mocksrvs) {
@@ -167,13 +169,13 @@ my @holdbe = (); # avoid having the backends immediately disconnect and pollute 
     # host, and port arguments.
     is(scalar @readable, 3, "all listeners became readable");
 
-    like(<$watcher>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=timeout name=\S+ port=11511/, "one backend timed out connecting");
+    my @watchable = $watch_s->can_read(5);
+    is(scalar @watchable, 1, "got new watcher log lines");
+    like(<$watcher>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=readvalidate name=\S+ port=11511/, "one backend timed out connecting");
+    like(<$watcher>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=markedbad name=\S+ port=11511/, "backend was marked bad");
 
     for my $msrv (@readable) {
-        my $be = $msrv->accept();
-        ok(defined $be, "mock backend accepted");
-        like(<$be>, qr/version/, "received version command");
-        print $be "VERSION 1.0.0-mock\r\n";
+        my $be = accept_backend($msrv);
         push(@holdbe, $be);
     }
 
@@ -221,10 +223,7 @@ is(<$watcher>, "OK\r\n", "watcher enabled");
     for my $msrv (@readable) {
         my @temp = ();
         for (0 .. 3) {
-            my $be = $msrv->accept();
-            ok(defined $be, "mock backend accepted");
-            like(<$be>, qr/version/, "received version command");
-            print $be "VERSION 1.0.0-mock\r\n";
+            my $be = accept_backend($msrv);
             $bes->add($be);
             push(@temp, $be);
         }
@@ -264,9 +263,179 @@ is(<$watcher>, "OK\r\n", "watcher enabled");
         push(@cli, $p);
     }
 
+    @readable = $s->can_read(0.25);
+    is(scalar @readable, 0, "no listeners should be active pre-reload");
+    $p_srv->reload();
+    wait_reload($watcher);
+    @readable = $s->can_read(0.25);
+    is(scalar @readable, 0, "no listeners should be active post-reload");
+}
+
+###
+# diag "starting proxy again from scratch"
+###
+
+# TODO: probably time to abstract the entire "start the server with mocked
+# listeners" routine.
+$watcher = undef;
+write_modefile('return "reqlimit"');
+$p_srv->stop;
+while (1) {
+    if ($p_srv->is_running) {
+        sleep 1;
+    } else {
+        ok(!$p_srv->is_running, "stopped proxy");
+        last;
+    }
+}
+
+@mocksrvs = ();
+# re-create the mock servers so we get clean connects, the previous
+# backends could be reconnecting still.
+for my $port (11511, 11512, 11513) {
+    my $srv = mock_server($port);
+    ok(defined $srv, "mock server created");
+    push(@mocksrvs, $srv);
+}
+
+# Start up a clean server.
+# Since limits are per worker thread, cut the worker threads down to 1 to ease
+# testing.
+$p_srv = new_memcached('-o proxy_config=./t/proxyconfig.lua -t 1');
+$ps = $p_srv->sock;
+$ps->autoflush(1);
+
+{
+    for my $msrv ($mocksrvs[0], $mocksrvs[1], $mocksrvs[2]) {
+        my $be = accept_backend($msrv);
+        push(@mbe, $be);
+    }
+
+    my $stats = mem_stats($ps, 'proxy');
+    isnt($stats->{active_req_limit}, 0, "active request limit is set");
+
+    # active request limit is 4, pipeline 6 requests and ensure the last two
+    # get junked
+    my $cmd = '';
+    for ('a', 'b', 'c', 'd', 'e', 'f') {
+        $cmd .= "mg /test/$_\r\n";
+    }
+    print $ps $cmd;
+
+    # Lua config only sends commands to the first backend for this test.
+    my $be = $mbe[0];
+    for (1 .. 4) {
+        like(<$be>, qr/^mg \/test\/\w\r\n$/, "backend received mg");
+        print $be "EN\r\n";
+    }
+    my $s = IO::Select->new();
+    $s->add($be);
+    my @readable = $s->can_read(0.25);
+    is(scalar @readable, 0, "no more pending reads on backend");
+
+    for (1 .. 4) {
+        is(scalar <$ps>, "EN\r\n", "received miss from backend");
+    }
+
+    is(scalar <$ps>, "SERVER_ERROR active request limit reached\r\n", "got error back");
+    is(scalar <$ps>, "SERVER_ERROR active request limit reached\r\n", "got two limit errors");
+
+    # Test turning the limit back off.
+    write_modefile('return "noreqlimit"');
+    $watcher = $p_srv->new_sock;
+    print $watcher "watch proxyevents\n";
+    is(<$watcher>, "OK\r\n", "watcher enabled");
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    $stats = mem_stats($ps, 'proxy');
+    is($stats->{active_req_limit}, 0, "active request limit unset");
+
+    $cmd = '';
+    for ('a', 'b', 'c', 'd', 'e', 'f') {
+        $cmd .= "mg /test/$_\r\n";
+    }
+    print $ps $cmd;
+    for (1 .. 6) {
+        like(<$be>, qr/^mg \/test\/\w\r\n$/, "backend received mg");
+        print $be "EN\r\n";
+    }
+    for (1 .. 6) {
+        is(scalar <$ps>, "EN\r\n", "received miss from backend");
+    }
+}
+
+{
+    # Test the buffer memory limiter.
+    # - limit per worker will be 1/t global limit
+    write_modefile('return "buflimit"');
+    $p_srv->reload();
+    wait_reload($watcher);
+    # Get a secondary client to trample limit.
+    my $sps = $p_srv->new_sock;
+
+    my $stats = mem_stats($ps, 'proxy');
+    isnt($stats->{buffer_memory_limit}, 0, "buf mem limit is set");
+
+    # - test SET commands with values, but nothing being read on backend
+    my $data = 'x' x 30000;
+    my $cmd = "ms foo 30000 T30\r\n" . $data . "\r\n";
+    print $ps $cmd;
+
+    my $be = $mbe[0];
+    my $s = IO::Select->new;
+    $s->add($be);
+    # Wait until the backend has the request queued, then send the second one.
+    my @readable = $s->can_read(1);
+    print $sps $cmd;
+
+    my $res;
+    is(scalar <$be>, "ms foo 30000 T30\r\n", "received first ms");
+    $res = scalar <$be>;
+    print $be "HD\r\n";
+
+    # The second request should have been caught by the memory limiter
+    is(scalar <$sps>, "SERVER_ERROR out of memory\r\n", "got server error");
+    # FIXME: The original response cannot succeed because we cannot allocate
+    # enough memory to read the response from the backend.
+    # This is conveniently testing both paths right here but I would prefer
+    # something better.
+    # TODO: need to see if it's possible to surface an OOM from the backend
+    # handler, but that requires more rewiring.
+    is(scalar <$ps>, "SERVER_ERROR backend failure\r\n", "first request succeeded");
+
+    # Backend gets killed from a read OOM, so we need to re-establish.
+    $be = $mbe[0] = accept_backend($mocksrvs[0]);
+    like(<$watcher>, qr/error=outofmemory/, "OOM log line");
+
+    # Memory limits won't drop until the garbage collectors run, which
+    # requires a bit more push, so instead we raise the limits here so we can
+    # retry from the pre-existing connections to test swallow mode.
+    write_modefile('return "buflimit2"');
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    # Test sending another request down both pipes to ensure they still work.
+    $cmd = "ms foo 2 T30\r\nhi\r\n";
+    print $ps $cmd;
+    is(scalar <$be>, "ms foo 2 T30\r\n", "client works after oom");
+    is(scalar <$be>, "hi\r\n", "client works after oom");
+    print $be "HD\r\n";
+    is(scalar <$ps>, "HD\r\n", "client received resp after oom");
+    print $sps $cmd;
+    is(scalar <$be>, "ms foo 2 T30\r\n", "client works after oom");
+    is(scalar <$be>, "hi\r\n", "client works after oom");
+    print $be "HD\r\n";
+    is(scalar <$sps>, "HD\r\n", "client received resp after oom");
+
+    # - test GET commands but don't read back, large backend values
+    # - test disabling the limiter
+    # extended testing:
+    # - create errors while holding the buffers?
 }
 
 # TODO:
+# check reqlimit/bwlimit counters
 # remove backends
 # do dead sockets close?
 # adding user stats

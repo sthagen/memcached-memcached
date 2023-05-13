@@ -1,8 +1,7 @@
-mcp.backend_read_timeout(0.5)
-mcp.backend_connect_timeout(5)
-
 function mcp_config_pools(oldss)
     local srv = mcp.backend
+    mcp.backend_read_timeout(0.5)
+    mcp.backend_connect_timeout(5)
 
     -- Single backend for zones to ease testing.
     -- For purposes of this config the proxy is always "zone 1" (z1)
@@ -90,6 +89,22 @@ function mcp_config_routes(zones)
     pfx_md["b"] = basic
     pfx_ma["b"] = basic
 
+    pfx_get["errcheck"] = function(r)
+        local res = zones.z1(r)
+        -- expect an error
+        if res:ok() then
+            return "FAIL\r\n"
+        end
+        if res:code() == mcp.MCMC_CODE_ERROR then
+            return "ERROR\r\n"
+        elseif res:code() == mcp.MCMC_CODE_CLIENT_ERROR then
+            return "CLIENT_ERROR\r\n"
+        elseif res:code() == mcp.MCMC_CODE_SERVER_ERROR then
+            return "SERVER_ERROR\r\n"
+        end
+        return "FAIL"
+    end
+
     -- show that we fetched the key by generating our own response string.
     pfx_get["getkey"] = function(r)
         return "VALUE |" .. r:key() .. " 0 2\r\nts\r\nEND\r\n"
@@ -103,6 +118,107 @@ function mcp_config_routes(zones)
     pfx_get["ltrimkey"] = function(r)
         r:ltrimkey(10)
         return zones.z1(r)
+    end
+
+    pfx_mg["ntokens"] = function(r)
+        return "VA 1 C123 v\r\n" .. r:ntokens() .. "\r\n"
+    end
+
+    pfx_mg["hasflag"] = function(r)
+        if r:has_flag("c") then
+            return "HD C123\r\n"
+        elseif r:has_flag("O") then
+            return "HD Oabc\r\n"
+        end
+        return "NF\r\n"
+    end
+
+    -- Input flags: N10 k c R10
+    -- Output flags: N100 k R100
+    pfx_mg["flagtoken"] = function(r)
+        -- flag_token on non-existing flags: no effect
+        local Ttoken = r:flag_token("T", "T100")
+        local Otoken = r:flag_token("O", nil)
+        local vtoken = r:flag_token("v", "")
+        if vtoken or Otoken or Ttoken then
+            return "ERROR found non-existing flag."
+        end
+
+        -- flag_token to replace: N10 -> N100
+        local found, Ntoken = r:flag_token("N", "N100")
+        if not found or Ntoken ~= "10" then
+            return "ERROR unexpected N token."
+        end
+
+        -- flag_token with nil 2nd arg: equvalent to fetch
+        r:flag_token("k", nil)
+        if not r:has_flag("k") then
+            return "ERROR unexpected k token."
+        end
+
+        -- flag_token with self 2nd arg: no effect
+        r:flag_token("c", "c")
+        if not r:has_flag("c") then
+            return "ERROR unexpected c token 1."
+        end
+
+        -- flag_token with "" 2nd arg: remove
+        r:flag_token("c", "")
+        if r:has_flag("c") then
+            return "ERROR unexpected c token 2."
+        end
+
+        -- repeated flag_token calls: new value is returned.
+        local _, Rtoken = r:flag_token("R", "R100")
+        if Rtoken ~= '10' then
+            return "ERROR unexpected R token 1."
+        end
+        _, Rtoken = r:flag_token("R", "R100")
+        if Rtoken ~= '100' then
+            return "ERROR unexpected R token 2."
+        end
+
+        return "HD\r\n"
+    end
+
+    pfx_ms["request"] = function(r)
+        local key = r:key()
+        local newReq = mcp.request("ms /request/edit 2\r\n", "ab\r\n")
+        return zones.z1(newReq)
+    end
+
+    pfx_mg["request"] = function(r)
+        local key = r:key()
+        if key == "/request/old" then
+            local newReq = mcp.request("mg /request/new c\r\n")
+            return zones.z1(newReq)
+        else
+            local res = zones.z1(r)
+            local newReq = mcp.request("ms /request/a " .. res:vlen() .. "\r\n", res)
+            return zones.z1(newReq)
+        end
+    end
+
+    pfx_get["hasflag"] = function(r)
+        if r:has_flag("F") then
+            return "ERROR flag found\r\n"
+        end
+        return "END\r\n"
+    end
+
+    pfx_ms["token"] = function(r)
+        local key = r:key()
+        if key == "/token/replacement" then
+            r:token(4, "C456")
+            return zones.z1(r)
+        elseif key == "/token/removal" then
+            r:token(4, "")
+            return zones.z1(r)
+        else
+            local token = r:token(2)
+            r:flag_token("P", "P" .. token)
+            return zones.z1(r)
+        end
     end
 
     -- Basic test for routing requests to specific pools.
@@ -258,6 +374,11 @@ function mcp_config_routes(zones)
 
         print("Set Response count: " .. count)
         return good_res
+    end
+
+    pfx_touch["sanity"] = function(r)
+        local rtable = mcp.await(r, { zones.z1, zones.z2, zones.z3 })
+        return rtable[3]
     end
 
     mcp.attach(mcp.CMD_GET, toproute_factory(pfx_get, "get"))

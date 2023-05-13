@@ -347,10 +347,10 @@ static void _copy_config_table(lua_State *from, lua_State *to, LIBEVENT_THREAD *
                         lua_pushlstring(to, lua_tostring(from, -2), lua_rawlen(from, -2));
                         break;
                     case LUA_TNUMBER:
-                        if (lua_isinteger(from, -1)) {
-                            lua_pushinteger(to, lua_tointeger(from, -1));
+                        if (lua_isinteger(from, -2)) {
+                            lua_pushinteger(to, lua_tointeger(from, -2));
                         } else {
-                            lua_pushnumber(to, lua_tonumber(from, -1));
+                            lua_pushnumber(to, lua_tonumber(from, -2));
                         }
                         break;
                     default:
@@ -400,7 +400,7 @@ int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr) {
     int res = lua_pcall(L, 0, LUA_MULTRET, 0);
     if (res != LUA_OK) {
         // FIXME (v2): don't exit here!
-        fprintf(stderr, "Failed to load data into worker thread\n");
+        fprintf(stderr, "Failed to load data into worker thread: %s\n", lua_tostring(L, -1));
         return -1;
     }
 
@@ -458,7 +458,14 @@ int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr) {
         tus->num_stats = us->num_stats;
         pthread_mutex_unlock(&thr->stats.mutex);
     }
+    // also grab the concurrent request limit
+    thr->proxy_active_req_limit = ctx->active_req_limit;
     STAT_UL(ctx);
+
+    // update limit counter(s)
+    pthread_mutex_lock(&thr->proxy_limit_lock);
+    thr->proxy_buffer_memory_limit = ctx->buffer_memory_limit;
+    pthread_mutex_unlock(&thr->proxy_limit_lock);
 
     return 0;
 }

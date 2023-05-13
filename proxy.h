@@ -76,10 +76,7 @@
 #define ENDSTR "END\r\n"
 #define ENDLEN sizeof(ENDSTR)-1
 
-#define MCP_THREAD_UPVALUE 1
-#define MCP_ATTACH_UPVALUE 2
-#define MCP_BACKEND_UPVALUE 3
-#define MCP_CONTEXT_UPVALUE 4
+#define MCP_BACKEND_UPVALUE 1
 
 #define MCP_YIELD_POOL 1
 #define MCP_YIELD_AWAIT 2
@@ -198,6 +195,8 @@ typedef struct {
     lua_State *proxy_state;
     void *proxy_code;
     proxy_event_thread_t *proxy_io_thread;
+    uint64_t active_req_limit; // max total in-flight requests
+    uint64_t buffer_memory_limit; // max bytes for send/receive buffers.
     pthread_mutex_t config_lock;
     pthread_cond_t config_cond;
     pthread_t config_tid;
@@ -216,6 +215,11 @@ typedef struct {
     struct proxy_tunables tunables; // NOTE: updates covered by stats_lock
     pthread_mutex_t stats_lock; // used for rare global counters
 } proxy_ctx_t;
+
+#define PROXY_GET_THR_CTX(L) ((*(LIBEVENT_THREAD **)lua_getextraspace(L))->proxy_ctx)
+#define PROXY_GET_THR(L) (*(LIBEVENT_THREAD **)lua_getextraspace(L))
+// Operations from the config VM don't have a libevent thread.
+#define PROXY_GET_CTX(L) (*(proxy_ctx_t **)lua_getextraspace(L))
 
 struct proxy_hook_tagged {
     uint64_t tag;
@@ -247,6 +251,7 @@ enum mcp_backend_states {
     mcp_backend_read_end, // looking for an "END" marker for GET
     mcp_backend_want_read, // read more data to complete command
     mcp_backend_next, // advance to the next IO
+    mcp_backend_next_close, // complete current request, then close socket
 };
 
 typedef struct mcp_backend_wrap_s mcp_backend_wrap_t;
@@ -495,6 +500,9 @@ typedef struct {
     mcp_pool_be_t *pool; // ptr to main->pool starting offset for owner thread.
 } mcp_pool_proxy_t;
 
+// utils
+bool proxy_bufmem_checkadd(LIBEVENT_THREAD *t, int len);
+
 // networking interface
 void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct event_base *base);
 void *proxy_event_thread(void *arg);
@@ -546,7 +554,9 @@ void mcp_request_attach(lua_State *L, mcp_request_t *rq, io_pending_proxy_t *p);
 int mcp_request_render(mcp_request_t *rq, int idx, const char *tok, size_t len);
 void proxy_lua_error(lua_State *L, const char *s);
 void proxy_lua_ferror(lua_State *L, const char *fmt, ...);
-void proxy_out_errstring(mc_resp *resp, const char *str);
+#define PROXY_SERVER_ERROR "SERVER_ERROR "
+#define PROXY_CLIENT_ERROR "CLIENT_ERROR "
+void proxy_out_errstring(mc_resp *resp, char *type, const char *str);
 int _start_proxy_config_threads(proxy_ctx_t *ctx);
 int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr);
 
