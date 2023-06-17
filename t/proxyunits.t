@@ -55,6 +55,9 @@ my $p_srv = new_memcached('-o proxy_config=./t/proxyunits.lua');
 my $ps = $p_srv->sock;
 $ps->autoflush(1);
 
+my $pss = IO::Select->new();
+$pss->add($ps);
+
 # set up server backend sockets.
 my @mbe = ();
 #diag "accepting mock backends";
@@ -77,8 +80,9 @@ sub check_sanity {
     my $ps = shift;
     my $cmd = "touch /sanity/a 50\r\n";
     print $ps $cmd;
-    foreach my $be (@mbe) {
-        is(scalar <$be>, $cmd, "sanity check: touch cmd received");
+    foreach my $idx (keys @mbe) {
+        my $be = $mbe[$idx];
+        is(scalar <$be>, $cmd, "sanity check: touch cmd received for be " . $idx);
         print $be "TOUCHED\r\n";
     }
     is(scalar <$ps>, "TOUCHED\r\n", "sanity check: TOUCHED response received.");
@@ -95,10 +99,12 @@ sub proxy_test {
     my $ps_send = $args{ps_send};
     my $be_recv = $args{be_recv} // {};
     my $be_send = $args{be_send} // {};
-    my $ps_recv = $args{ps_recv} // [];
+    my $ps_recv = $args{ps_recv};
 
     # sends request to proxy
-    print $ps $ps_send;
+    if ($ps_send) {
+        print $ps $ps_send;
+    }
 
     # verify all backends received request
     foreach my $idx (keys @mbe) {
@@ -120,21 +126,31 @@ sub proxy_test {
         }
     }
 
-    # verify proxy received response
-    if (scalar @{$ps_recv}) {
-        foreach my $recv (@{$ps_recv}) {
-            is(scalar <$ps>, $recv, "ps returned expected response.");
+    if (defined $ps_recv) {
+        if (scalar @{$ps_recv}) {
+            foreach my $recv (@{$ps_recv}) {
+                is(scalar <$ps>, $recv, "ps returned expected response.");
+            }
+            # makes sure nothing remains in $ps.
+            check_version($ps);
+        } else {
+            # when $ps_recv is empty, make sure it is not readable.
+            my @readable = $pss->can_read(0.1);
+            is(scalar @readable, 0, "ps is expected to be non-readable");
         }
-    } else {
-        # makes sure nothing was received when ps_recv is empty.
-        check_version($ps)
     }
 }
 
 {
+    note("Bad syntax tests");
     # Write a request with bad syntax, and check the response.
     print $ps "set with the wrong number of tokens\n";
     is(scalar <$ps>, "CLIENT_ERROR parsing request\r\n", "got CLIENT_ERROR for bad syntax");
+
+    for ('get', 'incr', 'decr', 'touch', 'gat', 'gats', 'mg', 'md', 'ma', 'ms') {
+        print $ps "$_\r\n";
+        is(scalar <$ps>, "CLIENT_ERROR parsing request\r\n", "$_ got CLIENT_ERROR for too few tokens");
+    }
 }
 
 # Basic test with a backend; write a request to the client socket, read it
@@ -509,6 +525,7 @@ check_sanity($ps);
             ps_send => "ms /b/a 2 q\r\nhi\r\n",
             be_recv => {0 => ["ms /b/a 2  \r\n", "hi\r\n"]},
             be_send => {0 => ["HD\r\n"]},
+            ps_recv => [],
         );
     };
 
@@ -680,15 +697,245 @@ check_sanity($ps);
 }
 
 check_sanity($ps);
+
 # Test Lua response API
-#{
-    # elapsed()
-    # ok()
-    # hit()
-    # vlen()
-    # code()
-    # line()
-#}
+{
+    subtest 'response:elapsed() >100000micros' => sub {
+        # ps_recv must not receive an error
+        my $be = $mbe[0];
+        my $cmd = "mg /response/elapsed\r\n";
+        print $ps $cmd;
+        is(scalar <$be>, $cmd, "be received request.");
+        sleep 0.1;
+        print $be "HD\r\n";
+        is(scalar <$ps>, "HD\r\n", "proxy received HD");
+    };
+
+
+    subtest 'response:ok()' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "mg /response/ok\r\n",
+            be_recv => {0 => ["mg /response/ok\r\n"]},
+            be_send => {0 => ["HD\r\n"]},
+            ps_recv => ["HD\r\n"],
+        );
+    };
+
+    subtest 'response:ok() false 1' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_ok\r\n",
+            be_recv => {0 => ["mg /response/not_ok\r\n"]},
+            be_send => {0 => ["SERVER_ERROR\r\n"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+    };
+
+    subtest 'response:ok() false 2' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_ok\r\n",
+            be_recv => {0 => ["mg /response/not_ok\r\n"]},
+            be_send => {0 => ["GARBAGE\r\n"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+
+        # test not_ok when backend is disconnected.
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_ok\r\n",
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+
+        $mbe[0] = accept_backend($mocksrvs[0]);
+        $mbe[0] = accept_backend($mocksrvs[0]);
+    };
+
+    subtest 'response:ok() false 3' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_ok\r\n",
+            be_recv => {0 => ["mg /response/not_ok\r\n"]},
+            be_send => {0 => ["HD\r"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+        $mbe[0] = accept_backend($mocksrvs[0]);
+    };
+
+    subtest 'response:hit() mg' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "mg /response/hit\r\n",
+            be_recv => {0 => ["mg /response/hit\r\n"]},
+            be_send => {0 => ["HD\r\n"]},
+            ps_recv => ["HD\r\n"],
+        );
+    };
+
+    subtest 'response:hit() get' => sub {
+        # ps_recv must not receive an error
+        my $key = "/response/hit";
+        proxy_test(
+            ps_send => "get $key\r\n",
+            be_recv => {0 => ["get $key\r\n"]},
+            be_send => {0 => ["VALUE $key 0 1\r\na\r\nEND\r\n"]},
+            ps_recv => ["VALUE $key 0 1\r\n", "a\r\n", "END\r\n"],
+        );
+    };
+
+    subtest 'response:hit() false 1' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_hit\r\n",
+            be_recv => {0 => ["mg /response/not_hit\r\n"]},
+            be_send => {0 => ["EN\r\n"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+    };
+
+    subtest 'response:hit() false 2' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "get /response/not_hit\r\n",
+            be_recv => {0 => ["get /response/not_hit\r\n"]},
+            be_send => {0 => ["END\r\n"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+    };
+
+    subtest 'response:hit() false 3' => sub {
+        # ps_recv must receive an error
+        proxy_test(
+            ps_send => "mg /response/not_hit\r\n",
+            be_recv => {0 => ["mg /response/not_hit\r\n"]},
+            be_send => {0 => ["SERVER_ERROR\r\n"]},
+            ps_recv => ["SERVER_ERROR\r\n"],
+        );
+    };
+
+    subtest 'response:vlen()' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "mg /response/vlen v\r\n",
+            be_recv => {0 => ["mg /response/vlen v\r\n"]},
+            be_send => {0 => ["VA 1 v\r\n", "4\r\n"]},
+            ps_recv => ["VA 1 v\r\n", "4\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_OK' => sub {
+        # ps_recv must not receive an error
+        my $cmd = "mg /response/code_ok v\r\n";
+        proxy_test(
+            ps_send => $cmd,
+            be_recv => {0 => [$cmd]},
+            be_send => {0 => ["VA 1 v\r\n", "4\r\n"]},
+            ps_recv => ["VA 1 v\r\n", "4\r\n"],
+        );
+
+        proxy_test(
+            ps_send => "ms /response/code_ok 1\r\na\r\n",
+            be_recv => {0 => ["ms /response/code_ok 1\r\n", "a\r\n"]},
+            be_send => {0 => ["HD\r\n"]},
+            ps_recv => ["HD\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_MISS' => sub {
+        # ps_recv must not receive an error
+        my $cmd = "mg /response/code_miss v\r\n";
+        proxy_test(
+            ps_send => $cmd,
+            be_recv => {0 => [$cmd]},
+            be_send => {0 => ["EN\r\n"]},
+            ps_recv => ["EN\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_STORED' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "set /response/code_stored 0 0 1\r\na\r\n",
+            be_recv => {0 => ["set /response/code_stored 0 0 1\r\n", "a\r\n"]},
+            be_send => {0 => ["STORED\r\n"]},
+            ps_recv => ["STORED\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_EXISTS' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "set /response/code_exists 0 0 1\r\na\r\n",
+            be_recv => {0 => ["set /response/code_exists 0 0 1\r\n", "a\r\n"]},
+            be_send => {0 => ["EXISTS\r\n"]},
+            ps_recv => ["EXISTS\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_NOT_STORED' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "set /response/code_not_stored 0 0 1\r\na\r\n",
+            be_recv => {0 => ["set /response/code_not_stored 0 0 1\r\n", "a\r\n"]},
+            be_send => {0 => ["NOT_STORED\r\n"]},
+            ps_recv => ["NOT_STORED\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_NOT_FOUND' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "set /response/code_not_found 0 0 1\r\na\r\n",
+            be_recv => {0 => ["set /response/code_not_found 0 0 1\r\n", "a\r\n"]},
+            be_send => {0 => ["NOT_FOUND\r\n"]},
+            ps_recv => ["NOT_FOUND\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_TOUCHED' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "touch /response/code_touched 50\r\n",
+            be_recv => {0 => ["touch /response/code_touched 50\r\n"]},
+            be_send => {0 => ["TOUCHED\r\n"]},
+            ps_recv => ["TOUCHED\r\n"],
+        );
+    };
+
+    subtest 'response:code() MCMC_CODE_DELETED' => sub {
+        # ps_recv must not receive an error
+        proxy_test(
+            ps_send => "delete /response/code_deleted\r\n",
+            be_recv => {0 => ["delete /response/code_deleted\r\n"]},
+            be_send => {0 => ["DELETED\r\n"]},
+            ps_recv => ["DELETED\r\n"],
+        );
+    };
+
+    SKIP: {
+        skip "response:line() is broken";
+        subtest 'response:line()' => sub {
+            # ps_recv must not receive an error
+            my $cmd = "mg /response/line v\r\n";
+            proxy_test(
+                ps_send => $cmd,
+                be_recv => {0 => [$cmd]},
+                be_send => {0 => ["VA 1 v c123\r\n", "a\r\n"]},
+                ps_recv => ["VA 1 v c123\r\n", "a\r\n"],
+            );
+
+            # ps_recv must not receive an error
+            proxy_test(
+                ps_send => "ms /response/line 2\r\nab\r\n",
+                be_recv => {0 => ["ms /response/line 2\r\n", "ab\r\n"]},
+                be_send => {0 => ["HD O123 C123\r\n"]},
+                ps_recv => ["HD O123 C123\r\n"],
+            );
+        };
+    };
+}
+
 
 # Test requests land in proper backend in basic scenarios
 {
@@ -758,7 +1005,9 @@ check_sanity($ps);
 {
     note("Test await argument:" . __LINE__);
 
-    subtest 'Await hits all 3 backends' => sub {
+    # DEFAULT MODE, i.e. AWAIT_GOOD
+
+    subtest 'await(r, p): send [h, h, h], recv 3 hits' => sub {
         # be_recv must receive hit from all three backends
         my $key = "/awaitbasic/a";
         my $ps_send = "get $key\r\n";
@@ -771,46 +1020,138 @@ check_sanity($ps);
         );
     };
 
+    subtest 'await(r, p, 1): send [h], recv 1 response and 2 reconn' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => ["VALUE $key 0 2\r\nok\r\nEND\r\n"]},
+            ps_recv => ["VALUE $key 0 5\r\n", "1:1:1\r\n", "END\r\n"],
+        );
+        # reconnect due to timeout
+        $mbe[1] = accept_backend($mocksrvs[1]);
+        $mbe[2] = accept_backend($mocksrvs[2]);
+    };
+
+    subtest 'await(r, p, 1): send [h, m, m], recv 1 response' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "1:1:1\r\n", "END\r\n"],
+        );
+        # send response to not timeout
+        $mbe[1]->send($be_miss);
+        $mbe[2]->send($be_miss);
+    };
+
+    subtest 'await(r, p, 1): send [m, m, h], recv 3 responses' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_miss], 1 => [$be_miss], 2 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "3:3:1\r\n", "END\r\n"],
+        );
+    };
+
+    subtest 'await(r, p, 1): sent [m, h, m], recv 2 responses' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_miss], 1 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "2:2:1\r\n", "END\r\n"],
+        );
+        $mbe[2]->send($be_miss);
+    };
+
+    subtest 'await(r, p, 1): sent [h, h, h], recv 1 response' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_hit], 1 => [$be_hit], 2 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "1:1:1\r\n", "END\r\n"],
+        );
+    };
+
+    subtest 'await(r, p, 2): sent [h, h, h], recv 2 responses' => sub {
+        my $key = "/awaitone/b";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_hit], 1 => [$be_hit], 2 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "2:2:2\r\n", "END\r\n"],
+        );
+    };
+
+    subtest 'await(r, p, 1): send [e, m, h], recv 3 responses and 1 reconn' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        my $be_error = "ERROR backend failure\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_error], 1 => [$be_miss], 2 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "3:2:1\r\n", "END\r\n"],
+        );
+        # reconnect due to ERROR
+        $mbe[0] = accept_backend($mocksrvs[0]);
+    };
+
+    subtest 'await(r, p, 1): send [e, m, e], recv 3 responses and 1 reconn' => sub {
+        my $key = "/awaitone/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        my $be_error = "ERROR failure\r\n";
+        my $be_server_error = "SERVER_ERROR backend failure\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_error], 1 => [$be_miss], 2 => [$be_server_error]},
+            ps_recv => ["VALUE $key 0 5\r\n", "3:1:0\r\n", "END\r\n"],
+        );
+        # reconnect due to ERROR
+        $mbe[0] = accept_backend($mocksrvs[0]);
+    };
+
+    subtest 'await(r, p, 1, mcp.AWAIT_GOOD): sent [h, h, h], recv 1 response' => sub {
+        # ps_recv must receive hit when one backend sent good response.
+        my $key = "/awaitgood/a";
+        my $ps_send = "get $key\r\n";
+        my $be_hit = "VALUE $key 0 2\r\nok\r\nEND\r\n";
+        my $be_miss = "END\r\n";
+        proxy_test(
+            ps_send => $ps_send,
+            be_recv => {0 => [$ps_send], 1 => [$ps_send], 2 => [$ps_send]},
+            be_send => {0 => [$be_hit], 1 => [$be_hit], 2 => [$be_hit]},
+            ps_recv => ["VALUE $key 0 5\r\n", "1:1:1\r\n", "END\r\n"],
+        );
+    };
+
     my $cmd;
     my $key;
-
-    # await(r, p, 1)
-    $key = "/awaitone/a";
-    $cmd = "get $key\r\n";
-    print $ps $cmd;
-    for my $be (@mbe) {
-        is(scalar <$be>, $cmd, "awaitone backend req");
-        print $be "VALUE $key 0 2\r\nok\r\nEND\r\n";
-    }
-    is(scalar <$ps>, "VALUE $key 0 1\r\n", "response from await");
-    is(scalar <$ps>, "1\r\n", "looking for a single response");
-    is(scalar <$ps>, "END\r\n", "end from await");
-
-    # await(r, p(3+), 2)
-    $key = "/awaitone/b";
-    $cmd = "get $key\r\n";
-    print $ps $cmd;
-    for my $be (@mbe) {
-        is(scalar <$be>, $cmd, "awaitone backend req");
-        print $be "VALUE $key 0 2\r\nok\r\nEND\r\n";
-    }
-    is(scalar <$ps>, "VALUE $key 0 1\r\n", "response from await");
-    is(scalar <$ps>, "2\r\n", "looking two responses");
-    is(scalar <$ps>, "END\r\n", "end from await");
-
-    # await(r, p, 1, mcp.AWAIT_GOOD)
-    $key = "/awaitgood/a";
-    $cmd = "get $key\r\n";
-    print $ps $cmd;
-    for my $be (@mbe) {
-        is(scalar <$be>, $cmd, "awaitgood backend req");
-        print $be "VALUE $key 0 2\r\nok\r\nEND\r\n";
-    }
-    is(scalar <$ps>, "VALUE $key 0 1\r\n", "response from await");
-    is(scalar <$ps>, "1\r\n", "looking for a single response");
-    is(scalar <$ps>, "END\r\n", "end from await");
-    # should test above with first response being err, second good, third
-    # miss, and a few similar iterations.
 
     # await(r, p, 2, mcp.AWAIT_ANY)
     $key = "/awaitany/a";

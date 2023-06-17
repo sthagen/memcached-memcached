@@ -408,12 +408,13 @@ typedef struct {
     char *buf; // response line + potentially value.
     mc_resp *cresp; // client mc_resp object during extstore fetches.
     LIBEVENT_THREAD *thread; // cresp's owner thread needed for extstore cleanup.
-    size_t blen; // total size of the value to read.
+    unsigned int blen; // total size of the value to read.
     struct timeval start; // time this object was created.
     long elapsed; // time elapsed once handled.
     int status; // status code from mcmc_read()
     int bread; // amount of bytes read into value so far.
     uint8_t cmd; // from parser (pr.command)
+    uint8_t extra; // ascii multiget hack for memory accounting. extra blen.
     enum mcp_resp_mode mode; // reply mode (for noreply fixing)
     char be_name[MAX_NAMELEN+1];
     char be_port[MAX_PORTLEN+1];
@@ -435,6 +436,7 @@ struct _io_pending_proxy_t {
     int io_type; // extstore IO or backend IO
     int coro_ref; // lua registry reference to the coroutine
     lua_State *coro; // pointer directly to the coroutine
+    bool ascii_multiget; // passed on from mcp_r_t
     union {
         // extstore IO.
         struct {
@@ -459,7 +461,6 @@ struct _io_pending_proxy_t {
             int await_ref; // lua reference if we were an await object
             mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
             bool flushed; // whether we've fully written this request to a backend.
-            bool ascii_multiget; // passed on from mcp_r_t
             bool is_await; // are we an await object?
             bool await_first; // are we the main route for an await object?
             bool await_background; // dummy IO for backgrounded awaits

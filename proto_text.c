@@ -594,8 +594,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 {
                   MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
                                         it->nbytes, ITEM_get_cas(it));
-                  int nbytes = it->nbytes;;
-                  nbytes = it->nbytes;
+                  int nbytes = it->nbytes;
                   char *p = resp->wbuf;
                   memcpy(p, "VALUE ", 6);
                   p += 6;
@@ -1461,6 +1460,7 @@ static void process_mset_command(conn *c, token_t *tokens, const size_t ntokens)
             case 'c':
                 // need to set the cas value post-assignment.
                 META_CHAR(p, 'c');
+                break;
             case 's':
                 // get the final size post-fill
                 META_CHAR(p, 's');
