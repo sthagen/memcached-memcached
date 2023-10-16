@@ -140,8 +140,10 @@ struct logentry_proxy_errbe {
     size_t errlen;
     size_t be_namelen;
     size_t be_portlen;
+    size_t be_labellen;
     size_t be_rbuflen;
     int be_depth;
+    int retry;
     char data[];
 };
 #endif

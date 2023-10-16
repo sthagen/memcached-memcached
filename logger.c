@@ -409,16 +409,23 @@ static void _logger_log_proxy_errbe(logentry *e, const entry_details *d, const v
     char *errmsg = va_arg(ap, char *);
     char *be_name = va_arg(ap, char *);
     char *be_port = va_arg(ap, char *);
+    char *be_label = va_arg(ap, char *);
     int be_depth = va_arg(ap, int);
     char *be_rbuf = va_arg(ap, char *);
     int be_rbuflen = va_arg(ap, int);
+    int be_retry = va_arg(ap, int);
 
     struct logentry_proxy_errbe *le = (void *)e->data;
     le->be_depth = be_depth;
+    le->retry = be_retry;
     le->errlen = strlen(errmsg);
     if (be_name && be_port) {
         le->be_namelen = strlen(be_name);
         le->be_portlen = strlen(be_port);
+    }
+
+    if (be_label) {
+        le->be_labellen = strlen(be_label);
     }
 
     le->be_rbuflen = be_rbuflen;
@@ -433,6 +440,8 @@ static void _logger_log_proxy_errbe(logentry *e, const entry_details *d, const v
     data += le->be_namelen;
     memcpy(data, be_port, le->be_portlen);
     data += le->be_portlen;
+    memcpy(data, be_label, le->be_labellen);
+    data += le->be_labellen;
     memcpy(data, be_rbuf, le->be_rbuflen);
     data += le->be_rbuflen;
 
@@ -450,14 +459,24 @@ static int _logger_parse_prx_errbe(logentry *e, char *scratch) {
     data += le->be_namelen;
     char *be_port = data;
     data += le->be_portlen;
+    char *be_label = data;
+    data += le->be_labellen;
     char *be_rbuf = data;
 
     uriencode(be_rbuf, rbuf, le->be_rbuflen, MAX_RBUF_READ * 3);
-    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-            "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s depth=%d rbuf=%s\n",
-            (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
-            (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
-            (int)le->be_portlen, be_port, le->be_depth, rbuf);
+    if (le->retry) {
+        total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+                "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s retry=%d\n",
+                (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+                (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->retry);
+    } else {
+        total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+                "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s depth=%d rbuf=%s\n",
+                (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+                (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->be_depth, rbuf);
+    }
 
     return total;
 }

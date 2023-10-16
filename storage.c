@@ -31,6 +31,7 @@ typedef struct _io_pending_storage_t {
     mc_resp *resp;
     io_queue_cb return_cb;    // called on worker thread.
     io_queue_cb finalize_cb;  // called back on the worker thread.
+    STAILQ_ENTRY(io_pending_t) iop_next; // queue chain.
                               /* original struct ends here */
     item *hdr_it;             /* original header item. */
     obj_io io_ctx;            /* embedded extstore IO header */
@@ -247,7 +248,7 @@ int storage_get_item(conn *c, item *it, mc_resp *resp) {
     bool chunked = false;
     if (ntotal > settings.slab_chunk_size_max) {
         // Pull a chunked item header.
-        uint32_t flags;
+        client_flags_t flags;
         FLAGS_CONV(it, flags);
         new_it = item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, it->nbytes);
         assert(new_it == NULL || (new_it->it_flags & ITEM_CHUNKED));
@@ -491,7 +492,7 @@ static int storage_write(void *storage, const int clsid, const int item_age) {
     item *it = it_info.it;
     /* First, storage for the header object */
     size_t orig_ntotal = ITEM_ntotal(it);
-    uint32_t flags;
+    client_flags_t flags;
     if ((it->it_flags & ITEM_HDR) == 0 &&
             (item_age == 0 || current_time - it->time > item_age)) {
         FLAGS_CONV(it, flags);
@@ -855,8 +856,32 @@ static void storage_compact_readback(void *storage, logger *l,
                         hdr->offset = io.offset;
                         rescues++;
                     } else {
-                        lost++;
-                        // TODO: re-alloc and replace header.
+                        // re-alloc and replace header.
+                        client_flags_t flags;
+                        FLAGS_CONV(hdr_it, flags);
+                        item *new_it = do_item_alloc(ITEM_key(hdr_it), hdr_it->nkey, flags, hdr_it->exptime, sizeof(item_hdr));
+                        if (new_it) {
+                            // need to preserve the original item flags, but we
+                            // start unlinked, with linked being added during
+                            // item_replace below.
+                            new_it->it_flags = hdr_it->it_flags & (~ITEM_LINKED);
+                            new_it->time = hdr_it->time;
+                            new_it->nbytes = hdr_it->nbytes;
+
+                            // copy the hdr data.
+                            item_hdr *new_hdr = (item_hdr *) ITEM_data(new_it);
+                            new_hdr->page_version = io.page_version;
+                            new_hdr->page_id = io.page_id;
+                            new_hdr->offset = io.offset;
+
+                            // replace the item in the hash table.
+                            item_replace(hdr_it, new_it, hv);
+                            ITEM_set_cas(new_it, (settings.use_cas) ? ITEM_get_cas(hdr_it) : 0);
+                            do_item_remove(new_it); // release our reference.
+                            rescues++;
+                        } else {
+                            lost++;
+                        }
                     }
                 } else {
                     lost++;

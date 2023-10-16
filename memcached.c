@@ -538,16 +538,7 @@ void conn_close_idle(conn *c) {
     }
 }
 
-/* bring conn back from a sidethread. could have had its event base moved. */
-void conn_worker_readd(conn *c) {
-    if (c->state == conn_io_queue) {
-        c->io_queues_submitted--;
-        // If we're still waiting for other queues to return, don't re-add the
-        // connection yet.
-        if (c->io_queues_submitted != 0) {
-            return;
-        }
-    }
+static void _conn_event_readd(conn *c) {
     c->ev_flags = EV_READ | EV_PERSIST;
     event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
     event_base_set(c->thread->base, &c->event);
@@ -556,17 +547,41 @@ void conn_worker_readd(conn *c) {
     if (event_add(&c->event, 0) == -1) {
         perror("event_add");
     }
+}
 
-    // side thread wanted us to close immediately.
-    if (c->state == conn_closing) {
-        drive_machine(c);
-        return;
-    } else if (c->state == conn_io_queue) {
-        // machine will know how to return based on secondary state.
-        drive_machine(c);
-    } else {
-        conn_set_state(c, conn_new_cmd);
+/* bring conn back from a sidethread. could have had its event base moved. */
+void conn_worker_readd(conn *c) {
+    if (c->io_queues_submitted) { // TODO: ensure this is safe?
+        c->io_queues_submitted--;
+        // If we're still waiting for other queues to return, don't re-add the
+        // connection yet.
+        if (c->io_queues_submitted != 0) {
+            return;
+        }
     }
+
+    switch (c->state) {
+        case conn_closing:
+            // might be fixable: only need to do this because we can't do
+            // event_del() without the event being armed.
+            _conn_event_readd(c);
+            drive_machine(c);
+            break;
+        case conn_io_pending:
+            // The event listener was removed as more data showed up while
+            // waiting for the async response.
+            _conn_event_readd(c);
+            // Explicit fall-through.
+        case conn_io_queue:
+            conn_set_state(c, conn_io_resume);
+            // machine will know how to return based on secondary state.
+            drive_machine(c);
+            break;
+        default:
+            _conn_event_readd(c);
+            conn_set_state(c, conn_new_cmd);
+    }
+
 }
 
 void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb) {
@@ -969,7 +984,9 @@ static const char *state_text(enum conn_states state) {
                                        "conn_mwrite",
                                        "conn_closed",
                                        "conn_watch",
-                                       "conn_io_queue" };
+                                       "conn_io_queue",
+                                       "conn_io_resume",
+                                       "conn_io_pending" };
     return statenames[state];
 }
 
@@ -1571,7 +1588,7 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
     enum cas_result { CAS_NONE, CAS_MATCH, CAS_BADVAL, CAS_STALE, CAS_MISS };
 
     item *new_it = NULL;
-    uint32_t flags;
+    client_flags_t flags;
 
     /* Do the CAS test up front so we can apply to all store modes */
     enum cas_result cas_res = CAS_NONE;
@@ -2003,6 +2020,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
 #endif
     APPEND_STAT("num_napi_ids", "%s", settings.num_napi_ids);
     APPEND_STAT("memory_file", "%s", settings.memory_file);
+    APPEND_STAT("client_flags_size", "%d", sizeof(client_flags_t));
 }
 
 static int nz_strcmp(int nzlength, const char *nz, const char *z) {
@@ -2318,7 +2336,7 @@ enum delta_result_type do_add_delta(LIBEVENT_THREAD *t, const char *key, const s
         do_item_update(it);
     } else if (it->refcount > 1) {
         item *new_it;
-        uint32_t flags;
+        client_flags_t flags;
         FLAGS_CONV(it, flags);
         new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2);
         if (new_it == 0) {
@@ -3336,7 +3354,6 @@ static void drive_machine(conn *c) {
             }
             if (c->io_queues_submitted != 0) {
                 conn_set_state(c, conn_io_queue);
-                event_del(&c->event);
 
                 stop = true;
                 break;
@@ -3386,6 +3403,16 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
         case conn_io_queue:
+            /* Woke up while waiting for an async return, but not ready. */
+            event_del(&c->event);
+            conn_set_state(c, conn_io_pending);
+            stop = true;
+            break;
+        case conn_io_pending:
+            /* Should not be reachable */
+            assert(false);
+            break;
+        case conn_io_resume:
             /* Complete our queued IO's from within the worker thread. */
             conn_set_state(c, conn_mwrite);
             break;
@@ -4107,6 +4134,7 @@ static void usage(void) {
            "   - worker_logbuf_size:  size in kilobytes of per-worker-thread buffer\n"
            "                          read by background thread, then written to watchers. (default: %u)\n"
            "   - track_sizes:         enable dynamic reports for 'stats sizes' command.\n"
+           "                          note that counts for each size are approximate.\n"
            "   - no_hashexpand:       disables hash table expansion (dangerous)\n"
            "   - modern:              enables options which will be default in future.\n"
            "                          currently: nothing\n"
@@ -4816,6 +4844,7 @@ int main (int argc, char **argv) {
 #ifdef PROXY
         PROXY_CONFIG,
         PROXY_URING,
+        PROXY_MEMPROFILE,
 #endif
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
@@ -4878,6 +4907,7 @@ int main (int argc, char **argv) {
 #ifdef PROXY
         [PROXY_CONFIG] = "proxy_config",
         [PROXY_URING] = "proxy_uring",
+        [PROXY_MEMPROFILE] = "proxy_memprofile",
 #endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
@@ -5640,6 +5670,9 @@ int main (int argc, char **argv) {
             case PROXY_URING:
                 settings.proxy_uring = true;
                 break;
+            case PROXY_MEMPROFILE:
+                settings.proxy_memprofile = true;
+                break;
 #endif
 #ifdef MEMCACHED_DEBUG
             case RELAXED_PRIVILEGES:
@@ -5912,9 +5945,6 @@ int main (int argc, char **argv) {
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
     if (do_daemonize) {
-        if (signal(SIGHUP, SIG_IGN) == SIG_ERR) {
-            perror("Failed to ignore SIGHUP");
-        }
         if (daemonize(maxcore, settings.verbose) == -1) {
             fprintf(stderr, "failed to daemon() in order to daemonize\n");
             exit(EXIT_FAILURE);
@@ -6056,7 +6086,7 @@ int main (int argc, char **argv) {
     /* start up worker threads if MT mode */
 #ifdef PROXY
     if (settings.proxy_enabled) {
-        settings.proxy_ctx = proxy_init(settings.proxy_uring);
+        settings.proxy_ctx = proxy_init(settings.proxy_uring, settings.proxy_memprofile);
     }
 #endif
 #ifdef EXTSTORE

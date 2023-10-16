@@ -12,11 +12,27 @@
 
 #define PROCESS_MULTIGET true
 #define PROCESS_NORMAL false
+#define PROXY_GC_BACKGROUND_SECONDS 2
 static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool multiget);
 static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc);
+static void *mcp_profile_alloc(void *ud, void *ptr, size_t osize, size_t nsize);
 
 /******** EXTERNAL FUNCTIONS ******/
 // functions starting with _ are breakouts for the public functions.
+
+// We want to ensure we slowly iterate through VM memory in two cases:
+// - If using the newer zero-allocation API, old backends will never close
+// after reload.
+// - If the server is completely idle and user is issuing reloads, they will
+// be confused when old backends do not close.
+// So every few seconds we push one minimal GC step.
+static void proxy_gc_poke(evutil_socket_t fd, short event, void *arg) {
+    LIBEVENT_THREAD *t = arg;
+    lua_State *L = t->L;
+    struct timeval next = { PROXY_GC_BACKGROUND_SECONDS, 0 };
+    lua_gc(L, LUA_GCSTEP, 0);
+    evtimer_add(t->proxy_gc_timer, &next);
+}
 
 bool proxy_bufmem_checkadd(LIBEVENT_THREAD *t, int len) {
     bool oom = false;
@@ -89,7 +105,7 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
 
     // return all of the user generated stats
     for (int x = 0; x < us->num_stats; x++) {
-        if (us->names[x]) {
+        if (us->names[x] && us->names[x][0]) {
             snprintf(key_str, STAT_KEY_LEN-1, "user_%s", us->names[x]);
             APPEND_STAT(key_str, "%llu", (unsigned long long)counters[x]);
         }
@@ -135,9 +151,10 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
 }
 
 // start the centralized lua state and config thread.
-void *proxy_init(bool use_uring) {
+void *proxy_init(bool use_uring, bool proxy_memprofile) {
     proxy_ctx_t *ctx = calloc(1, sizeof(proxy_ctx_t));
     ctx->use_uring = use_uring;
+    ctx->memprofile = proxy_memprofile; // FIXME: take from argument.
 
     pthread_mutex_init(&ctx->config_lock, NULL);
     pthread_cond_init(&ctx->config_cond, NULL);
@@ -156,9 +173,19 @@ void *proxy_init(bool use_uring) {
     ctx->tunables.connect.tv_sec = 5;
     ctx->tunables.retry.tv_sec = 3;
     ctx->tunables.read.tv_sec = 3;
+    ctx->tunables.flap_backoff_ramp = 1.5;
+    ctx->tunables.flap_backoff_max = 3600;
+    ctx->tunables.max_ustats = MAX_USTATS_DEFAULT;
 
     STAILQ_INIT(&ctx->manager_head);
-    lua_State *L = luaL_newstate();
+    lua_State *L = NULL;
+    if (ctx->memprofile) {
+        struct mcp_memprofile *prof = calloc(1, sizeof(struct mcp_memprofile));
+        prof->id = ctx->memprofile_thread_counter++;
+        L = lua_newstate(mcp_profile_alloc, prof);
+    } else {
+        L = luaL_newstate();
+    }
     ctx->proxy_state = L;
     luaL_openlibs(L);
     // NOTE: might need to differentiate the libs yes?
@@ -197,7 +224,15 @@ void proxy_thread_init(void *ctx, LIBEVENT_THREAD *thr) {
     thr->proxy_ctx = ctx;
 
     // Initialize the lua state.
-    lua_State *L = luaL_newstate();
+    proxy_ctx_t *pctx = ctx;
+    lua_State *L = NULL;
+    if (pctx->memprofile) {
+        struct mcp_memprofile *prof = calloc(1, sizeof(struct mcp_memprofile));
+        prof->id = pctx->memprofile_thread_counter++;
+        L = lua_newstate(mcp_profile_alloc, prof);
+    } else {
+        L = luaL_newstate();
+    }
     thr->L = L;
     luaL_openlibs(L);
     proxy_register_libs(ctx, thr, L);
@@ -205,6 +240,10 @@ void proxy_thread_init(void *ctx, LIBEVENT_THREAD *thr) {
     for (int x = 0; x < 3; x++) {
         thr->proxy_rng[x] = rand();
     }
+
+    thr->proxy_gc_timer = evtimer_new(thr->base, proxy_gc_poke, thr);
+    // kick off the timer loop.
+    proxy_gc_poke(0, 0, thr);
 
     // Create a proxy event thread structure to piggyback on the worker.
     proxy_event_thread_t *t = calloc(1, sizeof(proxy_event_thread_t));
@@ -268,7 +307,6 @@ void proxy_submit_cb(io_queue_t *q) {
             be->depth++;
             if (!be->stacked) {
                 be->stacked = true;
-                be->be_next.stqe_next = NULL; // paranoia
                 STAILQ_INSERT_TAIL(&w_head, be, be_next);
             }
         }
@@ -280,13 +318,18 @@ void proxy_submit_cb(io_queue_t *q) {
     q->stack_ctx = NULL;
 
     if (!STAILQ_EMPTY(&head)) {
+        bool do_notify = false;
         P_DEBUG("%s: submitting queue to IO thread\n", __func__);
         // Transfer request stack to event thread.
         pthread_mutex_lock(&e->mutex);
+        if (STAILQ_EMPTY(&e->io_head_in)) {
+            do_notify = true;
+        }
         STAILQ_CONCAT(&e->io_head_in, &head);
         // No point in holding the lock since we're not doing a cond signal.
         pthread_mutex_unlock(&e->mutex);
 
+        if (do_notify) {
         // Signal to check queue.
 #ifdef USE_EVENTFD
         uint64_t u = 1;
@@ -300,6 +343,7 @@ void proxy_submit_cb(io_queue_t *q) {
             assert(1 == 0);
         }
 #endif
+        }
     }
 
     if (!STAILQ_EMPTY(&w_head)) {
@@ -486,14 +530,6 @@ void complete_nread_proxy(conn *c) {
 // for clarity add a 'return' after calls to this.
 void proxy_lua_error(lua_State *L, const char *s) {
     lua_pushstring(L, s);
-    lua_error(L);
-}
-
-void proxy_lua_ferror(lua_State *L, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    lua_pushfstring(L, fmt, ap);
-    va_end(ap);
     lua_error(L);
 }
 
@@ -721,6 +757,12 @@ int proxy_run_coroutine(lua_State *Lc, mc_resp *resp, io_pending_proxy_t *p, con
     return 0;
 }
 
+// basically any data before the first key.
+// max is like 15ish plus spaces. we can be more strict about how many spaces
+// to expect because any client spamming space is being deliberately stupid
+// anyway.
+#define MAX_CMD_PREFIX 20
+
 static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool multiget) {
     assert(c != NULL);
     LIBEVENT_THREAD *thr = c->thread;
@@ -793,12 +835,18 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     if (!multiget && pr.cmd_type == CMD_TYPE_GET && pr.has_space) {
         uint32_t keyoff = pr.tokens[pr.keytoken];
         while (pr.klen != 0) {
-            char temp[KEY_MAX_LENGTH + 30];
+            char temp[KEY_MAX_LENGTH + MAX_CMD_PREFIX + 30];
             char *cur = temp;
             // Core daemon can abort the entire command if one key is bad, but
             // we cannot from the proxy. Instead we have to inject errors into
             // the stream. This should, thankfully, be rare at least.
-            if (pr.klen > KEY_MAX_LENGTH) {
+            if (pr.tokens[pr.keytoken] > MAX_CMD_PREFIX) {
+                if (!resp_start(c)) {
+                    conn_set_state(c, conn_closing);
+                    return;
+                }
+                proxy_out_errstring(c->resp, PROXY_CLIENT_ERROR, "malformed request");
+            } else if (pr.klen > KEY_MAX_LENGTH) {
                 if (!resp_start(c)) {
                     conn_set_state(c, conn_closing);
                     return;
@@ -1022,6 +1070,85 @@ static void mcp_queue_io(conn *c, mc_resp *resp, int coro_ref, lua_State *Lc) {
     q->stack_ctx = p;
 
     return;
+}
+
+static void *mcp_profile_alloc(void *ud, void *ptr, size_t osize,
+                                            size_t nsize) {
+    struct mcp_memprofile *prof = ud;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    enum mcp_memprofile_types t = mcp_memp_free;
+    if (ptr == NULL) {
+        switch (osize) {
+            case LUA_TSTRING:
+                t = mcp_memp_string;
+                //fprintf(stderr, "alloc string: %ld\n", nsize);
+                break;
+            case LUA_TTABLE:
+                t = mcp_memp_table;
+                //fprintf(stderr, "alloc table: %ld\n", nsize);
+                break;
+            case LUA_TFUNCTION:
+                t = mcp_memp_func;
+                //fprintf(stderr, "alloc func: %ld\n", nsize);
+                break;
+            case LUA_TUSERDATA:
+                t = mcp_memp_userdata;
+                //fprintf(stderr, "alloc userdata: %ld\n", nsize);
+                break;
+            case LUA_TTHREAD:
+                t = mcp_memp_thread;
+                //fprintf(stderr, "alloc thread: %ld\n", nsize);
+                break;
+            default:
+                t = mcp_memp_default;
+                //fprintf(stderr, "alloc osize: %ld nsize: %ld\n", osize, nsize);
+        }
+        prof->allocs[t]++;
+        prof->alloc_bytes[t] += nsize;
+    } else {
+        if (nsize != 0) {
+            prof->allocs[mcp_memp_realloc]++;
+            prof->alloc_bytes[mcp_memp_realloc] += nsize;
+        } else {
+            prof->allocs[mcp_memp_free]++;
+            prof->alloc_bytes[mcp_memp_free] += osize;
+        }
+        //fprintf(stderr, "realloc: osize: %ld nsize: %ld\n", osize, nsize);
+    }
+
+    if (now.tv_sec != prof->last_status.tv_sec) {
+        prof->last_status.tv_sec = now.tv_sec;
+        fprintf(stderr, "MEMPROF[%d]:\tstring[%llu][%llu] table[%llu][%llu] func[%llu][%llu] udata[%llu][%llu] thr[%llu][%llu] def[%llu][%llu] realloc[%llu][%llu] free[%llu][%llu]\n",
+                prof->id,
+                (unsigned long long)prof->allocs[1],
+                (unsigned long long)prof->alloc_bytes[1],
+                (unsigned long long)prof->allocs[2],
+                (unsigned long long)prof->alloc_bytes[2],
+                (unsigned long long)prof->allocs[3],
+                (unsigned long long)prof->alloc_bytes[3],
+                (unsigned long long)prof->allocs[4],
+                (unsigned long long)prof->alloc_bytes[4],
+                (unsigned long long)prof->allocs[5],
+                (unsigned long long)prof->alloc_bytes[5],
+                (unsigned long long)prof->allocs[6],
+                (unsigned long long)prof->alloc_bytes[6],
+                (unsigned long long)prof->allocs[7],
+                (unsigned long long)prof->alloc_bytes[7],
+                (unsigned long long)prof->allocs[0],
+                (unsigned long long)prof->alloc_bytes[0]);
+        for (int x = 0; x < 8; x++) {
+            prof->allocs[x] = 0;
+            prof->alloc_bytes[x] = 0;
+        }
+    }
+
+    if (nsize == 0) {
+        free(ptr);
+        return NULL;
+    } else {
+        return realloc(ptr, nsize);
+    }
 }
 
 // Common lua debug command.

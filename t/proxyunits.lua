@@ -2,6 +2,7 @@ function mcp_config_pools(oldss)
     local srv = mcp.backend
     mcp.backend_read_timeout(0.5)
     mcp.backend_connect_timeout(5)
+    mcp.backend_retry_timeout(5)
 
     -- Single backend for zones to ease testing.
     -- For purposes of this config the proxy is always "zone 1" (z1)
@@ -13,12 +14,18 @@ function mcp_config_pools(oldss)
     local b2z = {b2}
     local b3z = {b3}
 
+    local dead = srv('dead', '127.9.9.9', 11011);
+
+    local no_label = srv('', '127.0.0.1', 11414)
+
     -- convert the backends to pools.
     -- as per a normal full config see simple.lua or t/startfile.lua
     local zones = {
         z1 = mcp.pool(b1z),
         z2 = mcp.pool(b2z),
         z3 = mcp.pool(b3z),
+        dead = mcp.pool({dead}),
+        no_label = mcp.pool({no_label})
     }
 
     return zones
@@ -118,6 +125,10 @@ function mcp_config_routes(zones)
     pfx_get["ltrimkey"] = function(r)
         r:ltrimkey(10)
         return zones.z1(r)
+    end
+
+    pfx_get["nolabel"] = function(r)
+        return zones.no_label(r)
     end
 
     pfx_mg["ntokens"] = function(r)
@@ -398,6 +409,12 @@ function mcp_config_routes(zones)
         return res
     end
 
+    pfx_get["logreqstest"] = function(r)
+        local res = zones.z1(r)
+        mcp.log_reqsample(150, 0, true, r, res, "logsampletest")
+        return res
+    end
+
     -- tell caller what we got back via a fake response
     pfx_get["awaitbasic"] = function(r)
         local vals = {}
@@ -506,10 +523,7 @@ function mcp_config_routes(zones)
 
     -- testing different styles of building the table argument for mcp.await()
     pfx_get["awaitfastgood"] = function(r)
-        local all_zones = {}
-        for k, v in pairs(zones) do
-            all_zones[k] = v
-        end
+        local all_zones = { zones.z1, zones.z2, zones.z3 }
 
         local restable = mcp.await(r, all_zones, 2, mcp.AWAIT_FASTGOOD)
 
@@ -526,10 +540,7 @@ function mcp_config_routes(zones)
     end
 
     pfx_set["awaitfastgood"] = function(r)
-        local all_zones = {}
-        for _, v in pairs(zones) do
-            table.insert(all_zones, v)
-        end
+        local all_zones = { zones.z1, zones.z2, zones.z3 }
 
         local restable = mcp.await(r, all_zones, 2)
         local count = 0
@@ -549,6 +560,19 @@ function mcp_config_routes(zones)
         local rtable = mcp.await(r, { zones.z1, zones.z2, zones.z3 })
         return rtable[3]
     end
+
+    pfx_get["dead"] = function(r)
+        return zones.dead(r)
+    end
+
+   pfx_get["deadrespcode"] = function(r)
+       local res = zones.dead(r)
+
+       if res:code() == mcp.MCMC_CODE_SERVER_ERROR then
+         return "ERROR code_correct\r\n"
+       end
+       return "ERROR code_incorrect: " .. res:code() .. "\r\n"
+   end
 
     mcp.attach(mcp.CMD_GET, toproute_factory(pfx_get, "get"))
     mcp.attach(mcp.CMD_SET, toproute_factory(pfx_set, "set"))

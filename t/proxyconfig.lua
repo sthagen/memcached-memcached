@@ -39,6 +39,34 @@ function mcp_config_pools(old)
             test = mcp.pool({b1, b2, b3}, { iothread = false })
         }
         return pools
+    elseif mode == "connections" then
+        local b1 = mcp.backend({ label = "b1c", host = "127.0.0.1", port = 11511,
+                               connections = 3})
+        local pools = {
+            test = mcp.pool({b1})
+        }
+        return pools
+    elseif mode == "connectionsreload" then
+        local b1 = mcp.backend({ label = "b1c", host = "127.0.0.1", port = 11511,
+                               connections = 1})
+        local pools = {
+            test = mcp.pool({b1})
+        }
+        return pools
+    elseif mode == "down" then
+        local down = mcp.backend({ label = "down", host = "127.0.0.1", port = 11517,
+                                   down = true })
+        local pools = {
+            test = mcp.pool({down})
+        }
+        return pools
+    elseif mode == "notdown" then
+        local down = mcp.backend({ label = "down", host = "127.0.0.1", port = 11517,
+                                   down = false })
+        local pools = {
+            test = mcp.pool({down})
+        }
+        return pools
     end
 end
 

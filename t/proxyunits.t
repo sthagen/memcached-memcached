@@ -151,6 +151,24 @@ sub proxy_test {
         print $ps "$_\r\n";
         is(scalar <$ps>, "CLIENT_ERROR parsing request\r\n", "$_ got CLIENT_ERROR for too few tokens");
     }
+
+    my $space = ' ' x 200;
+    print $ps "get$space key key\r\n";
+    is(scalar <$ps>, "CLIENT_ERROR malformed request\r\n");
+    is(scalar <$ps>, "CLIENT_ERROR malformed request\r\n");
+    is(scalar <$ps>, "END\r\n"); # god damn multiget syntax.
+}
+
+{
+    note("Test dead backend");
+    my $start = int(time());
+    print $ps "get /dead/foo\r\n";
+    is(scalar <$ps>, "SERVER_ERROR backend failure\r\n", "Backend failed");
+    my $end = int(time());
+    cmp_ok($end - $start, '<', 3, "backend failed immediately");
+
+    print $ps "get /deadrespcode/foo\r\n";
+    is(scalar <$ps>, "ERROR code_correct\r\n", "Backend had correct response code on failure");
 }
 
 # Basic test with a backend; write a request to the client socket, read it
@@ -184,7 +202,7 @@ sub proxy_test {
     is(scalar <$ps>, "SERVER_ERROR backend failure\r\n", "backend failure error");
 
     # verify a particular proxy event logline is received
-    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=timeout name=127.0.0.1 port=\d+ depth=1 rbuf=EN/, "got backend error log line");
+    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=timeout name=127.0.0.1 port=\d+ label=b\d+ depth=1 rbuf=EN/, "got backend error log line");
 
     # backend is disconnected due to the error, so we have to re-establish it.
     $mbe[0] = accept_backend($mocksrvs[0]);
@@ -210,9 +228,35 @@ sub proxy_test {
     is(scalar <$ps>, "ok\r\n", "got data back");
     is(scalar <$ps>, "END\r\n", "got end string");
 
-    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=trailingdata name=127.0.0.1 port=\d+ depth=0 rbuf=garbage/, "got backend error log line");
+    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=trailingdata name=127.0.0.1 port=\d+ label=b\d+ depth=0 rbuf=garbage/, "got backend error log line");
 
     $mbe[0] = accept_backend($mocksrvs[0]);
+}
+
+{
+    note("Test proxyevents for a backend without a label");
+
+    my $msrv_nolabel = mock_server(11414);
+    ok(defined $msrv_nolabel, "mock server with no label created");
+    my $mbe_nolabel = accept_backend($msrv_nolabel);
+
+    # Trigger a proxyevent error by adding trailing data ("garbage") to the
+    # backend response.
+    my $w = $p_srv->new_sock;
+    print $w "watch proxyevents\n";
+    is(<$w>, "OK\r\n", "watcher enabled");
+
+    print $ps "get /nolabel/c\r\n";
+    is(scalar <$mbe_nolabel>, "get /nolabel/c\r\n", "get passthrough");
+    # Set off a "trailing data" error
+    print $mbe_nolabel "VALUE /nolabel/c 0 2\r\nok\r\nEND\r\ngarbage";
+
+    is(scalar <$ps>, "VALUE /nolabel/c 0 2\r\n", "got value back");
+    is(scalar <$ps>, "ok\r\n", "got data back");
+    is(scalar <$ps>, "END\r\n", "got end string");
+
+    # Verify a proxy event logline is received with empty label
+    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=trailingdata name=127.0.0.1 port=11414 label= depth=0 rbuf=garbage/, "got backend error log line");
 }
 
 note("Test bugfix for missingend:" . __LINE__);
@@ -244,7 +288,7 @@ SKIP: {
 
     is(scalar <$ps>, "SERVER_ERROR backend failure\r\n");
 
-    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=missingend name=127.0.0.1 port=\d+ depth=1 rbuf=/, "got missingend error log line");
+    like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_backend error=missingend name=127.0.0.1 port=\d+ label=b\d+ depth=1 rbuf=/, "got missingend error log line");
 
     $mbe[0] = accept_backend($mocksrvs[0]);
 }
@@ -298,6 +342,44 @@ SKIP: {
 
     is(scalar <$ps>, "STORED\r\n", "got STORED from set");
 
+    # set (large value)
+    my $datasize = 256000;
+    my $data = 'x' x $datasize;
+    $cmd = "set /b/a 0 0 $datasize";
+    print $ps "$cmd\r\n$data\r\n";
+    is(scalar <$be>, "$cmd\r\n", "set passthrough (large value)");
+    is(scalar <$be>, "$data\r\n", "set value (large value)");
+    print $be "STORED\r\n";
+
+    is(scalar <$ps>, "STORED\r\n", "got STORED from set (large value)");
+
+    # set (pipelined)
+    my $num_repetitions = 5;
+    $cmd = "set /b/a 0 0 2";
+    $data = "ab";
+    my $req_ps = "$cmd\r\n$data\r\n";
+    my $resp_be = "STORED\r\n";
+
+    my $repeated_req_ps = "";
+    my $repeated_resp_be = "";
+    for (1..$num_repetitions) {
+        $repeated_req_ps = $repeated_req_ps . $req_ps;
+        $repeated_resp_be = $repeated_resp_be . $resp_be;
+    }
+
+    print $ps $repeated_req_ps;
+
+    for (1..$num_repetitions) {
+        is(scalar <$be>, "$cmd\r\n", "set passthrough (repeated)");
+        is(scalar <$be>, "$data\r\n", "set value (repeated)");
+    }
+
+    print $be $repeated_resp_be;
+
+    for (1..$num_repetitions) {
+        is(scalar <$ps>, "STORED\r\n", "got STORED from set (repeated)");
+    }
+
     # Basic get
     $cmd = "get /b/a\r\n";
     print $ps $cmd;
@@ -307,6 +389,18 @@ SKIP: {
     is(scalar <$ps>, "VALUE /b/a 0 2\r\n", "get rline");
     is(scalar <$ps>, "hi\r\n", "get data");
     is(scalar <$ps>, "END\r\n", "get end");
+
+    # get (large value)
+    $datasize = 256000;
+    $data = 'x' x $datasize;
+    $cmd = "get /b/a\r\n";
+    print $ps $cmd;
+    is(scalar <$be>, $cmd, "get passthrough (large value)");
+    print $be "VALUE /b/a 0 $datasize\r\n$data\r\nEND\r\n";
+
+    is(scalar <$ps>, "VALUE /b/a 0 $datasize\r\n", "get rline (large value)");
+    is(scalar <$ps>, "$data\r\n", "get data (large value)");
+    is(scalar <$ps>, "END\r\n", "get end (large value)");
 
     # touch
     $cmd = "touch /b/a 50\r\n";
@@ -336,6 +430,14 @@ SKIP: {
     is(scalar <$ps>, "hi\r\n", "gat data");
     is(scalar <$ps>, "END\r\n", "gat end");
 
+    # gat (cache miss)
+    $cmd = "gat 10 /b/a\r\n";
+    print $ps $cmd;
+    is(scalar <$be>, $cmd, "gat passthrough");
+    print $be "END\r\n";
+
+    is(scalar <$ps>, "END\r\n", "gat end, cache miss");
+
     # gats
     $cmd = "gats 11 /b/a\r\n";
     print $ps $cmd;
@@ -355,6 +457,15 @@ SKIP: {
 
     is(scalar <$ps>, "STORED\r\n", "got STORED from cas");
 
+    # cas (already exists failure)
+    $cmd = "cas /b/a 0 0 3 6";
+    print $ps "$cmd\r\nabc\r\n";
+    is(scalar <$be>, "$cmd\r\n", "cas passthrough");
+    is(scalar <$be>, "abc\r\n", "cas value");
+    print $be "EXISTS\r\n";
+
+    is(scalar <$ps>, "EXISTS\r\n", "got EXISTS from cas");
+
     # add
     $cmd = "add /b/a 0 0 2";
     print $ps "$cmd\r\nhi\r\n";
@@ -363,6 +474,15 @@ SKIP: {
     print $be "STORED\r\n";
 
     is(scalar <$ps>, "STORED\r\n", "got STORED from add");
+
+    # add (re-add failure)
+    $cmd = "add /b/a 0 0 4";
+    print $ps "$cmd\r\nabcd\r\n";
+    is(scalar <$be>, "$cmd\r\n", "add passthrough");
+    is(scalar <$be>, "abcd\r\n", "add value");
+    print $be "NOT_STORED\r\n";
+
+    is(scalar <$ps>, "NOT_STORED\r\n", "got STORED from add");
 
     # delete
     $cmd = "delete /b/a\r\n";
@@ -991,6 +1111,21 @@ check_sanity($ps);
 
     # test log_req with nil res (should be 0's in places)
     # log_reqsample()
+    $cmd = "get /logreqstest/a\r\n";
+    print $ps $cmd;
+    is(scalar <$be>, $cmd, "got passthru for logsamp");
+    print $be "END\r\n";
+    is(scalar <$ps>, "END\r\n", "got END from log test");
+
+    $cmd = "get /logreqstest/b\r\n";
+    print $ps $cmd;
+    is(scalar <$be>, $cmd, "got passthru for logsamp");
+
+    # cause the sampler time limit to trigger.
+    sleep 0.3;
+    print $be "END\r\n";
+    is(scalar <$ps>, "END\r\n", "got END from log test");
+    like(<$watcher>, qr/ts=(\S+) gid=\d+ type=proxy_req elapsed=\d+ type=105 code=17 status=0 be=127.0.0.1:11411 detail=logsampletest req=get \/logreqstest\/b/, "only got b request from log sample");
 }
 
 # Basic proxy stats validation

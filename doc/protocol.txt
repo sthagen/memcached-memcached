@@ -555,7 +555,7 @@ The flags used by the 'mg' command are:
 
 These flags can modify the item:
 - N(token): vivify on miss, takes TTL as a argument
-- R(token): if token is less than remaining TTL win for recache
+- R(token): if remaining TTL is less than token, win for recache
 - T(token): update remaining TTL
 
 These extra flags can be added to the response:
@@ -1498,6 +1498,7 @@ other stats command.
                     | bool     | If proxy is configured to use IO_URING.      |
                     |          | NOTE: uring may be used if kernel too old    |
 | memory_file       | char     | Warm restart memory file path, if enabled    |
+| client_flags_size | 32u      | Size in bytes of client flags                |
 |-------------------+----------+----------------------------------------------|
 
 
@@ -1599,7 +1600,8 @@ The server terminates this list with the line
 END\r\n
 
 'size' is an approximate size of the item, within 32 bytes.
-'count' is the amount of items that exist within that 32-byte range.
+'count' is the approximate amount of items that exist within that 32-byte
+range.
 
 This is essentially a display of all of your items if there was a slab class
 for every 32 bytes. You can use this to determine if adjusting the slab growth

@@ -70,6 +70,17 @@ sub wait_reload {
     like(<$w>, qr/ts=(\S+) gid=\d+ type=proxy_conf status=done/, "reload completed");
 }
 
+# Not looking for a clear pipeline, just when a reload finishes.
+sub wait_reload_relaxed {
+    my $w = shift;
+    while (my $line = <$w>) {
+        if ($line =~ m/type=proxy_conf status=done/) {
+            last;
+        }
+    }
+    pass("reload complete");
+}
+
 my @mocksrvs = ();
 #diag "making mock servers";
 for my $port (11511, 11512, 11513) {
@@ -184,6 +195,128 @@ my @holdbe = (); # avoid having the backends immediately disconnect and pollute 
     wait_reload($watcher);
     @readable = $s->can_read(0.5);
     is(scalar @readable, 0, "no new sockets");
+}
+
+#diag "testing multiple connections";
+{
+    write_modefile('return "connections"');
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    # Should get 3 new connetions for the first server.
+    my $msrv = $mocksrvs[0];
+    my @bes = ();
+    for (1 .. 3) {
+        my $be = $msrv->accept();
+        $be->autoflush(1);
+        ok(defined $be, "mock backend created");
+        push(@bes, $be);
+    }
+
+    my $s = IO::Select->new();
+
+    for my $be (@bes) {
+        $s->add($be);
+        like(<$be>, qr/version/, "received version command");
+        print $be "VERSION 1.0.0-mock\r\n";
+    }
+
+    # Command should only go to the first socket we created in N tries
+    for (1 .. 5) {
+        my $cmd = "mg foo$_ v\r\n";
+        print $ps $cmd;
+        my @readable = $s->can_read(0.25);
+        my $be = $bes[0];
+        is(scalar <$be>, $cmd, "get passthrough");
+        print $be "EN\r\n";
+        is(scalar <$ps>, "EN\r\n", "miss received");
+    }
+    my @readable = $s->can_read(0.25);
+    is(scalar @readable, 0, "rest of connections are idle still");
+
+    # Pipelined commands should all go to the first socket
+    print $ps "mg f1 v\r\nmg f2 v\r\nmg f3 v\r\n";
+    @readable = $s->can_read(0.25);
+    is(scalar @readable, 1, "only one backend woke up");
+    {
+        my $be = $bes[0];
+        for (1 .. 3) {
+            is(scalar <$be>, "mg f$_ v\r\n", "mg to connection $_");
+            print $be "EN\r\n";
+        }
+        for (1 .. 3) {
+            is(scalar <$ps>, "EN\r\n", "miss $_ from backend");
+        }
+    }
+
+    # Rest of sockets should be used when backend depth is nonzero
+    # need two more client sockets.
+    # client will be in conn_iowait, so if we write more requests down the
+    # same socket it won't go anywhere.
+    my $ps2 = $p_srv->new_sock;
+    my $ps3 = $p_srv->new_sock;
+    my @psocks = ($ps, $ps2, $ps3);
+    for (1 .. 3) {
+        my $psc = $psocks[$_ - 1];
+        my $be = $bes[$_ - 1];
+        print $psc "mg f$_ v\r\n";
+        is(scalar <$be>, "mg f$_ v\r\n", "trying all connections");
+    }
+    for my $be (@bes) {
+        print $be "EN\r\n";
+    }
+    for my $psc (@psocks) {
+        is(scalar <$psc>, "EN\r\n", "miss from backend");
+    }
+
+    # Verify the backend changes if we only change the connection count.
+    write_modefile('return "connectionsreload"');
+    $p_srv->reload();
+    wait_reload($watcher);
+
+    my $ms = IO::Select->new();
+    $ms->add($msrv);
+    @readable = $ms->can_read(0.25);
+    is(scalar @readable, 1, "listener became readable after changing conncount");
+    $bes[0] = accept_backend($readable[0]);
+}
+
+{
+    note("Testing down backends");
+    $watcher = $p_srv->new_sock;
+    print $watcher "watch proxyevents\n";
+    is(<$watcher>, "OK\r\n", "watcher enabled");
+
+    # Make a dedicated mock server for the down host.
+    my $msrv = mock_server(11517);
+
+    write_modefile('return "down"');
+    $p_srv->reload();
+    wait_reload_relaxed($watcher);
+
+    my $ms = IO::Select->new();
+    $ms->add($msrv);
+    my @readable = $ms->can_read(0.25);
+    is(scalar @readable, 0, "listener did not become readable for down backend");
+
+    print $ps "mg toast\r\n";
+    is(scalar <$ps>, "SERVER_ERROR backend failure\r\n", "client received SERVER_ERROR");
+
+    write_modefile('return "notdown"');
+    $p_srv->reload();
+    wait_reload_relaxed($watcher);
+
+    @readable = $ms->can_read(0.25);
+    is(scalar @readable, 1, "listener did become readable for backend that was down");
+
+    my $be = accept_backend($readable[0]);
+
+    print $ps "mg toast\r\n";
+    is(scalar <$be>, "mg toast\r\n", "backend works");
+    print $be "HD\r\n";
+    is(scalar <$ps>, "HD\r\n", "backned to client works");
+
+    check_version($ps);
 }
 
 # Disconnect the existing sockets

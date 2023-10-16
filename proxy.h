@@ -70,6 +70,24 @@
 // FIXME (v2): do include dir properly.
 #include "vendor/mcmc/mcmc.h"
 
+enum mcp_memprofile_types {
+    mcp_memp_free = 0,
+    mcp_memp_string,
+    mcp_memp_table,
+    mcp_memp_func,
+    mcp_memp_userdata,
+    mcp_memp_thread,
+    mcp_memp_default,
+    mcp_memp_realloc,
+};
+
+struct mcp_memprofile {
+    struct timespec last_status; // for per-second prints on status
+    int id;
+    uint64_t allocs[8];
+    uint64_t alloc_bytes[8];
+};
+
 // Note: value created from thin air. Could be shorter.
 #define MCP_REQUEST_MAXLEN KEY_MAX_LENGTH * 2
 
@@ -181,13 +199,13 @@ struct proxy_tunables {
     struct timeval connect;
     struct timeval retry; // wait time before retrying a dead backend
     struct timeval read;
-#ifdef HAVE_LIBURING
-    struct __kernel_timespec connect_ur;
-    struct __kernel_timespec retry_ur;
-    struct __kernel_timespec read_ur;
-#endif // HAVE_LIBURING
+    struct timeval flap; // need to stay connected this long or it's flapping
+    float flap_backoff_ramp; // factorial for retry time
+    uint32_t flap_backoff_max; // don't backoff longer than this.
     int backend_failure_limit;
+    int max_ustats; // limit the ustats index.
     bool tcp_keepalive;
+    bool down; // backend is forced into a down/bad state.
 };
 
 typedef STAILQ_HEAD(pool_head_s, mcp_pool_s) pool_head_t;
@@ -210,6 +228,8 @@ typedef struct {
     bool worker_failed; // covered by worker_lock as well.
     bool use_uring; // use IO_URING for backend connections.
     bool loading; // bool indicating an active config load.
+    bool memprofile; // indicate if we want to profile lua memory.
+    uint8_t memprofile_thread_counter;
     struct proxy_global_stats global_stats;
     struct proxy_user_stats user_stats;
     struct proxy_tunables tunables; // NOTE: updates covered by stats_lock
@@ -277,6 +297,7 @@ struct mcp_parser_s {
     uint8_t keytoken; // because GAT. sigh. also cmds without a key.
     uint32_t parsed; // how far into the request we parsed already
     uint32_t reqlen; // full length of request buffer.
+    uint32_t endlen; // index to the start of \r\n or \n
     int vlen;
     uint32_t klen; // length of key.
     uint16_t tokens[PARSER_MAX_TOKENS]; // offsets for start of each token
@@ -315,6 +336,7 @@ struct mcp_backend_label_s {
     char port[MAX_PORTLEN+1];
     char label[MAX_LABELLEN+1];
     size_t llen; // cache label length for small speedup in pool creation.
+    int conncount; // number of sockets to make.
     struct proxy_tunables tunables;
 };
 
@@ -327,16 +349,15 @@ struct mcp_backend_wrap_s {
     mcp_backend_t *be;
 };
 
-// FIXME: inline the mcmc client data.
-// TODO: event_thread -> something? union of owner type?
-struct mcp_backend_s {
+struct mcp_backendconn_s {
+    mcp_backend_t *be_parent; // find the wrapper.
+    int self; // our index into the parent array.
     int depth; // total number of requests in queue
     int pending_read; // number of requests written to socket, pending read.
     int failed_count; // number of fails (timeouts) in a row
+    int flap_count; // number of times we've "flapped" into bad state.
     proxy_event_thread_t *event_thread; // event thread owning this backend.
     void *client; // mcmc client
-    STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
-    STAILQ_ENTRY(mcp_backend_s) beconn_next; // stack for connecting conns
     io_head_t io_head; // stack of requests.
     io_pending_proxy_t *io_next; // next request to write.
     char *rbuf; // statically allocated read buffer.
@@ -345,23 +366,32 @@ struct mcp_backend_s {
     struct event write_event; // libevent: only used when socket wbuf full
     struct event timeout_event; // libevent: alarm for pending reads
     struct proxy_tunables tunables;
-#ifdef HAVE_LIBURING
-    proxy_event_t ur_rd_ev; // liburing.
-    proxy_event_t ur_wr_ev; // need a separate event/cb for writing/polling
-    proxy_event_t ur_te_ev; // for timeout handling
-#endif
+    struct timeval last_failed; // time the backend was last reset.
     enum mcp_backend_states state; // readback state machine
     int connect_flags; // flags to pass to mcmc_connect
-    bool transferred; // if beconn has been shipped to owner thread.
     bool connecting; // in the process of an asynch connection.
     bool validating; // in process of validating a new backend connection.
     bool can_write; // recently got a WANT_WRITE or are connecting.
-    bool stacked; // if backend already queued for syscalls.
     bool bad; // timed out, marked as bad.
-    bool use_io_thread; // note if this backend is worker-local or not.
     struct iovec write_iovs[BE_IOV_MAX]; // iovs to stage batched writes
+};
+
+// TODO: move depth and flags to a second top level array so we can make index
+// decisions from fewer memory stalls.
+struct mcp_backend_s {
+    int conncount; // total number of connections managed.
+    int depth; // temporary depth counter for io_head
+    bool transferred; // if beconn has been shipped to owner thread.
+    bool use_io_thread; // note if this backend is worker-local or not.
+    bool stacked; // if backend already queued for syscalls.
+    STAILQ_ENTRY(mcp_backend_s) beconn_next; // stack for connecting conns
+    STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
+    io_head_t io_head; // stack of inbound requests.
     char name[MAX_NAMELEN+1];
     char port[MAX_PORTLEN+1];
+    char label[MAX_LABELLEN+1];
+    struct proxy_tunables tunables; // this gets copied a few times for speed.
+    struct mcp_backendconn_s be[];
 };
 typedef STAILQ_HEAD(be_head_s, mcp_backend_s) be_head_t;
 typedef STAILQ_HEAD(beconn_head_s, mcp_backend_s) beconn_head_t;
@@ -431,6 +461,7 @@ struct _io_pending_proxy_t {
     mc_resp *resp;
     io_queue_cb return_cb; // called on worker thread.
     io_queue_cb finalize_cb; // called back on the worker thread.
+    STAILQ_ENTRY(io_pending_t) iop_next; // queue chain.
     // original struct ends here
 
     int io_type; // extstore IO or backend IO
@@ -451,6 +482,7 @@ struct _io_pending_proxy_t {
         };
         // backend request IO
         struct {
+            // FIXME: use top level next chain
             struct _io_pending_proxy_t *next; // stack for IO submission
             STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
             int mcpres_ref; // mcp.res reference used for await()
@@ -492,6 +524,7 @@ struct mcp_pool_s {
     int phc_ref;
     int self_ref; // TODO (v2): double check that this is needed.
     int pool_size;
+    int pool_be_total; // can be different from pool size for worker IO
     bool use_iothread;
     mcp_pool_be_t pool[];
 };
@@ -508,6 +541,7 @@ bool proxy_bufmem_checkadd(LIBEVENT_THREAD *t, int len);
 void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct event_base *base);
 void *proxy_event_thread(void *arg);
 void proxy_run_backend_queue(be_head_t *head);
+struct mcp_backendconn_s *proxy_choose_beconn(mcp_backend_t *be);
 
 // await interface
 enum mcp_await_e {
@@ -528,11 +562,16 @@ int mcplib_internal(lua_State *L);
 int mcplib_internal_run(lua_State *L, conn *c, mc_resp *top_resp, int coro_ref);
 
 // user stats interface
+#define MAX_USTATS_DEFAULT 1024
 int mcplib_add_stat(lua_State *L);
 int mcplib_stat(lua_State *L);
 size_t _process_request_next_key(mcp_parser_t *pr);
 int process_request(mcp_parser_t *pr, const char *command, size_t cmdlen);
 mcp_request_t *mcp_new_request(lua_State *L, mcp_parser_t *pr, const char *command, size_t cmdlen);
+
+// rate limit interfaces
+int mcplib_ratelim_tbf(lua_State *L);
+int mcplib_ratelim_tbf_call(lua_State *L);
 
 // request interface
 int mcplib_request(lua_State *L);
@@ -554,7 +593,12 @@ mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_proxy_t *pp,
 void mcp_request_attach(lua_State *L, mcp_request_t *rq, io_pending_proxy_t *p);
 int mcp_request_render(mcp_request_t *rq, int idx, const char *tok, size_t len);
 void proxy_lua_error(lua_State *L, const char *s);
-void proxy_lua_ferror(lua_State *L, const char *fmt, ...);
+#define proxy_lua_ferror(L, fmt, ...) \
+    do { \
+        lua_pushfstring(L, fmt, __VA_ARGS__); \
+        lua_error(L); \
+    } while (0)
+
 #define PROXY_SERVER_ERROR "SERVER_ERROR "
 #define PROXY_CLIENT_ERROR "CLIENT_ERROR "
 void proxy_out_errstring(mc_resp *resp, char *type, const char *str);

@@ -49,6 +49,8 @@
 #include "protocol_binary.h"
 #include "cache.h"
 #include "logger.h"
+#include "queue.h"
+#include "util.h"
 
 #ifdef EXTSTORE
 #include "crc32c.h"
@@ -88,6 +90,15 @@
 /* Initial power multiplier for the hash table */
 #define HASHPOWER_DEFAULT 16
 #define HASHPOWER_MAX 32
+
+/* Abstract the size of an item's client flag suffix */
+#ifdef LARGE_CLIENT_FLAGS
+typedef uint64_t client_flags_t;
+#define safe_strtoflags safe_strtoull
+#else
+typedef uint32_t client_flags_t;
+#define safe_strtoflags safe_strtoul
+#endif
 
 /*
  * We only reposition items in the LRU queue if they haven't been repositioned
@@ -131,12 +142,12 @@
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
          + (item)->nbytes \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
@@ -163,13 +174,13 @@
 /** Item client flag conversion */
 #define FLAGS_CONV(it, flag) { \
     if ((it)->it_flags & ITEM_CFLAGS) { \
-        flag = *((uint32_t *)ITEM_suffix((it))); \
+        flag = *((client_flags_t *)ITEM_suffix((it))); \
     } else { \
         flag = 0; \
     } \
 }
 
-#define FLAGS_SIZE(item) (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
+#define FLAGS_SIZE(item) (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0)
 
 /**
  * Callback for any function producing stats.
@@ -204,6 +215,8 @@ enum conn_states {
     conn_closed,     /**< connection is closed */
     conn_watch,      /**< held by the logger thread as a watcher */
     conn_io_queue,   /**< wait on async. process to get response object */
+    conn_io_resume,  /**< ready to resume mwrite after async work */
+    conn_io_pending, /**< got woken up while waiting for async work */
     conn_max_state   /**< Max state value (used for assertion) */
 };
 
@@ -532,6 +545,7 @@ struct settings {
 #ifdef PROXY
     bool proxy_enabled;
     bool proxy_uring; /* if the proxy should use io_uring */
+    bool proxy_memprofile; /* output detail of lua allocations */
     char *proxy_startfile; /* lua file to run when workers start */
     void *proxy_ctx; /* proxy's state context */
 #endif
@@ -639,7 +653,7 @@ typedef struct _strchunk {
 #ifdef NEED_ALIGN
 static inline char *ITEM_schunk(item *it) {
     int offset = it->nkey + 1
-        + ((it->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0)
+        + ((it->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0)
         + ((it->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0);
     int remain = offset % 8;
     if (remain != 0) {
@@ -649,7 +663,7 @@ static inline char *ITEM_schunk(item *it) {
 }
 #else
 #define ITEM_schunk(item) ((char*) &((item)->data) + (item)->nkey + 1 \
-         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(uint32_t) : 0) \
+         + (((item)->it_flags & ITEM_CFLAGS) ? sizeof(client_flags_t) : 0) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 #endif
 
@@ -667,6 +681,7 @@ typedef struct {
 #define IO_QUEUE_EXTSTORE 1
 #define IO_QUEUE_PROXY 2
 
+typedef STAILQ_HEAD(iop_head_s, _io_pending_t) iop_head_t;
 typedef struct _io_pending_t io_pending_t;
 typedef struct io_queue_s io_queue_t;
 typedef void (*io_queue_stack_cb)(io_queue_t *q);
@@ -690,17 +705,24 @@ typedef struct io_queue_cb_s {
     int type;
 } io_queue_cb_t;
 
-typedef struct _mc_resp_bundle mc_resp_bundle;
-typedef struct {
-    pthread_t thread_id;        /* unique ID of this thread */
-    struct event_base *base;    /* libevent handle this thread uses */
-    struct event notify_event;  /* listen event for notify pipe */
+struct thread_notify {
+    struct event notify_event;  /* listen event for notify pipe or eventfd */
 #ifdef HAVE_EVENTFD
     int notify_event_fd;        /* notify counter */
 #else
     int notify_receive_fd;      /* receiving end of notify pipe */
     int notify_send_fd;         /* sending end of notify pipe */
 #endif
+};
+
+typedef struct _mc_resp_bundle mc_resp_bundle;
+typedef struct {
+    pthread_t thread_id;        /* unique ID of this thread */
+    struct event_base *base;    /* libevent handle this thread uses */
+    struct thread_notify n;     /* for thread notification */
+    struct thread_notify ion;   /* for thread IO object notification */
+    pthread_mutex_t ion_lock;   /* mutex for ion_head */
+    iop_head_t ion_head;        /* queue for IO object return */
     int cur_sfd;                /* client fd for logging commands */
     int thread_baseid;          /* which "number" thread this is for data offsets */
     struct thread_stats stats;  /* Stats generated by this thread */
@@ -725,6 +747,7 @@ typedef struct {
     void *proxy_user_stats;
     void *proxy_int_stats;
     void *proxy_event_thread; // worker threads can also be proxy IO threads
+    struct event *proxy_gc_timer; // periodic GC pushing.
     pthread_mutex_t proxy_limit_lock;
     uint64_t proxy_active_req_limit;
     uint64_t proxy_buffer_memory_limit; // protected by limit_lock
@@ -785,6 +808,7 @@ struct _io_pending_t {
     mc_resp *resp; // associated response object
     io_queue_cb return_cb; // called on worker thread.
     io_queue_cb finalize_cb; // called back on the worker thread.
+    STAILQ_ENTRY(_io_pending_t) iop_next; // queue chain.
     char data[120];
 };
 
@@ -941,7 +965,6 @@ extern int daemonize(int nochdir, int noclose);
 #include "crawler.h"
 #include "trace.h"
 #include "hash.h"
-#include "util.h"
 
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
@@ -968,7 +991,7 @@ enum delta_result_type add_delta(LIBEVENT_THREAD *t, const char *key,
 void accept_new_conns(const bool do_accept);
 void  conn_close_idle(conn *c);
 void  conn_close_all(void);
-item *item_alloc(const char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
+item *item_alloc(const char *key, size_t nkey, client_flags_t flags, rel_time_t exptime, int nbytes);
 #define DO_UPDATE true
 #define DONT_UPDATE false
 item *item_get(const char *key, const size_t nkey, LIBEVENT_THREAD *t, const bool do_update);
