@@ -26,6 +26,22 @@ static lua_Integer _mcplib_backend_get_waittime(lua_Number secondsf) {
     return secondsi;
 }
 
+static int mcplib_time_real_millis(lua_State *L) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    lua_Integer t = now.tv_nsec / 1000000 + now.tv_sec * 1000;
+    lua_pushinteger(L, t);
+    return 1;
+}
+
+static int mcplib_time_mono_millis(lua_State *L) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lua_Integer t = now.tv_nsec / 1000000 + now.tv_sec * 1000;
+    lua_pushinteger(L, t);
+    return 1;
+}
+
 // end util funcs.
 
 static int mcplib_response_elapsed(lua_State *L) {
@@ -98,20 +114,17 @@ static int mcplib_response_line(lua_State *L) {
     return 1;
 }
 
-static int mcplib_response_gc(lua_State *L) {
-    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
-    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
-
-    // FIXME: we handle the accounting here, but the actual response buffer is
-    // freed elsewhere, after the network write.
-    pthread_mutex_lock(&t->proxy_limit_lock);
-    t->proxy_buffer_memory_used -= r->blen + r->extra;
-    pthread_mutex_unlock(&t->proxy_limit_lock);
+void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r) {
 
     // On error/similar we might be holding the read buffer.
     // If the buf is handed off to mc_resp for return, this pointer is NULL
     if (r->buf != NULL) {
+        pthread_mutex_lock(&t->proxy_limit_lock);
+        t->proxy_buffer_memory_used -= r->blen + r->extra;
+        pthread_mutex_unlock(&t->proxy_limit_lock);
+
         free(r->buf);
+        r->buf = NULL;
     }
 
     // release our temporary mc_resp sub-object.
@@ -119,7 +132,14 @@ static int mcplib_response_gc(lua_State *L) {
         mc_resp *cresp = r->cresp;
         assert(r->thread != NULL);
         resp_free(r->thread, cresp);
+        r->cresp = NULL;
     }
+}
+
+static int mcplib_response_gc(lua_State *L) {
+    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+    mcp_response_cleanup(t, r);
 
     return 0;
 }
@@ -664,6 +684,7 @@ static void _mcplib_pool_make_be(lua_State *L, mcp_pool_t *p) {
 
 // p = mcp.pool(backends, { dist = f, hashfilter = f, seed = "a", hash = f })
 static int mcplib_pool(lua_State *L) {
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
     int argc = lua_gettop(L);
     luaL_checktype(L, 1, LUA_TTABLE);
     int n = luaL_len(L, 1); // get length of array table
@@ -675,7 +696,7 @@ static int mcplib_pool(lua_State *L) {
     memset(p, 0, plen);
     p->pool_size = n;
     p->pool_be_total = n * workers;
-    p->use_iothread = true;
+    p->use_iothread = ctx->tunables.use_iothread;
     // TODO (v2): Nicer if this is fetched from mcp.default_key_hash
     p->key_hasher = XXH3_64bits_withSeed;
     pthread_mutex_init(&p->lock, NULL);
@@ -828,7 +849,7 @@ static int mcplib_pool_proxy_gc(lua_State *L) {
     return 0;
 }
 
-mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_proxy_t *pp, const char *key, size_t len) {
+mcp_backend_t *mcplib_pool_proxy_call_helper(mcp_pool_proxy_t *pp, const char *key, size_t len) {
     mcp_pool_t *p = pp->main;
     if (p->key_filter) {
         key = p->key_filter(p->key_filter_conf, key, len, &len);
@@ -838,22 +859,16 @@ mcp_backend_t *mcplib_pool_proxy_call_helper(lua_State *L, mcp_pool_proxy_t *pp,
     uint32_t lookup = p->phc.selector_func(hash, p->phc.ctx);
 
     assert(p->phc.ctx != NULL);
-    // attach the backend to the request object.
-    // the lua modules should "think" in 1 based indexes, so we need to
-    // subtract one here.
     if (lookup >= p->pool_size) {
-        proxy_lua_error(L, "key dist hasher tried to use out of bounds index");
+        return NULL;
     }
 
     return pp->pool[lookup].be;
 }
 
-// hashfunc(request) -> backend(request)
-// needs key from request object.
+// pool(request) -> yields the pool/request for further processing
 static int mcplib_pool_proxy_call(lua_State *L) {
-    // internal args are the hash selector (self)
     mcp_pool_proxy_t *pp = luaL_checkudata(L, -2, "mcp.pool_proxy");
-    // then request object.
     mcp_request_t *rq = luaL_checkudata(L, -1, "mcp.request");
 
     // we have a fast path to the key/length.
@@ -863,11 +878,28 @@ static int mcplib_pool_proxy_call(lua_State *L) {
     }
     const char *key = MCP_PARSER_KEY(rq->pr);
     size_t len = rq->pr.klen;
-    rq->be = mcplib_pool_proxy_call_helper(L, pp, key, len);
+    mcp_backend_t *be = mcplib_pool_proxy_call_helper(pp, key, len);
+    if (be == NULL) {
+        proxy_lua_error(L, "key dist hasher tried to use out of bounds index");
+        return 0;
+    }
+    lua_pushlightuserdata(L, be);
 
-    // now yield request, pool up.
+    // now yield request, pool, backend, mode up.
     lua_pushinteger(L, MCP_YIELD_POOL);
-    return lua_yield(L, 3);
+    return lua_yield(L, 4);
+}
+
+static int mcplib_backend_use_iothread(lua_State *L) {
+    luaL_checktype(L, -1, LUA_TBOOLEAN);
+    int state = lua_toboolean(L, -1);
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
+
+    STAT_L(ctx);
+    ctx->tunables.use_iothread = state;
+    STAT_UL(ctx);
+
+    return 0;
 }
 
 static int mcplib_tcp_keepalive(lua_State *L) {
@@ -1067,7 +1099,29 @@ static int mcplib_attach(lua_State *L) {
         loop_end = hook + 1;
     }
 
+    mcp_funcgen_t *fgen = NULL;
     if (lua_isfunction(L, 2)) {
+        // create a funcgen with null generator that calls this function
+        lua_pushvalue(L, 2); // function must be at top of stack.
+        mcplib_funcgenbare_new(L); // convert it into a function generator.
+        fgen = luaL_checkudata(L, -1, "mcp.funcgen"); // set our pointer ref.
+        lua_replace(L, 2); // move the function generator over the input
+                           // function. necessary for alignment with the rest
+                           // of the code.
+        lua_pop(L, 1); // drop the extra generator function reference.
+    } else if ((fgen = luaL_testudata(L, 2, "mcp.funcgen")) != NULL) {
+        // good
+    } else {
+        proxy_lua_error(L, "mcp.attach: must pass a function");
+        return 0;
+    }
+
+    if (fgen->closed) {
+        proxy_lua_error(L, "mcp.attach: cannot use a previously replaced function");
+        return 0;
+    }
+
+    {
         struct proxy_hook *hooks = t->proxy_hooks;
         uint64_t tag = 0; // listener socket tag
 
@@ -1088,7 +1142,8 @@ static int mcplib_attach(lua_State *L) {
                 // need to add flush support before allowing override
                 continue;
             }
-            lua_pushvalue(L, 2); // duplicate the function for the ref.
+            lua_pushvalue(L, 2); // duplicate the ref.
+            struct proxy_hook_ref *href = &h->ref;
 
             if (tag) {
                 // listener was tagged. use the extended hook structure.
@@ -1106,21 +1161,7 @@ static int mcplib_attach(lua_State *L) {
 
                 bool found = false;
                 for (int x = 0; x < h->tagcount; x++) {
-                    if (pht->tag == tag) {
-                        if (pht->lua_ref) {
-                            // Found existing tagged hook.
-                            luaL_unref(L, LUA_REGISTRYINDEX, pht->lua_ref);
-                        }
-
-                        pht->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-                        assert(pht->lua_ref != 0);
-                        found = true;
-                        break;
-                    } else if (pht->tag == 0) {
-                        // no tag in this slot, so we use it.
-                        pht->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-                        pht->tag = tag;
-                        assert(pht->lua_ref != 0);
+                    if (pht->tag == tag || pht->tag == 0) {
                         found = true;
                         break;
                     }
@@ -1129,33 +1170,34 @@ static int mcplib_attach(lua_State *L) {
 
                 // need to resize the array to fit the new tag.
                 if (!found) {
-                    pht = realloc(h->tagged, sizeof(struct proxy_hook_tagged) * (h->tagcount+1));
-                    if (!pht) {
+                    struct proxy_hook_tagged *temp = realloc(h->tagged, sizeof(struct proxy_hook_tagged) * (h->tagcount+1));
+                    if (!temp) {
                         proxy_lua_error(L, "mcp.attach: failure to resize tagged hooks");
                         return 0;
                     }
-
-                    pht[h->tagcount].lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-                    pht[h->tagcount].tag = tag;
-
+                    pht = &temp[h->tagcount];
+                    memset(pht, 0, sizeof(*pht));
                     h->tagcount++;
-                    h->tagged = pht;
+                    h->tagged = temp;
                 }
 
-            } else {
-                if (h->lua_ref) {
-                    // remove existing reference.
-                    luaL_unref(L, LUA_REGISTRYINDEX, h->lua_ref);
-                }
-
-                // pops the function from the stack and leaves us a ref. for later.
-                h->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-                assert(h->lua_ref != 0);
+                href = &pht->ref;
+                pht->tag = tag;
             }
+
+            // now assign our hook reference.
+            if (href->lua_ref) {
+                // Found existing tagged hook.
+                luaL_unref(L, LUA_REGISTRYINDEX, href->lua_ref);
+                mcp_funcgen_dereference(L, href->ctx);
+            }
+
+            lua_pushvalue(L, -1); // duplicate the funcgen
+            mcp_funcgen_reference(L);
+            href->lua_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            href->ctx = fgen;
+            assert(href->lua_ref != 0);
         }
-    } else {
-        proxy_lua_error(L, "Must pass a function to mcp.attach");
-        return 0;
     }
 
     return 0;
@@ -1291,6 +1333,9 @@ static void proxy_register_defines(lua_State *L) {
 #define X(x) \
     lua_pushinteger(L, x); \
     lua_setfield(L, -2, #x);
+#define Y(x, l) \
+    lua_pushinteger(L, x); \
+    lua_setfield(L, -2, l);
 
     X(MCMC_CODE_STORED);
     X(MCMC_CODE_EXISTS);
@@ -1315,8 +1360,19 @@ static void proxy_register_defines(lua_State *L) {
     X(AWAIT_FIRST);
     X(AWAIT_FASTGOOD);
     X(AWAIT_BACKGROUND);
+    Y(QWAIT_ANY, "WAIT_ANY");
+    Y(QWAIT_OK, "WAIT_OK");
+    Y(QWAIT_GOOD, "WAIT_GOOD");
+    Y(QWAIT_FASTGOOD, "WAIT_FASTGOOD");
+    Y(RQUEUE_R_GOOD, "RES_GOOD");
+    Y(RQUEUE_R_OK, "RES_OK");
+    Y(RQUEUE_R_ANY, "RES_ANY");
     CMD_FIELDS
 #undef X
+#undef Y
+
+    lua_pushboolean(L, 1);
+    lua_setfield(L, -2, "WAIT_RESUME");
 }
 
 // Creates and returns the top level "mcp" module
@@ -1374,6 +1430,26 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {NULL, NULL}
     };
 
+    const struct luaL_Reg mcplib_rcontext_m[] = {
+        {"handle_set_cb", mcplib_rcontext_handle_set_cb},
+        {"enqueue", mcplib_rcontext_enqueue},
+        {"wait_cond", mcplib_rcontext_wait_cond},
+        {"enqueue_and_wait", mcplib_rcontext_enqueue_and_wait},
+        {"wait_handle", mcplib_rcontext_wait_handle},
+        {"res_good", mcplib_rcontext_res_good},
+        {"res_ok", mcplib_rcontext_res_ok},
+        {"res_any", mcplib_rcontext_res_any},
+        {"result", mcplib_rcontext_result},
+        {NULL, NULL}
+    };
+
+    const struct luaL_Reg mcplib_funcgen_m[] = {
+        {"__gc", mcplib_funcgen_gc},
+        {"new_handle", mcplib_funcgen_new_handle},
+        {"ready", mcplib_funcgen_ready},
+        {NULL, NULL}
+    };
+
     const struct luaL_Reg mcplib_f_config [] = {
         {"pool", mcplib_pool},
         {"backend", mcplib_backend},
@@ -1387,6 +1463,7 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"backend_flap_time", mcplib_backend_flap_time},
         {"backend_flap_backoff_ramp", mcplib_backend_flap_backoff_ramp},
         {"backend_flap_backoff_max", mcplib_backend_flap_backoff_max},
+        {"backend_use_iothread", mcplib_backend_use_iothread},
         {"tcp_keepalive", mcplib_tcp_keepalive},
         {"active_req_limit", mcplib_active_req_limit},
         {"buffer_memory_limit", mcplib_buffer_memory_limit},
@@ -1396,6 +1473,8 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
     const struct luaL_Reg mcplib_f_routes [] = {
         {"internal", mcplib_internal},
         {"attach", mcplib_attach},
+        {"funcgen_new", mcplib_funcgen_new},
+        {"router_new", mcplib_router_new},
         {"await", mcplib_await},
         {"await_logerrors", mcplib_await_logerrors},
         {"log", mcplib_log},
@@ -1404,6 +1483,8 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"stat", mcplib_stat},
         {"request", mcplib_request},
         {"ratelim_tbf", mcplib_ratelim_tbf},
+        {"time_real_millis", mcplib_time_real_millis},
+        {"time_mono_millis", mcplib_time_mono_millis},
         {NULL, NULL}
     };
     // VM's have void* extra space in the VM by default for fast-access to a
@@ -1436,6 +1517,26 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         lua_pushvalue(L, -1); // duplicate metatable.
         lua_setfield(L, -2, "__index"); // mt.__index = mt
         luaL_setfuncs(L, mcplib_ratelim_tbf_m, 0); // register methods
+        lua_pop(L, 1);
+
+        luaL_newmetatable(L, "mcp.rcontext");
+        lua_pushvalue(L, -1); // duplicate metatable.
+        lua_setfield(L, -2, "__index"); // mt.__index = mt
+        luaL_setfuncs(L, mcplib_rcontext_m, 0); // register methods
+        lua_pop(L, 1);
+
+        luaL_newmetatable(L, "mcp.funcgen");
+        lua_pushvalue(L, -1); // duplicate metatable.
+        lua_setfield(L, -2, "__index"); // mt.__index = mt
+        luaL_setfuncs(L, mcplib_funcgen_m, 0); // register methods
+        lua_pop(L, 1);
+
+        // marks a special C-compatible route function.
+        luaL_newmetatable(L, "mcp.rfunc");
+        lua_pop(L, 1);
+
+        // function generator userdata.
+        luaL_newmetatable(L, "mcp.funcgen");
         lua_pop(L, 1);
 
         luaL_newlibtable(L, mcplib_f_routes);

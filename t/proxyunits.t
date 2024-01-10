@@ -51,7 +51,7 @@ for my $port (11411, 11412, 11413) {
     push(@mocksrvs, $srv);
 }
 
-my $p_srv = new_memcached('-o proxy_config=./t/proxyunits.lua');
+my $p_srv = new_memcached('-o proxy_config=./t/proxyunits.lua -t 1');
 my $ps = $p_srv->sock;
 $ps->autoflush(1);
 
@@ -169,6 +169,20 @@ sub proxy_test {
 
     print $ps "get /deadrespcode/foo\r\n";
     is(scalar <$ps>, "ERROR code_correct\r\n", "Backend had correct response code on failure");
+}
+
+{
+    note("millisecond timer");
+    print $ps "mg /millis/key\r\n";
+    my $res = <$ps>;
+    if ($res =~ m/^HD t(\d+)/) {
+        my $time = $1;
+        my $now = int(time());
+        cmp_ok($time, '>', $now*5, "mcp.time_millis is a reasonable value: $now*5 vs $time");
+        cmp_ok($time, '!=', 0, 'mcp.time_millis is non zero');
+    } else {
+        fail("mcp.time_millis failure: $res");
+    }
 }
 
 # Basic test with a backend; write a request to the client socket, read it
