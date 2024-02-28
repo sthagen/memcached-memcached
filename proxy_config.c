@@ -78,7 +78,7 @@ int proxy_first_confload(void *arg) {
 // Manages a queue of inbound objects destined to be deallocated.
 static void *_proxy_manager_thread(void *arg) {
     proxy_ctx_t *ctx = arg;
-    pool_head_t head;
+    globalobj_head_t head;
 
     pthread_mutex_lock(&ctx->manager_lock);
     while (1) {
@@ -94,24 +94,18 @@ static void *_proxy_manager_thread(void *arg) {
         // Config lock is required for using config VM.
         pthread_mutex_lock(&ctx->config_lock);
         lua_State *L = ctx->proxy_state;
-        mcp_pool_t *p;
-        STAILQ_FOREACH(p, &head, next) {
-            // we let the pool object _gc() handle backend references.
-
-            luaL_unref(L, LUA_REGISTRYINDEX, p->phc_ref);
-            // need to... unref self.
-            // NOTE: double check if we really need to self-reference.
-            // this is a backup here to ensure the external refcounts hit zero
-            // before lua garbage collects the object. other things hold a
-            // reference to the object though.
-            luaL_unref(L, LUA_REGISTRYINDEX, p->self_ref);
+        struct mcp_globalobj_s *g;
+        STAILQ_FOREACH(g, &head, next) {
+            // we let the object _gc() handle backend/etc references
+            luaL_unref(L, LUA_REGISTRYINDEX, g->self_ref);
         }
-        pthread_mutex_unlock(&ctx->config_lock);
         // force lua garbage collection so any resources close out quickly.
         lua_gc(L, LUA_GCCOLLECT);
         // twice because objects with garbage collector handlers are only
         // marked on the first collection cycle.
         lua_gc(L, LUA_GCCOLLECT);
+        // must hold this lock while interacting with the config VM.
+        pthread_mutex_unlock(&ctx->config_lock);
 
         // done.
         pthread_mutex_lock(&ctx->manager_lock);
@@ -267,7 +261,7 @@ int proxy_load_config(void *arg) {
 }
 
 static int _copy_pool(lua_State *from, lua_State *to, LIBEVENT_THREAD *thr) {
-    // from, -3 should have he userdata.
+    // from, -3 should have the userdata.
     mcp_pool_t *p = luaL_checkudata(from, -3, "mcp.pool");
     size_t size = sizeof(mcp_pool_proxy_t);
     mcp_pool_proxy_t *pp = lua_newuserdatauv(to, size, 0);
@@ -280,9 +274,9 @@ static int _copy_pool(lua_State *from, lua_State *to, LIBEVENT_THREAD *thr) {
         // allow 0 indexing for backends when unique to each worker thread
         pp->pool = &p->pool[thr->thread_baseid * p->pool_size];
     }
-    pthread_mutex_lock(&p->lock);
-    p->refcount++;
-    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_lock(&p->g.lock);
+    p->g.refcount++;
+    pthread_mutex_unlock(&p->g.lock);
     return 0;
 }
 
@@ -306,6 +300,9 @@ static void _copy_config_table(lua_State *from, lua_State *to, LIBEVENT_THREAD *
                     const char *name = lua_tostring(from, -1);
                     if (strcmp(name, "mcp.pool") == 0) {
                         _copy_pool(from, to, thr);
+                        found = true;
+                    } else if (strcmp(name, "mcp.ratelim_global_tbf") == 0) {
+                        mcp_ratelim_proxy_tbf(from, to);
                         found = true;
                     }
                 }
@@ -427,7 +424,7 @@ int proxy_thread_loadconf(proxy_ctx_t *ctx, LIBEVENT_THREAD *thr) {
     _copy_config_table(ctx->proxy_state, L, thr);
 
     // copied value is in front of route function, now call it.
-    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
         fprintf(stderr, "Failed to execute mcp_config_routes: %s\n", lua_tostring(L, -1));
         return -1;
     }

@@ -17,6 +17,7 @@ int mcplib_funcgen_gc(lua_State *L) {
     assert(fgen->self_ref == 0);
 
     mcp_funcgen_cleanup(L, fgen);
+    fgen->closed = true;
     return 0;
 }
 
@@ -311,7 +312,7 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
         // remove the C reference to the fgen
         luaL_unref(L, LUA_REGISTRYINDEX, fgen->self_ref);
         fgen->self_ref = 0;
-    } else {
+    } else if (fgen->closed) {
         // we've already cleaned up, probably redundant call from _gc()
         return;
     }
@@ -326,6 +327,8 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
     if (fgen->name_ref) {
         lua_rawgeti(L, LUA_REGISTRYINDEX, fgen->name_ref);
         name = lua_tostring(L, -1);
+    } else if (fgen->router.type != FGEN_ROUTER_NONE) {
+        name = "mcp_router";
     } else {
         name = "anonymous";
     }
@@ -355,12 +358,29 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
             } else if (rqu->obj_type != RQUEUE_TYPE_NONE) {
                 assert(1 == 0);
             }
+
+            if (rqu->res_ref) {
+                luaL_unref(L, LUA_REGISTRYINDEX, rqu->res_ref);
+                rqu->res_ref = 0;
+            }
+
             if (rqu->cb_ref) {
                 luaL_unref(L, LUA_REGISTRYINDEX, rqu->cb_ref);
                 rqu->cb_ref = 0;
             }
         }
     }
+
+    if (fgen->argument_ref) {
+        luaL_unref(L, LUA_REGISTRYINDEX, fgen->argument_ref);
+        fgen->argument_ref = 0;
+    }
+
+    if (fgen->generator_ref) {
+        luaL_unref(L, LUA_REGISTRYINDEX, fgen->generator_ref);
+        fgen->generator_ref = 0;
+    }
+
     // decrement the slot tracker. apply full delta at once for efficiency.
     mcp_sharedvm_delta(t->proxy_ctx, SHAREDVM_FGENSLOT_IDX, name, -fgen->total);
 
@@ -372,8 +392,8 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
                 luaL_unref(L, LUA_REGISTRYINDEX, rqu->obj_ref);
             } else if (rqu->obj_type == RQUEUE_TYPE_FGEN) {
                 // don't need to recurse, just deref.
-                mcp_rcontext_t *subrctx = rqu->obj;
-                mcp_funcgen_dereference(L, subrctx->fgen);
+                mcp_funcgen_t *subfgen = rqu->obj;
+                mcp_funcgen_dereference(L, subfgen);
             } else if (rqu->obj_type != RQUEUE_TYPE_NONE) {
                 assert(1 == 0);
             }
@@ -1618,6 +1638,9 @@ int mcplib_router_new(lua_State *L) {
     }
 
     lua_pop(L, 2); // drop argmap, mymap.
+
+    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
+    mcp_sharedvm_delta(t->proxy_ctx, SHAREDVM_FGEN_IDX, "mcp_router", 1);
 
     return 1;
 }
