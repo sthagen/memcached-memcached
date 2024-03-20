@@ -58,14 +58,12 @@ static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 static uint64_t sizes_bytes[LARGEST_ID];
 static unsigned int *stats_sizes_hist = NULL;
-static uint64_t stats_sizes_cas_min = 0;
 static int stats_sizes_buckets = 0;
 static uint64_t cas_id = 0;
 
 static volatile int do_run_lru_maintainer_thread = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void item_stats_reset(void) {
     int i;
@@ -123,14 +121,9 @@ void set_cas_id(uint64_t new_cas) {
 
 int item_is_flushed(item *it) {
     rel_time_t oldest_live = settings.oldest_live;
-    uint64_t cas = ITEM_get_cas(it);
-    uint64_t oldest_cas = settings.oldest_cas;
-    if (oldest_live == 0 || oldest_live > current_time)
-        return 0;
-    if ((it->time <= oldest_live)
-            || (oldest_cas != 0 && cas != 0 && cas < oldest_cas)) {
+    if (it->time <= oldest_live && oldest_live <= current_time)
         return 1;
-    }
+
     return 0;
 }
 
@@ -597,6 +590,51 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv) {
     return do_item_link(new_it, hv);
 }
 
+void item_flush_expired(void) {
+    int i;
+    item *iter, *next;
+    if (settings.oldest_live == 0)
+        return;
+    for (i = 0; i < LARGEST_ID; i++) {
+        /* The LRU is sorted in decreasing time order, and an item's timestamp
+         * is never newer than its last access time, so we only need to walk
+         * back until we hit an item older than the oldest_live time.
+         * The oldest_live checking will auto-expire the remaining items.
+         */
+        pthread_mutex_lock(&lru_locks[i]);
+        for (iter = heads[i]; iter != NULL; iter = next) {
+            void *hold_lock = NULL;
+            next = iter->next;
+            if (iter->time == 0 && iter->nkey == 0 && iter->it_flags == 1) {
+                continue; // crawler item.
+            }
+            uint32_t hv = hash(ITEM_key(iter), iter->nkey);
+            // if we can't lock the item, just give up.
+            // we can't block here because the lock order is inverted.
+            if ((hold_lock = item_trylock(hv)) == NULL) {
+                continue;
+            }
+
+            if (iter->time >= settings.oldest_live) {
+                // note: not sure why SLABBED check is here. linked and slabbed
+                // are mutually exclusive, but this can't hurt and I don't
+                // want to validate it right now.
+                if ((iter->it_flags & ITEM_SLABBED) == 0) {
+                    STORAGE_delete(ext_storage, iter);
+                    // nolock version because we hold the LRU lock already.
+                    do_item_unlink_nolock(iter, hash(ITEM_key(iter), iter->nkey));
+                }
+                item_trylock_unlock(hold_lock);
+            } else {
+                /* We've hit the first old item. Continue to the next queue. */
+                item_trylock_unlock(hold_lock);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&lru_locks[i]);
+    }
+}
+
 /*@null@*/
 /* This is walking the line of violating lock order, but I think it's safe.
  * If the LRU lock is held, an item in the LRU cannot be wiped and freed.
@@ -882,10 +920,8 @@ void item_stats(ADD_STAT add_stats, void *c) {
 
 bool item_stats_sizes_status(void) {
     bool ret = false;
-    mutex_lock(&stats_sizes_lock);
     if (stats_sizes_hist != NULL)
         ret = true;
-    mutex_unlock(&stats_sizes_lock);
     return ret;
 }
 
@@ -894,40 +930,10 @@ void item_stats_sizes_init(void) {
         return;
     stats_sizes_buckets = settings.item_size_max / 32 + 1;
     stats_sizes_hist = calloc(stats_sizes_buckets, sizeof(int));
-    stats_sizes_cas_min = (settings.use_cas) ? get_cas_id() : 0;
-}
-
-void item_stats_sizes_enable(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-    if (!settings.use_cas) {
-        APPEND_STAT("sizes_status", "error", "");
-        APPEND_STAT("sizes_error", "cas_support_disabled", "");
-    } else if (stats_sizes_hist == NULL) {
-        item_stats_sizes_init();
-        if (stats_sizes_hist != NULL) {
-            APPEND_STAT("sizes_status", "enabled", "");
-        } else {
-            APPEND_STAT("sizes_status", "error", "");
-            APPEND_STAT("sizes_error", "no_memory", "");
-        }
-    } else {
-        APPEND_STAT("sizes_status", "enabled", "");
-    }
-    mutex_unlock(&stats_sizes_lock);
-}
-
-void item_stats_sizes_disable(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-    if (stats_sizes_hist != NULL) {
-        free(stats_sizes_hist);
-        stats_sizes_hist = NULL;
-    }
-    APPEND_STAT("sizes_status", "disabled", "");
-    mutex_unlock(&stats_sizes_lock);
 }
 
 void item_stats_sizes_add(item *it) {
-    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+    if (stats_sizes_hist == NULL)
         return;
     int ntotal = ITEM_ntotal(it);
     int bucket = ntotal / 32;
@@ -939,7 +945,7 @@ void item_stats_sizes_add(item *it) {
  * Since items getting their time value bumped will pass this validation.
  */
 void item_stats_sizes_remove(item *it) {
-    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+    if (stats_sizes_hist == NULL)
         return;
     int ntotal = ITEM_ntotal(it);
     int bucket = ntotal / 32;
@@ -954,8 +960,6 @@ void item_stats_sizes_remove(item *it) {
  * which don't change.
  */
 void item_stats_sizes(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-
     if (stats_sizes_hist != NULL) {
         int i;
         for (i = 0; i < stats_sizes_buckets; i++) {
@@ -970,7 +974,6 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
     }
 
     add_stats(NULL, 0, NULL, 0, c);
-    mutex_unlock(&stats_sizes_lock);
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */

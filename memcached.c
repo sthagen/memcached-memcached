@@ -242,7 +242,6 @@ static void settings_init(void) {
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
-    settings.oldest_cas = 0;          /* supplements accuracy of oldest_live */
     settings.evict_to_free = 1;       /* push old items out of cache when memory runs out */
     settings.socketpath = NULL;       /* by default, not using a unix socket */
     settings.auth_file = NULL;        /* by default, not using ASCII authentication tokens */
@@ -2064,10 +2063,6 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             slabs_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "sizes") == 0) {
             item_stats_sizes(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_enable") == 0) {
-            item_stats_sizes_enable(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_disable") == 0) {
-            item_stats_sizes_disable(add_stats, c);
         } else {
             ret = false;
         }
@@ -2482,7 +2477,7 @@ static enum try_read_result try_read_network(conn *c) {
     assert(c != NULL);
 
     if (c->rcurr != c->rbuf) {
-        if (c->rbytes != 0) /* otherwise there's nothing to copy */
+        if (c->rbytes > 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
         c->rcurr = c->rbuf;
     }
@@ -4193,10 +4188,10 @@ static void usage(void) {
            "   - ext_drop_unread:     don't re-write unread values during compaction (default: %s)\n"
            "   - ext_recache_rate:    recache an item every N accesses (default: %u)\n"
            "   - ext_compact_under:   compact when fewer than this many free pages\n"
-           "                          (default: 1/4th of the assigned storage)\n"
+           "                          (default: 1 percent of the assigned storage)\n"
            "   - ext_drop_under:      drop COLD items when fewer than this many free pages\n"
            "                          (default: 1/4th of the assigned storage)\n"
-           "   - ext_max_frag:        max page fragmentation to tolerate (default: %.2f)\n"
+           "   - ext_max_frag:        only defrag pages if they are less full than this pct-wise (default: %.2f)\n"
            "   - ext_max_sleep:       max sleep time of background threads in us (default: %u)\n"
            "   - slab_automove_freeratio: ratio of memory to hold free as buffer.\n"
            "                          (see doc/storage.txt for more info, default: %.3f)\n",
@@ -4546,7 +4541,6 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
     // Might as well just fetch the next CAS value to use than tightly
     // coupling the internal variable into the restart system.
     restart_set_kv(ctx, "current_cas", "%llu", (unsigned long long) get_cas_id());
-    restart_set_kv(ctx, "oldest_cas", "%llu", (unsigned long long) settings.oldest_cas);
     restart_set_kv(ctx, "logger_gid", "%llu", logger_get_gid());
     restart_set_kv(ctx, "hashpower", "%u", stats_state.hash_power_level);
     // NOTE: oldest_live is a rel_time_t, which aliases for unsigned int.
@@ -4564,7 +4558,7 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
 // TODO: Once crc32'ing of the metadata file is done this could be ensured better by
 // the restart module itself (crc32 + count of lines must match on the
 // backend)
-#define RESTART_REQUIRED_META 17
+#define RESTART_REQUIRED_META 16
 
 // With this callback we make a decision on if the current configuration
 // matches up enough to allow reusing the cache.
@@ -4592,7 +4586,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         R_USE_CAS,
         R_SLAB_REASSIGN,
         R_CURRENT_CAS,
-        R_OLDEST_CAS,
         R_OLDEST_LIVE,
         R_LOGGER_GID,
         R_CURRENT_TIME,
@@ -4612,7 +4605,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         [R_USE_CAS] = "use_cas",
         [R_SLAB_REASSIGN] = "slab_reassign",
         [R_CURRENT_CAS] = "current_cas",
-        [R_OLDEST_CAS] = "oldest_cas",
         [R_OLDEST_LIVE] = "oldest_live",
         [R_LOGGER_GID] = "logger_gid",
         [R_CURRENT_TIME] = "current_time",
@@ -4702,13 +4694,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
                 reuse_mmap = -1;
             } else {
                 set_cas_id(bigval_uint);
-            }
-            break;
-        case R_OLDEST_CAS:
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                settings.oldest_cas = bigval_uint;
             }
             break;
         case R_OLDEST_LIVE:
@@ -6215,6 +6200,10 @@ int main (int argc, char **argv) {
         if (portnumber_filename != NULL) {
             len = strlen(portnumber_filename)+4+1;
             temp_portnumber_filename = malloc(len);
+            if (temp_portnumber_filename == NULL) {
+                vperror("Failed to allocate memory for portnumber file");
+                exit(EX_OSERR);
+            }
             snprintf(temp_portnumber_filename,
                      len,
                      "%s.lck", portnumber_filename);

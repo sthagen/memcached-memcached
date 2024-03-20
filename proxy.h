@@ -640,23 +640,25 @@ struct mcp_funcgen_router {
     int map_ref;
 };
 
+#define FGEN_NAME_MAXLEN 80
 struct mcp_funcgen_s {
     LIBEVENT_THREAD *thread; // worker thread that created this funcgen.
     int generator_ref; // reference to the generator function.
     int self_ref; // self-reference if we're attached anywhere
     int argument_ref; // reference to an argument to pass to generator
-    int name_ref; // reference to string name for the generator
     int max_queues; // how many queue slots rctx's have
     unsigned int refcount; // reference counter
     unsigned int total; // total contexts managed
     unsigned int free; // free contexts
     unsigned int free_max; // size of list below.
+    unsigned int free_pressure; // "pressure" for when to early release rctx
     unsigned int routecount; // total routes if this fgen is a router.
     bool closed; // the hook holding this fgen has been replaced
     bool ready; // if we're locked down or not.
     mcp_rcontext_t **list;
     struct mcp_rqueue_s *queue_list;
     struct mcp_funcgen_router router;
+    char name[FGEN_NAME_MAXLEN+1]; // string name for the generator.
 };
 
 #define RQUEUE_TYPE_NONE 0
@@ -691,6 +693,7 @@ struct mcp_rqueue_s {
 };
 
 struct mcp_rcontext_s {
+    int self_ref; // reference to our own object
     int request_ref; // top level request for this context.
     int function_ref; // ref to the created route function.
     int coroutine_ref; // ref to our encompassing coroutine.
@@ -749,6 +752,10 @@ int mcplib_request_token(lua_State *L);
 int mcplib_request_ntokens(lua_State *L);
 int mcplib_request_has_flag(lua_State *L);
 int mcplib_request_flag_token(lua_State *L);
+int mcplib_request_flag_add(lua_State *L);
+int mcplib_request_flag_set(lua_State *L);
+int mcplib_request_flag_replace(lua_State *L);
+int mcplib_request_flag_del(lua_State *L);
 int mcplib_request_gc(lua_State *L);
 void mcp_request_cleanup(LIBEVENT_THREAD *t, mcp_request_t *rq);
 
@@ -762,7 +769,10 @@ int mcplib_open_dist_ring_hash(lua_State *L);
 int proxy_run_rcontext(mcp_rcontext_t *rctx);
 mcp_backend_t *mcplib_pool_proxy_call_helper(mcp_pool_proxy_t *pp, const char *key, size_t len);
 void mcp_request_attach(mcp_request_t *rq, io_pending_proxy_t *p);
-int mcp_request_render(mcp_request_t *rq, int idx, const char *tok, size_t len);
+int mcp_request_render(mcp_request_t *rq, int idx, char flag, const char *tok, size_t len);
+int mcp_request_append(mcp_request_t *rq, const char flag, const char *tok, size_t len);
+int mcp_request_find_flag_index(mcp_request_t *rq, const char flag);
+int mcp_request_find_flag_token(mcp_request_t *rq, const char flag, const char **token, size_t *len);
 void proxy_lua_error(lua_State *L, const char *s);
 #define proxy_lua_ferror(L, fmt, ...) \
     do { \

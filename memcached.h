@@ -414,6 +414,8 @@ struct stats {
     uint64_t      extstore_compact_lost; /* items lost because they were locked */
     uint64_t      extstore_compact_rescues; /* items re-written during compaction */
     uint64_t      extstore_compact_skipped; /* unhit items skipped during compaction */
+    uint64_t      extstore_compact_resc_cold; /* items re-written during compaction */
+    uint64_t      extstore_compact_resc_old; /* items re-written during compaction */
 #endif
 #ifdef TLS
     uint64_t      ssl_handshake_errors; /* TLS failures at accept/handshake time */
@@ -457,7 +459,6 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
-    uint64_t oldest_cas; /* ignore existing items with CAS values lower than this */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
     char *auth_file;    /* path to user authentication file */
@@ -749,6 +750,10 @@ typedef struct {
     void *proxy_event_thread; // worker threads can also be proxy IO threads
     struct event *proxy_gc_timer; // periodic GC pushing.
     pthread_mutex_t proxy_limit_lock;
+    int proxy_vm_extra_kb;
+    int proxy_vm_last_kb;
+    int proxy_vm_gcrunning;
+    bool proxy_vm_needspoke;
     uint64_t proxy_active_req_limit;
     uint64_t proxy_buffer_memory_limit; // protected by limit_lock
     uint64_t proxy_buffer_memory_used; // protected by limit_lock

@@ -525,9 +525,16 @@ static void *worker_libevent(void *arg) {
     }
 
     register_thread_initialized();
-
+#ifdef PROXY
+    while (!event_base_got_exit(me->base)) {
+        event_base_loop(me->base, EVLOOP_ONCE);
+        if (me->proxy_ctx) {
+            proxy_gc_poke(me);
+        }
+    }
+#else
     event_base_loop(me->base, 0);
-
+#endif
     // same mechanism used to watch for all threads exiting.
     register_thread_initialized();
 
@@ -677,7 +684,7 @@ static void thread_libevent_process(evutil_socket_t fd, short which, void *arg) 
 #define THR_NAME_MAXLEN 16
 void thread_setname(pthread_t thread, const char *name) {
 assert(strlen(name) < THR_NAME_MAXLEN);
-#if defined(__linux__)
+#if defined(__linux__) && defined(HAVE_PTHREAD_SETNAME_NP)
 pthread_setname_np(thread, name);
 #endif
 }
