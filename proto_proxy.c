@@ -21,13 +21,27 @@ static void *mcp_profile_alloc(void *ud, void *ptr, size_t osize, size_t nsize);
 
 static inline void _proxy_advance_lastkb(lua_State *L, LIBEVENT_THREAD *t) {
     int new_kb = lua_gc(L, LUA_GCCOUNT);
+    // We need to slew the increase in "gc pause" because the lua GC actually
+    // needs to run twice to free a userdata: once to run the _gc's and again
+    // to actually clean up the object.
+    // Meaning we will continually increase in size.
     if (new_kb > t->proxy_vm_last_kb) {
-        // clamp increases of the base memory per run to help
-        // prevent runaway scenarios.
-        t->proxy_vm_last_kb += (new_kb - t->proxy_vm_last_kb) * 0.5;
-    } else {
-        t->proxy_vm_last_kb = new_kb;
+        new_kb = t->proxy_vm_last_kb + (new_kb - t->proxy_vm_last_kb) * 0.50;
     }
+
+    // remove the memory freed during this cycle so we can kick off the GC
+    // early if we're very aggressively making garbage.
+    // carry our negative delta forward so a huge reclaim can push for a
+    // couple cycles.
+    if (t->proxy_vm_negative_delta >= new_kb) {
+        t->proxy_vm_negative_delta -= new_kb;
+        new_kb = 1;
+    } else {
+        new_kb -= t->proxy_vm_negative_delta;
+        t->proxy_vm_negative_delta = 0;
+    }
+
+    t->proxy_vm_last_kb = new_kb;
 }
 
 // The lua GC is paused while running requests. Run it manually inbetween
@@ -51,19 +65,28 @@ void proxy_gc_poke(LIBEVENT_THREAD *t) {
     if (t->proxy_vm_gcrunning > 0) {
         t->proxy_vm_needspoke = false;
         int loops = t->proxy_vm_gcrunning;
+        int done = 0;
         /*fprintf(stderr, "PROXYGC: proxy_gc_poke [cur: %d - last: %d - loops: %d]\n",
             vm_kb,
             t->proxy_vm_last_kb,
             loops);*/
-        while (loops--) {
+        while (loops-- && !done) {
             // reset counters once full GC cycle has completed
-            if (lua_gc(L, LUA_GCSTEP, 0)) {
-                _proxy_advance_lastkb(L, t);
-                t->proxy_vm_extra_kb = 0;
-                t->proxy_vm_gcrunning = 0;
-                //fprintf(stderr, "PROXYGC: proxy_gc_poke COMPLETE [cur: %d next: %d]\n", lua_gc(L, LUA_GCCOUNT), t->proxy_vm_last_kb);
-                break;
-            }
+            done = lua_gc(L, LUA_GCSTEP, 0);
+        }
+
+        int vm_kb_after = lua_gc(L, LUA_GCCOUNT);
+        int vm_kb_clean = vm_kb - t->proxy_vm_extra_kb;
+        if (vm_kb_clean > vm_kb_after) {
+            // track the amount of memory freed during the GC cycle.
+            t->proxy_vm_negative_delta += vm_kb_clean - vm_kb_after;
+        }
+
+        if (done) {
+            _proxy_advance_lastkb(L, t);
+            t->proxy_vm_extra_kb = 0;
+            t->proxy_vm_gcrunning = 0;
+            //fprintf(stderr, "PROXYGC: proxy_gc_poke COMPLETE [cur: %d next: %d]\n", lua_gc(L, LUA_GCCOUNT), t->proxy_vm_last_kb);
         }
 
         // increase the aggressiveness by memory bloat level.
@@ -120,22 +143,24 @@ bool proxy_bufmem_checkadd(LIBEVENT_THREAD *t, int len) {
 }
 
 // see also: process_extstore_stats()
-void proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
+void proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     if (arg == NULL) {
        return;
     }
     proxy_ctx_t *ctx = arg;
-    STAT_L(ctx);
 
+    STAT_L(ctx);
     APPEND_STAT("proxy_config_reloads", "%llu", (unsigned long long)ctx->global_stats.config_reloads);
     APPEND_STAT("proxy_config_reload_fails", "%llu", (unsigned long long)ctx->global_stats.config_reload_fails);
+    APPEND_STAT("proxy_config_cron_runs", "%llu", (unsigned long long)ctx->global_stats.config_cron_runs);
+    APPEND_STAT("proxy_config_cron_fails", "%llu", (unsigned long long)ctx->global_stats.config_cron_fails);
     APPEND_STAT("proxy_backend_total", "%llu", (unsigned long long)ctx->global_stats.backend_total);
     APPEND_STAT("proxy_backend_marked_bad", "%llu", (unsigned long long)ctx->global_stats.backend_marked_bad);
     APPEND_STAT("proxy_backend_failed", "%llu", (unsigned long long)ctx->global_stats.backend_failed);
     STAT_UL(ctx);
 }
 
-void process_proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
+void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     char key_str[STAT_KEY_LEN];
     struct proxy_int_stats istats = {0};
     uint64_t req_limit = 0;
@@ -223,7 +248,7 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, conn *c) {
     APPEND_STAT("cmd_replace", "%llu", (unsigned long long)istats.counters[CMD_REPLACE]);
 }
 
-void process_proxy_funcstats(void *arg, ADD_STAT add_stats, conn *c) {
+void process_proxy_funcstats(void *arg, ADD_STAT add_stats, void *c) {
     char key_str[STAT_KEY_LEN];
     if (!arg) {
         return;
@@ -251,8 +276,39 @@ void process_proxy_funcstats(void *arg, ADD_STAT add_stats, conn *c) {
             snprintf(key_str, STAT_KEY_LEN-1, "slots_%s", name);
             APPEND_STAT(key_str, "%d", slots);
         } else {
-            // TODO: Is it safe to delete keys in the middle here?
-            // not worried at all about just leaking memory here.
+            // TODO: It is safe to delete keys here. Slightly complex so low
+            // priority.
+        }
+    }
+
+    pthread_mutex_unlock(&ctx->sharedvm_lock);
+}
+
+void process_proxy_bestats(void *arg, ADD_STAT add_stats, void *c) {
+    char key_str[STAT_KEY_LEN];
+    if (!arg) {
+        return;
+    }
+    proxy_ctx_t *ctx = arg;
+    lua_State *L = ctx->proxy_sharedvm;
+    pthread_mutex_lock(&ctx->sharedvm_lock);
+
+    // iterate all of the listed backends
+    lua_pushnil(L);
+    while (lua_next(L, SHAREDVM_BACKEND_IDX) != 0) {
+        int n = lua_tointeger(L, -1);
+        lua_pop(L, 1); // drop the value, leave the key.
+        if (n != 0) {
+            // now grab the name key.
+            const char *name = lua_tostring(L, -1);
+            snprintf(key_str, STAT_KEY_LEN-1, "bad_%s", name);
+            APPEND_STAT(key_str, "%d", n);
+        } else {
+            // delete keys of backends that are no longer bad or no longer
+            // exist to keep the table small.
+            const char *name = lua_tostring(L, -1);
+            lua_pushnil(L);
+            lua_setfield(L, SHAREDVM_BACKEND_IDX, name);
         }
     }
 
@@ -300,6 +356,10 @@ void *proxy_init(bool use_uring, bool proxy_memprofile) {
     luaL_openlibs(L);
     // NOTE: might need to differentiate the libs yes?
     proxy_register_libs(ctx, NULL, L);
+    // Create the cron table.
+    lua_newtable(L);
+    ctx->cron_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    ctx->cron_next = INT_MAX;
 
     // set up the shared state VM. Used by short-lock events (counters/state)
     // for global visibility.
@@ -310,6 +370,7 @@ void *proxy_init(bool use_uring, bool proxy_memprofile) {
     // constantly fetch them from registry.
     lua_newtable(ctx->proxy_sharedvm); // fgen count
     lua_newtable(ctx->proxy_sharedvm); // fgen slot count
+    lua_newtable(ctx->proxy_sharedvm); // backend down status
 
     // Create/start the IO thread, which we need before servers
     // start getting created.
@@ -429,6 +490,7 @@ void proxy_submit_cb(io_queue_t *q) {
         } else {
             // emulate some of handler_dequeue()
             STAILQ_INSERT_HEAD(&be->io_head, p, io_next);
+            assert(be->depth > -1);
             be->depth++;
             if (!be->stacked) {
                 be->stacked = true;
@@ -744,8 +806,10 @@ static void _proxy_run_tresp_to_resp(mc_resp *tresp, mc_resp *resp) {
     // So far all we fill is the wbuf and some iov's? so just copy
     // that + the UDP info?
     memcpy(resp->wbuf, tresp->wbuf, tresp->iov[0].iov_len);
+    resp->tosend = 0;
     for (int x = 0; x < tresp->iovcnt; x++) {
         resp->iov[x] = tresp->iov[x];
+        resp->tosend += tresp->iov[x].iov_len;
     }
     // resp->iov[x].iov_base needs to be updated if it's
     // pointing within its wbuf.
@@ -809,7 +873,9 @@ static void _proxy_run_tresp_to_resp(mc_resp *tresp, mc_resp *resp) {
 int proxy_run_rcontext(mcp_rcontext_t *rctx) {
     int nresults = 0;
     lua_State *Lc = rctx->Lc;
-    int cores = lua_resume(Lc, NULL, 1, &nresults);
+    assert(rctx->lua_narg != 0);
+    int cores = lua_resume(Lc, NULL, rctx->lua_narg, &nresults);
+    rctx->lua_narg = 1; // reset to default since not-default is uncommon.
     size_t rlen = 0;
     conn *c = rctx->c;
     mc_resp *resp = rctx->resp;
@@ -910,6 +976,9 @@ int proxy_run_rcontext(mcp_rcontext_t *rctx) {
                 // Even if we're in WAITHANDLE, we want to dispatch any queued
                 // requests, so we still need to iterate the full set of qslots.
                 _proxy_run_rcontext_queues(rctx);
+                break;
+            case MCP_YIELD_SLEEP:
+                // Pause coroutine and do nothing. Alarm will resume.
                 break;
             default:
                 abort();
@@ -1116,6 +1185,7 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     mcp_set_request(&pr, rctx->request, command, cmdlen);
     rctx->request->ascii_multiget = multiget;
     rctx->c = c;
+    rctx->conn_fd = c->sfd;
     rctx->pending_reqs++; // seed counter with the "main" request
     // remember the top level mc_resp, because further requests on the
     // same connection will replace c->resp.
@@ -1302,6 +1372,70 @@ void mcp_sharedvm_delta(proxy_ctx_t *ctx, int tidx, const char *name, int delta)
     }
 
     pthread_mutex_unlock(&ctx->sharedvm_lock);
+}
+
+void mcp_sharedvm_remove(proxy_ctx_t *ctx, int tidx, const char *name) {
+    lua_State *L = ctx->proxy_sharedvm;
+    pthread_mutex_lock(&ctx->sharedvm_lock);
+
+    lua_pushnil(L);
+    lua_setfield(L, tidx, name);
+
+    pthread_mutex_unlock(&ctx->sharedvm_lock);
+}
+
+// Global object support code.
+// Global objects are created in the configuration VM, and referenced in
+// worker VMs via proxy objects that refer back to memory in the
+// configuration VM.
+// We manage reference counts: once all remote proxy objects are collected, we
+// signal the config thread to remove a final reference and collect garbage to
+// remove the global object.
+
+static void mcp_gobj_enqueue(proxy_ctx_t *ctx, struct mcp_globalobj_s *g) {
+    pthread_mutex_lock(&ctx->manager_lock);
+    STAILQ_INSERT_TAIL(&ctx->manager_head, g, next);
+    pthread_cond_signal(&ctx->manager_cond);
+    pthread_mutex_unlock(&ctx->manager_lock);
+}
+
+// References the object, initializing the self-reference if necessary.
+// Call from config thread, with global object on top of stack.
+void mcp_gobj_ref(lua_State *L, struct mcp_globalobj_s *g) {
+    pthread_mutex_lock(&g->lock);
+    if (g->self_ref == 0) {
+        // Initialization requires a small dance:
+        // - store a negative of our ref, increase refcount an extra time
+        // - then link and signal the manager thread as though we were GC'ing
+        // the object.
+        // - the manager thread will later acknowledge the initialization of
+        // this global object and negate the self_ref again
+        // - this prevents an unused proxy object from causing the global
+        // object to be reaped early while we are still copying it to worker
+        // threads, as the manager thread will block waiting for the config
+        // thread to finish its reload work.
+        g->self_ref = -luaL_ref(L, LUA_REGISTRYINDEX);
+        g->refcount++;
+        proxy_ctx_t *ctx = PROXY_GET_CTX(L);
+        mcp_gobj_enqueue(ctx, g);
+    } else {
+        lua_pop(L, 1); // drop the reference we didn't end up using.
+    }
+    g->refcount++;
+    pthread_mutex_unlock(&g->lock);
+}
+
+void mcp_gobj_unref(proxy_ctx_t *ctx, struct mcp_globalobj_s *g) {
+    pthread_mutex_lock(&g->lock);
+    g->refcount--;
+    if (g->refcount == 0) {
+        mcp_gobj_enqueue(ctx, g);
+    }
+    pthread_mutex_unlock(&g->lock);
+}
+
+void mcp_gobj_finalize(struct mcp_globalobj_s *g) {
+    pthread_mutex_destroy(&g->lock);
 }
 
 static void *mcp_profile_alloc(void *ud, void *ptr, size_t osize,

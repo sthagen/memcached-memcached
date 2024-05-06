@@ -1596,7 +1596,7 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
  *
  * Returns the state of storage.
  */
-enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const uint32_t hv, int *nbytes, uint64_t *cas, bool cas_stale) {
+enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const uint32_t hv, int *nbytes, uint64_t *cas, uint64_t cas_in, bool cas_stale) {
     char *key = ITEM_key(it);
     item *old_it = do_item_get(key, it->nkey, hv, t, DONT_UPDATE);
     enum store_item_type stored = NOT_STORED;
@@ -1712,7 +1712,7 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
 
         if (do_store) {
             STORAGE_delete(t->storage, old_it);
-            item_replace(old_it, it, hv);
+            item_replace(old_it, it, hv, cas_in);
             stored = STORED;
         }
 
@@ -1750,7 +1750,7 @@ enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const
         }
 
         if (do_store) {
-            do_item_link(it, hv);
+            do_item_link(it, hv, cas_in);
             stored = STORED;
         }
     }
@@ -1796,7 +1796,7 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
 }
 
 /* return server specific stats only */
-void server_stats(ADD_STAT add_stats, conn *c) {
+void server_stats(ADD_STAT add_stats, void *c) {
     pid_t pid = getpid();
     rel_time_t now = current_time;
 
@@ -1861,7 +1861,7 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("get_expired", "%llu", (unsigned long long)thread_stats.get_expired);
     APPEND_STAT("get_flushed", "%llu", (unsigned long long)thread_stats.get_flushed);
 #ifdef EXTSTORE
-    if (c->thread->storage) {
+    if (ext_storage) {
         APPEND_STAT("get_extstore", "%llu", (unsigned long long)thread_stats.get_extstore);
         APPEND_STAT("get_aborted_extstore", "%llu", (unsigned long long)thread_stats.get_aborted_extstore);
         APPEND_STAT("get_oom_extstore", "%llu", (unsigned long long)thread_stats.get_oom_extstore);
@@ -2184,6 +2184,16 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
     }
 }
 
+static char *conn_queue_to_str(const conn *c, io_queue_t *q) {
+    if (q->type == IO_QUEUE_EXTSTORE) {
+        return "queue_extstore";
+    } else if (q->type == IO_QUEUE_PROXY) {
+        return "queue_proxy";
+    } else {
+        return "queue_unknown";
+    }
+}
+
 void process_stats_conns(ADD_STAT add_stats, void *c) {
     int i;
     char key_str[STAT_KEY_LEN];
@@ -2208,17 +2218,27 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
                 APPEND_NUM_STAT(i, "UDP", "%s", "UDP");
             }
             if (conns[i]->state != conn_closed) {
-                conn_to_str(conns[i], addr, svr_addr);
+                conn *sc = conns[i];
+                conn_to_str(sc, addr, svr_addr);
 
                 APPEND_NUM_STAT(i, "addr", "%s", addr);
-                if (conns[i]->state != conn_listening &&
-                    !(IS_UDP(conns[i]->transport) && conns[i]->state == conn_read)) {
+                if (sc->state != conn_listening &&
+                    !(IS_UDP(sc->transport) && sc->state == conn_read)) {
                     APPEND_NUM_STAT(i, "listen_addr", "%s", svr_addr);
                 }
                 APPEND_NUM_STAT(i, "state", "%s",
-                        state_text(conns[i]->state));
+                        state_text(sc->state));
+                if (sc->io_queues_submitted) {
+                    APPEND_NUM_STAT(i, "queues_waiting", "%d", sc->io_queues_submitted);
+                    for (io_queue_t *q = sc->io_queues; q->type != IO_QUEUE_NONE; q++) {
+                        if (q->count) {
+                            const char *qname = conn_queue_to_str(sc, q);
+                            APPEND_NUM_STAT(i, qname, "%d", q->count);
+                        }
+                    }
+                }
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
-                        current_time - conns[i]->last_cmd_time);
+                        current_time - sc->last_cmd_time);
             }
         }
     }
@@ -2357,7 +2377,7 @@ enum delta_result_type do_add_delta(LIBEVENT_THREAD *t, const char *key, const s
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it, hv);
+        item_replace(it, new_it, hv, (settings.use_cas) ? get_cas_id() : 0);
         // Overwrite the older item's CAS with our new CAS since we're
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);

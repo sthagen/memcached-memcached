@@ -88,6 +88,10 @@ struct mcp_memprofile {
     uint64_t alloc_bytes[8];
 };
 
+// for various time conversion functions
+#define NANOSECONDS(x) ((x) * 1E9 + 0.5)
+#define MICROSECONDS(x) ((x) * 1E6 + 0.5)
+
 // Note: value created from thin air. Could be shorter.
 #define MCP_REQUEST_MAXLEN KEY_MAX_LENGTH * 2
 
@@ -101,9 +105,11 @@ struct mcp_memprofile {
 #define MCP_YIELD_INTERNAL 3
 #define MCP_YIELD_WAITCOND 4
 #define MCP_YIELD_WAITHANDLE 5
+#define MCP_YIELD_SLEEP 6
 
 #define SHAREDVM_FGEN_IDX 1
 #define SHAREDVM_FGENSLOT_IDX 2
+#define SHAREDVM_BACKEND_IDX 3
 
 // all possible commands.
 #define CMD_FIELDS \
@@ -191,6 +197,8 @@ struct proxy_user_stats {
 struct proxy_global_stats {
     uint64_t config_reloads;
     uint64_t config_reload_fails;
+    uint64_t config_cron_runs;
+    uint64_t config_cron_fails;
     uint64_t backend_total;
     uint64_t backend_disconn; // backends with no connections
     uint64_t backend_requests; // reqs sent to backends
@@ -232,6 +240,9 @@ typedef struct {
     pthread_cond_t manager_cond;
     pthread_mutex_t sharedvm_lock; // protect statevm above
     globalobj_head_t manager_head; // stack for pool deallocation.
+    int config_generation; // counter tracking config reloads
+    int cron_ref; // reference to lua cron table
+    int cron_next; // next cron to sleep to / execute
     bool worker_done; // signal variable for the worker lock/cond system.
     bool worker_failed; // covered by worker_lock as well.
     bool use_uring; // use IO_URING for backend connections.
@@ -287,6 +298,7 @@ enum mcp_backend_states {
     mcp_backend_next_close, // complete current request, then close socket
 };
 
+typedef struct mcp_cron_s mcp_cron_t;
 typedef struct mcp_backend_wrap_s mcp_backend_wrap_t;
 typedef struct mcp_backend_label_s mcp_backend_label_t;
 typedef struct mcp_backend_s mcp_backend_t;
@@ -330,6 +342,13 @@ struct mcp_request_s {
     mcp_parser_t pr; // non-lua-specific parser handling.
     bool ascii_multiget; // ascii multiget mode. (hide errors/END)
     char request[];
+};
+
+struct mcp_cron_s {
+    uint32_t gen;
+    uint32_t next;
+    uint32_t every;
+    bool repeat;
 };
 
 typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
@@ -556,6 +575,11 @@ typedef struct {
 // utils
 bool proxy_bufmem_checkadd(LIBEVENT_THREAD *t, int len);
 void mcp_sharedvm_delta(proxy_ctx_t *ctx, int tidx, const char *name, int delta);
+void mcp_sharedvm_remove(proxy_ctx_t *ctx, int tidx, const char *name);
+
+void mcp_gobj_ref(lua_State *L, struct mcp_globalobj_s *g);
+void mcp_gobj_unref(proxy_ctx_t *ctx, struct mcp_globalobj_s *g);
+void mcp_gobj_finalize(struct mcp_globalobj_s *g);
 
 // networking interface
 void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct event_base *base);
@@ -612,7 +636,8 @@ enum mcp_rqueue_e {
     QWAIT_OK,
     QWAIT_GOOD,
     QWAIT_FASTGOOD,
-    QWAIT_HANDLE
+    QWAIT_HANDLE,
+    QWAIT_SLEEP,
 };
 
 enum mcp_funcgen_router_e {
@@ -703,7 +728,9 @@ struct mcp_rcontext_s {
     unsigned int wait_done; // TODO: change these variables to uint8's
     int wait_handle; // waiting on a specific queue slot
     int parent_handle; // queue slot in parent rctx
+    int conn_fd; // fd of the originating client, as *c can become invalid
     enum mcp_rqueue_e wait_mode;
+    uint8_t lua_narg; // number of responses to push when yield resuming.
     bool first_queue; // HACK
     lua_State *Lc; // coroutine thread pointer.
     mcp_request_t *request; // ptr to the above reference.
@@ -711,6 +738,7 @@ struct mcp_rcontext_s {
     conn *c; // associated client object.
     mc_resp *resp; // top level response object to fill.
     mcp_funcgen_t *fgen; // parent function generator context.
+    struct event timeout_event; // for *_wait_timeout() and sleep() calls
     struct mcp_rqueue_s qslots[]; // queueable slots.
 };
 
@@ -726,6 +754,8 @@ int mcplib_rcontext_res_good(lua_State *L);
 int mcplib_rcontext_res_any(lua_State *L);
 int mcplib_rcontext_res_ok(lua_State *L);
 int mcplib_rcontext_result(lua_State *L);
+int mcplib_rcontext_cfd(lua_State *L);
+int mcplib_rcontext_sleep(lua_State *L);
 int mcplib_funcgenbare_new(lua_State *L);
 int mcplib_funcgen_new(lua_State *L);
 int mcplib_funcgen_new_handle(lua_State *L);

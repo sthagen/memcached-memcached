@@ -91,14 +91,12 @@ static int _proxy_beconn_checkconnect(struct mcp_backendconn_s *be) {
         _reset_bad_backend(be, P_BE_FAIL_CONNECTING);
         return -1;
     }
-    P_DEBUG("%s: backend connected (%s:%s)\n", __func__, be->be_parent->name, be->be_parent->port);
+    P_DEBUG("%s: backend connected [fd: %d] (%s:%s)\n", __func__, mcmc_fd(be->client), be->be_parent->name, be->be_parent->port);
     be->connecting = false;
     be->state = mcp_backend_read;
-    be->bad = false;
+
     // seed the failure time for the flap check.
     gettimeofday(&be->last_failed, NULL);
-    be->depth = 0; // was set to INT_MAX if bad, need to reset.
-    be->failed_count = 0;
 
     be->validating = true;
     // TODO: make validation optional.
@@ -127,12 +125,16 @@ struct mcp_backendconn_s *proxy_choose_beconn(mcp_backend_t *be) {
         // else under low loads only the first conn will ever get used (which
         // is normally good; but sometimes bad if using stateful firewalls)
         for (int x = 0; x < be->conncount; x++) {
-            if (be->be[x].depth == 0) {
-                bec = &be->be[x];
+            struct mcp_backendconn_s *bec_i = &be->be[x];
+            if (bec_i->bad) {
+                continue;
+            }
+            if (bec_i->depth == 0) {
+                bec = bec_i;
                 break;
-            } else if (be->be[x].depth < depth) {
-                depth = bec->depth;
-                bec = &be->be[x];
+            } else if (bec_i->depth < depth) {
+                depth = bec_i->depth;
+                bec = bec_i;
             }
         }
     }
@@ -167,6 +169,7 @@ static void _proxy_event_handler_dequeue(proxy_event_thread_t *t) {
 
         mcp_backend_t *be = io->backend;
         STAILQ_INSERT_TAIL(&be->io_head, io, io_next);
+        assert(be->depth > -1);
         be->depth++;
         if (!be->stacked) {
             be->stacked = true;
@@ -197,6 +200,11 @@ static void _cleanup_backend(mcp_backend_t *be) {
             assert(STAILQ_EMPTY(&bec->io_head));
 
             mcmc_disconnect(bec->client);
+
+            if (bec->bad) {
+                mcp_sharedvm_delta(bec->event_thread->ctx, SHAREDVM_BACKEND_IDX,
+                    bec->be_parent->label, -1);
+            }
         }
         // - free be->client
         free(bec->client);
@@ -214,7 +222,6 @@ static void _setup_backend(mcp_backend_t *be) {
             // backend is "forced" into a bad state. never connect or
             // otherwise attempt to use it.
             be->be[x].bad = true;
-            be->be[x].depth = UINT_MAX / 2;
             continue;
         }
         // assign the initial events to the backend, so we don't have to
@@ -305,6 +312,7 @@ void proxy_run_backend_queue(be_head_t *head) {
                 io->client_resp->status = MCMC_ERR;
                 io->client_resp->resp.code = MCMC_CODE_SERVER_ERROR;
                 bec->depth--;
+                assert(bec->depth > -1);
                 return_io_pending((io_pending_t *)io);
             }
         } else if (bec->connecting || bec->validating) {
@@ -429,7 +437,9 @@ static void _drive_machine_next(struct mcp_backendconn_s *be, io_pending_proxy_t
     // set the head here. when we break the head will be correct.
     STAILQ_REMOVE_HEAD(&be->io_head, io_next);
     be->depth--;
+    assert(be->depth > -1);
     be->pending_read--;
+    assert(be->pending_read > -1);
 
     // stamp the elapsed time into the response object.
     gettimeofday(&end, NULL);
@@ -773,10 +783,11 @@ static void _backend_reschedule(struct mcp_backendconn_s *be) {
         if (!be->bad) {
             P_DEBUG("%s: marking backend as bad\n", __func__);
             STAT_INCR(be->event_thread->ctx, backend_marked_bad, 1);
+            mcp_sharedvm_delta(be->event_thread->ctx, SHAREDVM_BACKEND_IDX,
+                    be->be_parent->label, 1);
             LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_BE_ERROR, NULL, badtext, be->be_parent->name, be->be_parent->port, be->be_parent->label, 0, NULL, 0, retry_time);
         }
         be->bad = true;
-        be->depth = INT_MAX/2; // fast-path cache for "bad" marker
        _set_main_event(be, be->event_thread->base, EV_TIMEOUT, &tmp_time, proxy_backend_retry_handler);
     } else {
         struct timeval tmp_time = be->tunables.connect;
@@ -836,7 +847,7 @@ static void _backend_flap_check(struct mcp_backendconn_s *be, enum proxy_be_fail
 // _must_ be called from within the event thread.
 static void _reset_bad_backend(struct mcp_backendconn_s *be, enum proxy_be_failures err) {
     io_pending_proxy_t *io = NULL;
-    P_DEBUG("%s: resetting bad backend: %s\n", __func__, proxy_be_failure_text[err]);
+    P_DEBUG("%s: resetting bad backend: [fd: %d] %s\n", __func__, mcmc_fd(be->client), proxy_be_failure_text[err]);
     // Can't use STAILQ_FOREACH() since return_io_pending() free's the current
     // io. STAILQ_FOREACH_SAFE maybe?
     int depth = be->depth;
@@ -848,6 +859,7 @@ static void _reset_bad_backend(struct mcp_backendconn_s *be, enum proxy_be_failu
         io->client_resp->status = MCMC_ERR;
         io->client_resp->resp.code = MCMC_CODE_SERVER_ERROR;
         be->depth--;
+        assert(be->depth > -1);
         return_io_pending((io_pending_t *)io);
     }
 
@@ -945,8 +957,18 @@ static void _post_pending_write(struct mcp_backendconn_s *be, ssize_t sent) {
     } // for
 
     // resume the flush from this point.
-    if (io != NULL && !io->flushed) {
-        be->io_next = io;
+    if (io != NULL) {
+        if (!io->flushed) {
+            be->io_next = io;
+        } else {
+            // Check for incomplete list because we hit the iovcnt limit.
+            io_pending_proxy_t *nio = STAILQ_NEXT(io, io_next);
+            if (nio != NULL && !nio->flushed) {
+                be->io_next = io;
+            } else {
+                be->io_next = NULL;
+            }
+        }
     } else {
         be->io_next = NULL;
     }
@@ -989,7 +1011,7 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
     struct timeval tmp_time = be->tunables.read;
 
     if (which & EV_TIMEOUT) {
-        P_DEBUG("%s: backend timed out while connecting\n", __func__);
+        P_DEBUG("%s: backend timed out while connecting [fd: %d]\n", __func__, mcmc_fd(be->client));
         if (be->connecting) {
             _reset_bad_backend(be, P_BE_FAIL_CONNTIMEOUT);
         } else {
@@ -1079,6 +1101,18 @@ static void proxy_beconn_handler(const int fd, const short which, void *arg) {
     // switch to the primary persistent read event.
     if (!be->validating) {
         _set_main_event(be, be->event_thread->base, EV_READ|EV_PERSIST, NULL, proxy_backend_handler);
+
+        // we're happily validated and switching to normal processing, so
+        // _now_ the backend is no longer "bad".
+        // If we reset the failed count earlier we then can fail the
+        // validation loop indefinitely without ever being marked bad.
+        if (be->bad) {
+            // was bad, need to mark as no longer bad in shared space.
+            mcp_sharedvm_delta(be->event_thread->ctx, SHAREDVM_BACKEND_IDX,
+                    be->be_parent->label, -1);
+        }
+        be->bad = false;
+        be->failed_count = 0;
     }
 }
 

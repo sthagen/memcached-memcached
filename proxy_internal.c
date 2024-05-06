@@ -395,7 +395,7 @@ static void process_update_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *re
         return;
     }
 
-    int ret = store_item(it, comm, t, NULL, NULL, CAS_NO_STALE);
+    int ret = store_item(it, comm, t, NULL, NULL, (settings.use_cas) ? get_cas_id() : 0, CAS_NO_STALE);
     switch (ret) {
     case STORED:
       pout_string(resp, "STORED");
@@ -586,14 +586,17 @@ struct _meta_flags {
     unsigned int set_stale :1;
     unsigned int no_reply :1;
     unsigned int has_cas :1;
+    unsigned int has_cas_in :1;
     unsigned int new_ttl :1;
     unsigned int key_binary:1;
+    unsigned int remove_val:1;
     char mode; // single character mode switch, common to ms/ma
     rel_time_t exptime;
     rel_time_t autoviv_exptime;
     rel_time_t recache_time;
     client_flags_t client_flags;
     uint64_t req_cas_id;
+    uint64_t cas_id_in; // client supplied next-CAS
     uint64_t delta; // ma
     uint64_t initial; // ma
 };
@@ -687,6 +690,9 @@ static int _meta_flag_preparse(mcp_parser_t *pr, const size_t start,
             case 'q':
                 of->no_reply = 1;
                 break;
+            case 'x':
+                of->remove_val = 1;
+                break;
             // mset-related.
             case 'F':
                 if (!safe_strtoflags(&pr->request[pr->tokens[i]+1], &of->client_flags)) {
@@ -699,6 +705,14 @@ static int _meta_flag_preparse(mcp_parser_t *pr, const size_t start,
                     of->has_error = true;
                 } else {
                     of->has_cas = true;
+                }
+                break;
+            case 'E': // ms, md, ma
+                if (!safe_strtoull(&pr->request[pr->tokens[i]+1], &of->cas_id_in)) {
+                    *errstr = "CLIENT_ERROR bad token in command line format";
+                    of->has_error = true;
+                } else {
+                    of->has_cas_in = true;
                 }
                 break;
             case 'M': // mset and marithmetic mode switch
@@ -796,7 +810,7 @@ static void process_mget_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp
             // I look forward to the day I get rid of this :)
             memcpy(ITEM_data(it), "\r\n", 2);
             // NOTE: This initializes the CAS value.
-            do_item_link(it, hv);
+            do_item_link(it, hv, of.has_cas_in ? of.cas_id_in : get_cas_id());
             item_created = true;
         }
     }
@@ -1173,7 +1187,7 @@ static void process_mset_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *resp
 
     uint64_t cas = 0;
     int nbytes = 0;
-    int ret = store_item(it, comm, t, &nbytes, &cas, set_stale);
+    int ret = store_item(it, comm, t, &nbytes, &cas, of.has_cas_in ? of.cas_id_in : get_cas_id(), set_stale);
     switch (ret) {
         case STORED:
           memcpy(p, "HD", 2);
@@ -1313,6 +1327,26 @@ static void process_mdelete_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *r
             goto cleanup;
         }
 
+        // If requested, create a new empty tombstone item.
+        if (of.remove_val) {
+            item *new_it = item_alloc(key, nkey, of.client_flags, of.exptime, 2);
+            if (new_it != NULL) {
+                memcpy(ITEM_data(new_it), "\r\n", 2);
+                if (do_store_item(new_it, NREAD_SET, t, hv, NULL, NULL,
+                            of.has_cas_in ? of.cas_id_in : ITEM_get_cas(it), CAS_NO_STALE)) {
+                    do_item_remove(it);
+                    it = new_it;
+                } else {
+                    do_item_remove(new_it);
+                    memcpy(resp->wbuf, "NS", 2);
+                    goto cleanup;
+                }
+            } else {
+                errstr = "SERVER_ERROR out of memory";
+                goto error;
+            }
+        }
+
         // If we're to set this item as stale, we don't actually want to
         // delete it. We mark the stale bit, bump CAS, and update exptime if
         // we were supplied a new TTL.
@@ -1324,19 +1358,19 @@ static void process_mdelete_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_resp *r
             // Also need to remove TOKEN_SENT, so next client can win.
             it->it_flags &= ~ITEM_TOKEN_SENT;
 
-            ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-
-            // Clients can noreply nominal responses.
+            ITEM_set_cas(it, of.has_cas_in ? of.cas_id_in : get_cas_id());
             if (of.no_reply)
                 resp->skip = true;
+
             memcpy(resp->wbuf, "HD", 2);
         } else {
             pthread_mutex_lock(&t->stats.mutex);
             t->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
             pthread_mutex_unlock(&t->stats.mutex);
-
-            do_item_unlink(it, hv);
-            STORAGE_delete(t->storage, it);
+            if (!of.remove_val) {
+                do_item_unlink(it, hv);
+                STORAGE_delete(t->storage, it);
+            }
             if (of.no_reply)
                 resp->skip = true;
             memcpy(resp->wbuf, "HD", 2);
@@ -1363,6 +1397,11 @@ cleanup:
     //conn_set_state(c, conn_new_cmd);
     return;
 error:
+    // cleanup if an error happens after we fetched an item.
+    if (it) {
+        do_item_remove(it);
+        item_unlock(hv);
+    }
     pout_errstring(resp, errstr);
 }
 
@@ -1440,6 +1479,11 @@ static void process_marithmetic_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_res
         //if (c->noreply)
         //    resp->skip = true;
         // *it was filled, set the status below.
+        if (of.has_cas_in) {
+            // override the CAS. slightly inefficient but fixing that can wait
+            // until the next time do_add_delta is changed.
+            ITEM_set_cas(it, of.cas_id_in);
+        }
         cas = ITEM_get_cas(it);
         break;
     case NON_NUMERIC:
@@ -1459,7 +1503,8 @@ static void process_marithmetic_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_res
             if (it != NULL) {
                 memcpy(ITEM_data(it), tmpbuf, vlen);
                 memcpy(ITEM_data(it) + vlen, "\r\n", 2);
-                if (do_store_item(it, NREAD_ADD, t, hv, NULL, &cas, CAS_NO_STALE)) {
+                if (do_store_item(it, NREAD_ADD, t, hv, NULL, &cas,
+                            of.has_cas_in ? of.cas_id_in : get_cas_id(), CAS_NO_STALE)) {
                     item_created = true;
                 } else {
                     // Not sure how we can get here if we're holding the lock.
@@ -1704,7 +1749,7 @@ int mcplib_internal_run(mcp_rcontext_t *rctx) {
     // resp object is associated with the
     // response object, which is about a
     // kilobyte.
-    lua_gc(rctx->Lc, LUA_GCSTEP, 1);
+    t->proxy_vm_extra_kb++;
 
     if (resp->io_pending) {
         // TODO (v2): here we move the IO from the temporary resp to the top

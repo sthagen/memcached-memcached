@@ -74,7 +74,7 @@ void storage_delete(void *e, item *it) {
 // but feels a little off being defined here.
 // At very least maybe "process_storage_stats" in line with making this more
 // of a generic wrapper module.
-void process_extstore_stats(ADD_STAT add_stats, conn *c) {
+void process_extstore_stats(ADD_STAT add_stats, void *c) {
     int i;
     char key_str[STAT_KEY_LEN];
     char val_str[STAT_VAL_LEN];
@@ -83,7 +83,7 @@ void process_extstore_stats(ADD_STAT add_stats, conn *c) {
 
     assert(add_stats);
 
-    void *storage = c->thread->storage;
+    void *storage = ext_storage;
     if (storage == NULL) {
         return;
     }
@@ -106,9 +106,9 @@ void process_extstore_stats(ADD_STAT add_stats, conn *c) {
 }
 
 // Additional storage stats for the main stats output.
-void storage_stats(ADD_STAT add_stats, conn *c) {
+void storage_stats(ADD_STAT add_stats, void *c) {
     struct extstore_stats st;
-    if (c->thread->storage) {
+    if (ext_storage) {
         STATS_LOCK();
         APPEND_STAT("extstore_compact_lost", "%llu", (unsigned long long)stats.extstore_compact_lost);
         APPEND_STAT("extstore_compact_rescues", "%llu", (unsigned long long)stats.extstore_compact_rescues);
@@ -116,7 +116,7 @@ void storage_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("extstore_compact_resc_old", "%llu", (unsigned long long)stats.extstore_compact_resc_old);
         APPEND_STAT("extstore_compact_skipped", "%llu", (unsigned long long)stats.extstore_compact_skipped);
         STATS_UNLOCK();
-        extstore_get_stats(c->thread->storage, &st);
+        extstore_get_stats(ext_storage, &st);
         APPEND_STAT("extstore_page_allocs", "%llu", (unsigned long long)st.page_allocs);
         APPEND_STAT("extstore_page_evictions", "%llu", (unsigned long long)st.page_evictions);
         APPEND_STAT("extstore_page_reclaims", "%llu", (unsigned long long)st.page_reclaims);
@@ -443,8 +443,7 @@ static void recache_or_free(io_pending_t *pending) {
                 it->refcount = 0;
                 it->h_next = NULL; // might not be necessary.
                 STORAGE_delete(c->thread->storage, h_it);
-                item_replace(h_it, it, hv);
-                ITEM_set_cas(it, ITEM_get_cas(h_it));
+                item_replace(h_it, it, hv, ITEM_get_cas(h_it));
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.recache_from_extstore++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
@@ -570,8 +569,7 @@ static int storage_write(void *storage, const int clsid, const int item_age) {
                  * header and replace. Most of this requires the item lock
                  */
                 /* CAS gets set while linking. Copy post-replace */
-                item_replace(it, hdr_it, it_info.hv);
-                ITEM_set_cas(hdr_it, ITEM_get_cas(it));
+                item_replace(it, hdr_it, it_info.hv, ITEM_get_cas(it));
                 do_item_remove(hdr_it);
                 did_moves = 1;
                 LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EXTSTORE_WRITE, it, bucket);
@@ -997,8 +995,7 @@ static void storage_compact_readback(void *storage, logger *l,
                             new_hdr->offset = io.offset;
 
                             // replace the item in the hash table.
-                            item_replace(hdr_it, new_it, hv);
-                            ITEM_set_cas(new_it, (settings.use_cas) ? ITEM_get_cas(hdr_it) : 0);
+                            item_replace(hdr_it, new_it, hv, ITEM_get_cas(hdr_it));
                             do_item_remove(new_it); // release our reference.
                             rescued = true;
                         } else {
@@ -1241,7 +1238,7 @@ struct extstore_conf_file *storage_conf_parse(char *arg, unsigned int page_size)
     }
 
     // final token would be a default free bucket
-    p = strtok_r(NULL, ",", &b);
+    p = strtok_r(NULL, ":", &b);
     // TODO: We reuse the original DEFINES for now,
     // but if lowttl gets split up this needs to be its own set.
     if (p != NULL) {
