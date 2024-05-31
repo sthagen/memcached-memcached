@@ -48,10 +48,14 @@ static inline void _proxy_advance_lastkb(lua_State *L, LIBEVENT_THREAD *t) {
 // processing network events.
 void proxy_gc_poke(LIBEVENT_THREAD *t) {
     lua_State *L = t->L;
+    struct proxy_int_stats *is = t->proxy_int_stats;
     int vm_kb = lua_gc(L, LUA_GCCOUNT) + t->proxy_vm_extra_kb;
     if (t->proxy_vm_last_kb == 0) {
         t->proxy_vm_last_kb = vm_kb;
     }
+    WSTAT_L(t);
+    is->vm_memory_kb = vm_kb;
+    WSTAT_UL(t);
 
     // equivalent of luagc "pause" value
     int last = t->proxy_vm_last_kb;
@@ -86,6 +90,9 @@ void proxy_gc_poke(LIBEVENT_THREAD *t) {
             _proxy_advance_lastkb(L, t);
             t->proxy_vm_extra_kb = 0;
             t->proxy_vm_gcrunning = 0;
+            WSTAT_L(t);
+            is->vm_gc_runs++;
+            WSTAT_UL(t);
             //fprintf(stderr, "PROXYGC: proxy_gc_poke COMPLETE [cur: %d next: %d]\n", lua_gc(L, LUA_GCCOUNT), t->proxy_vm_last_kb);
         }
 
@@ -157,6 +164,7 @@ void proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     APPEND_STAT("proxy_backend_total", "%llu", (unsigned long long)ctx->global_stats.backend_total);
     APPEND_STAT("proxy_backend_marked_bad", "%llu", (unsigned long long)ctx->global_stats.backend_marked_bad);
     APPEND_STAT("proxy_backend_failed", "%llu", (unsigned long long)ctx->global_stats.backend_failed);
+    APPEND_STAT("proxy_request_failed_depth", "%llu", (unsigned long long)ctx->global_stats.request_failed_depth);
     STAT_UL(ctx);
 }
 
@@ -190,6 +198,8 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
         for (int i = 0; i < CMD_FINAL; i++) {
             istats.counters[i] += is->counters[i];
         }
+        istats.vm_gc_runs += is->vm_gc_runs;
+        istats.vm_memory_kb += is->vm_memory_kb;
         if (tus && tus->num_stats >= us->num_stats) {
             for (int i = 0; i < us->num_stats; i++) {
                 counters[i] += tus->counters[i];
@@ -226,6 +236,8 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     APPEND_STAT("active_req_limit", "%llu", (unsigned long long)req_limit);
     APPEND_STAT("buffer_memory_limit", "%llu", (unsigned long long)buffer_memory_limit);
     APPEND_STAT("buffer_memory_used", "%llu", (unsigned long long)buffer_memory_used);
+    APPEND_STAT("vm_gc_runs", "%llu", (unsigned long long)istats.vm_gc_runs);
+    APPEND_STAT("vm_memory_kb", "%llu", (unsigned long long)istats.vm_memory_kb);
     APPEND_STAT("cmd_mg", "%llu", (unsigned long long)istats.counters[CMD_MG]);
     APPEND_STAT("cmd_ms", "%llu", (unsigned long long)istats.counters[CMD_MS]);
     APPEND_STAT("cmd_md", "%llu", (unsigned long long)istats.counters[CMD_MD]);
@@ -340,8 +352,10 @@ void *proxy_init(bool use_uring, bool proxy_memprofile) {
     ctx->tunables.read.tv_sec = 3;
     ctx->tunables.flap_backoff_ramp = 1.5;
     ctx->tunables.flap_backoff_max = 3600;
+    ctx->tunables.backend_depth_limit = 0;
     ctx->tunables.max_ustats = MAX_USTATS_DEFAULT;
     ctx->tunables.use_iothread = false;
+    ctx->tunables.use_tls = false;
 
     STAILQ_INIT(&ctx->manager_head);
     lua_State *L = NULL;
@@ -828,6 +842,7 @@ static void _proxy_run_tresp_to_resp(mc_resp *tresp, mc_resp *resp) {
     resp->request_addr = tresp->request_addr;
     resp->request_addr_size = tresp->request_addr_size;
     resp->item = tresp->item; // will be populated if not extstore fetch
+    tresp->item = NULL; // move ownership of the item to resp from tresp
     resp->skip = tresp->skip;
 }
 

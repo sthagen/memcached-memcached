@@ -185,6 +185,8 @@ void *proxy_event_thread_ur(void *arg);
 // Note: This ends up wasting a few counters, but simplifies the rest of the
 // process for handling internal worker stats.
 struct proxy_int_stats {
+    uint64_t vm_gc_runs;
+    uint64_t vm_memory_kb;
     uint64_t counters[CMD_FINAL];
 };
 
@@ -200,12 +202,9 @@ struct proxy_global_stats {
     uint64_t config_cron_runs;
     uint64_t config_cron_fails;
     uint64_t backend_total;
-    uint64_t backend_disconn; // backends with no connections
-    uint64_t backend_requests; // reqs sent to backends
-    uint64_t backend_responses; // responses received from backends
-    uint64_t backend_errors; // errors from backends
     uint64_t backend_marked_bad; // backend set to autofail
     uint64_t backend_failed; // an error caused a backend reset
+    uint64_t request_failed_depth; // requests fast-failed due to be depth
 };
 
 struct proxy_tunables {
@@ -215,10 +214,12 @@ struct proxy_tunables {
     struct timeval flap; // need to stay connected this long or it's flapping
     float flap_backoff_ramp; // factorial for retry time
     uint32_t flap_backoff_max; // don't backoff longer than this.
+    int backend_depth_limit; // requests fast fail once depth over this limit
     int backend_failure_limit;
     int max_ustats; // limit the ustats index.
     bool tcp_keepalive;
     bool use_iothread; // default for using the bg io thread.
+    bool use_tls; // whether or not be should use TLS
     bool down; // backend is forced into a down/bad state.
 };
 
@@ -230,6 +231,9 @@ typedef struct {
     proxy_event_thread_t *proxy_io_thread;
     uint64_t active_req_limit; // max total in-flight requests
     uint64_t buffer_memory_limit; // max bytes for send/receive buffers.
+#ifdef PROXY_TLS
+    void *tls_ctx;
+#endif
     pthread_mutex_t config_lock;
     pthread_cond_t config_cond;
     pthread_t config_tid;
@@ -358,7 +362,9 @@ typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
 // TODO (v2): IOV_MAX tends to be 1000+ which would allow for more batching but we
 // don't have a good temporary space and don't want to malloc/free on every
 // write. transmit() uses the stack but we can't do that for uring's use case.
-#if (IOV_MAX > 1024)
+#if MEMCACHED_DEBUG
+#define BE_IOV_MAX 128 // let bench tests trigger max condition easily
+#elif (IOV_MAX > 1024)
 #define BE_IOV_MAX 1024
 #else
 #define BE_IOV_MAX IOV_MAX
@@ -391,6 +397,9 @@ struct mcp_backendconn_s {
     int flap_count; // number of times we've "flapped" into bad state.
     proxy_event_thread_t *event_thread; // event thread owning this backend.
     void *client; // mcmc client
+#ifdef PROXY_TLS
+    void *ssl;
+#endif
     io_head_t io_head; // stack of requests.
     io_pending_proxy_t *io_next; // next request to write.
     char *rbuf; // statically allocated read buffer.
@@ -406,6 +415,9 @@ struct mcp_backendconn_s {
     bool validating; // in process of validating a new backend connection.
     bool can_write; // recently got a WANT_WRITE or are connecting.
     bool bad; // timed out, marked as bad.
+#ifndef PROXY_TLS
+    bool ssl;
+#endif
     struct iovec write_iovs[BE_IOV_MAX]; // iovs to stage batched writes
 };
 
@@ -441,6 +453,10 @@ struct proxy_event_thread_s {
     eventfd_t event_counter;
     eventfd_t beevent_counter;
     bool use_uring;
+#endif
+#ifdef PROXY_TLS
+    char *tls_wbuf;
+    size_t tls_wbuf_size;
 #endif
     pthread_mutex_t mutex; // covers stack.
     pthread_cond_t cond; // condition to wait on while stack drains.

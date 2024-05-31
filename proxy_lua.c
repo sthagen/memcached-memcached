@@ -1,6 +1,7 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 
 #include "proxy.h"
+#include "proxy_tls.h"
 #include "storage.h" // for stats call
 
 // func prototype example:
@@ -308,7 +309,6 @@ static int mcplib_response_line(lua_State *L) {
 }
 
 void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r) {
-
     // On error/similar we might be holding the read buffer.
     // If the buf is handed off to mc_resp for return, this pointer is NULL
     if (r->buf != NULL) {
@@ -324,6 +324,10 @@ void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r) {
     if (r->cresp != NULL) {
         mc_resp *cresp = r->cresp;
         assert(r->thread != NULL);
+        if (cresp->item) {
+            item_remove(cresp->item);
+            cresp->item = NULL;
+        }
         resp_free(r->thread, cresp);
         r->cresp = NULL;
     }
@@ -332,6 +336,17 @@ void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r) {
 static int mcplib_response_gc(lua_State *L) {
     LIBEVENT_THREAD *t = PROXY_GET_THR(L);
     mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+    mcp_response_cleanup(t, r);
+
+    return 0;
+}
+
+// Note that this can be called multiple times for a single object, as opposed
+// to _gc. The cleanup routine is armored against repeat accesses by NULL'ing
+// th efields it checks.
+static int mcplib_response_close(lua_State *L) {
+    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
+    mcp_resp_t *r = luaL_checkudata(L, 1, "mcp.response");
     mcp_response_cleanup(t, r);
 
     return 0;
@@ -438,14 +453,30 @@ static int mcplib_backend(lua_State *L) {
         }
         lua_pop(L, 1);
 
+        if (lua_getfield(L, 1, "tls") != LUA_TNIL) {
+            be->tunables.use_tls = lua_toboolean(L, -1);
+        }
+        lua_pop(L, 1);
+
         if (lua_getfield(L, 1, "failurelimit") != LUA_TNIL) {
             int limit = luaL_checkinteger(L, -1);
             if (limit < 0) {
-                proxy_lua_error(L, "failure_limit must be >= 0");
+                proxy_lua_error(L, "failurelimit must be >= 0");
                 return 0;
             }
 
             be->tunables.backend_failure_limit = limit;
+        }
+        lua_pop(L, 1);
+
+        if (lua_getfield(L, 1, "depthlimit") != LUA_TNIL) {
+            int limit = luaL_checkinteger(L, -1);
+            if (limit < 0) {
+                proxy_lua_error(L, "depthlimit must be >= 0");
+                return 0;
+            }
+
+            be->tunables.backend_depth_limit = limit;
         }
         lua_pop(L, 1);
 
@@ -657,6 +688,16 @@ static mcp_backend_wrap_t *_mcplib_make_backendconn(lua_State *L, mcp_backend_la
         }
         STAT_UL(ctx);
         bec->connect_flags = flags;
+
+        // FIXME: remove ifdef via an initialized checker? or
+        // mcp_tls_backend_init response code?
+#ifdef PROXY_TLS
+        if (be->tunables.use_tls && !ctx->tls_ctx) {
+            proxy_lua_error(L, "TLS requested but not initialized: call mcp.init_tls()");
+            return NULL;
+        }
+#endif
+        mcp_tls_backend_init(ctx, bec);
 
         bec->event_thread = e;
     }
@@ -1094,6 +1135,34 @@ static int mcplib_backend_use_iothread(lua_State *L) {
     return 0;
 }
 
+static int mcplib_backend_use_tls(lua_State *L) {
+    luaL_checktype(L, -1, LUA_TBOOLEAN);
+    int state = lua_toboolean(L, -1);
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
+#ifndef PROXY_TLS
+    if (state == 1) {
+        proxy_lua_error(L, "cannot set mcp.backend_use_tls: TLS support not compiled");
+    }
+#endif
+    STAT_L(ctx);
+    ctx->tunables.use_tls = state;
+    STAT_UL(ctx);
+
+    return 0;
+}
+
+// TODO: error checking.
+static int mcplib_init_tls(lua_State *L) {
+#ifndef PROXY_TLS
+    proxy_lua_error(L, "cannot run mcp.init_tls: TLS support not compiled");
+#else
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
+    mcp_tls_init(ctx);
+#endif
+
+    return 0;
+}
+
 static int mcplib_tcp_keepalive(lua_State *L) {
     luaL_checktype(L, -1, LUA_TBOOLEAN);
     int state = lua_toboolean(L, -1);
@@ -1117,6 +1186,22 @@ static int mcplib_backend_failure_limit(lua_State *L) {
 
     STAT_L(ctx);
     ctx->tunables.backend_failure_limit = limit;
+    STAT_UL(ctx);
+
+    return 0;
+}
+
+static int mcplib_backend_depth_limit(lua_State *L) {
+    int limit = luaL_checkinteger(L, -1);
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
+
+    if (limit < 0) {
+        proxy_lua_error(L, "backend_depth_limit must be >= 0");
+        return 0;
+    }
+
+    STAT_L(ctx);
+    ctx->tunables.backend_depth_limit = limit;
     STAT_UL(ctx);
 
     return 0;
@@ -1655,6 +1740,8 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"line", mcplib_response_line},
         {"elapsed", mcplib_response_elapsed},
         {"__gc", mcplib_response_gc},
+        {"__close", mcplib_response_close},
+        {"close", mcplib_response_close},
         {NULL, NULL}
     };
 
@@ -1718,10 +1805,13 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"backend_retry_waittime", mcplib_backend_retry_waittime},
         {"backend_read_timeout", mcplib_backend_read_timeout},
         {"backend_failure_limit", mcplib_backend_failure_limit},
+        {"backend_depth_limit", mcplib_backend_depth_limit},
         {"backend_flap_time", mcplib_backend_flap_time},
         {"backend_flap_backoff_ramp", mcplib_backend_flap_backoff_ramp},
         {"backend_flap_backoff_max", mcplib_backend_flap_backoff_max},
         {"backend_use_iothread", mcplib_backend_use_iothread},
+        {"backend_use_tls", mcplib_backend_use_tls},
+        {"init_tls", mcplib_init_tls},
         {"tcp_keepalive", mcplib_tcp_keepalive},
         {"active_req_limit", mcplib_active_req_limit},
         {"buffer_memory_limit", mcplib_buffer_memory_limit},
