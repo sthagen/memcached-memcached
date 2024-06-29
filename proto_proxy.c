@@ -184,8 +184,9 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     buffer_memory_limit = ctx->buffer_memory_limit;
 
     // prepare aggregated counters.
-    struct proxy_user_stats *us = &ctx->user_stats;
-    uint64_t counters[us->num_stats];
+    struct proxy_user_stats_entry *us = ctx->user_stats;
+    int stats_num = ctx->user_stats_num;
+    uint64_t counters[stats_num];
     memset(counters, 0, sizeof(counters));
 
     // TODO (v3): more globals to remove and/or change API method.
@@ -200,8 +201,8 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
         }
         istats.vm_gc_runs += is->vm_gc_runs;
         istats.vm_memory_kb += is->vm_memory_kb;
-        if (tus && tus->num_stats >= us->num_stats) {
-            for (int i = 0; i < us->num_stats; i++) {
+        if (tus && tus->num_stats >= stats_num) {
+            for (int i = 0; i < stats_num; i++) {
                 counters[i] += tus->counters[i];
             }
         }
@@ -212,10 +213,31 @@ void process_proxy_stats(void *arg, ADD_STAT add_stats, void *c) {
     }
 
     // return all of the user generated stats
-    for (int x = 0; x < us->num_stats; x++) {
-        if (us->names[x] && us->names[x][0]) {
-            snprintf(key_str, STAT_KEY_LEN-1, "user_%s", us->names[x]);
-            APPEND_STAT(key_str, "%llu", (unsigned long long)counters[x]);
+    if (ctx->user_stats_namebuf) {
+        char vbuf[INCR_MAX_STORAGE_LEN];
+        char *e = NULL; // ptr into vbuf
+        const char *pfx = "user_";
+        const size_t pfxlen = strlen(pfx);
+        for (int x = 0; x < stats_num; x++) {
+            if (us[x].cname) {
+                char *name = ctx->user_stats_namebuf + us[x].cname;
+                size_t nlen = strlen(name);
+                if (nlen > STAT_KEY_LEN-6) {
+                    // impossible, but for paranoia.
+                    nlen = STAT_KEY_LEN-6;
+                }
+                // avoiding an snprintf call for some performance ("user_%s")
+                memcpy(key_str, pfx, pfxlen);
+                memcpy(key_str+pfxlen, name, nlen);
+                key_str[pfxlen+nlen] = '\0';
+
+                // APPEND_STAT() calls another snprintf, which calls our
+                // add_stats argument. Lets skip yet another snprintf with
+                // some unrolling.
+                e = itoa_u64(counters[x], vbuf);
+                *(e+1) = '\0';
+                add_stats(key_str, pfxlen+nlen, vbuf, e-vbuf, c);
+            }
         }
     }
 
@@ -1310,6 +1332,14 @@ mcp_resp_t *mcp_prep_resobj(lua_State *L, mcp_request_t *rq, mcp_backend_t *be, 
     lua_setmetatable(L, -2);
 
     return r;
+}
+
+void mcp_resp_set_elapsed(mcp_resp_t *r) {
+    struct timeval end;
+    // stamp the elapsed time into the response object.
+    gettimeofday(&end, NULL);
+    r->elapsed = (end.tv_sec - r->start.tv_sec) * 1000000 +
+        (end.tv_usec - r->start.tv_usec);
 }
 
 // Used for any cases where we're queueing requests to the IO subsystem.

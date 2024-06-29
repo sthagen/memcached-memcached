@@ -191,9 +191,14 @@ struct proxy_int_stats {
 };
 
 struct proxy_user_stats {
-    size_t num_stats; // number of stats, for sizing various arrays
-    char **names; // not needed for worker threads
+    int num_stats; // number of stats, for sizing various arrays
     uint64_t *counters; // array of counters.
+};
+
+struct proxy_user_stats_entry {
+    char *name;
+    unsigned int cname; // offset into compact name buffer
+    bool reset; // counter must reset this cycle
 };
 
 struct proxy_global_stats {
@@ -226,14 +231,21 @@ struct proxy_tunables {
 typedef STAILQ_HEAD(globalobj_head_s, mcp_globalobj_s) globalobj_head_t;
 typedef struct {
     lua_State *proxy_state; // main configuration vm
-    lua_State *proxy_sharedvm; // sub VM for short-lock global events/data
-    void *proxy_code;
     proxy_event_thread_t *proxy_io_thread;
     uint64_t active_req_limit; // max total in-flight requests
     uint64_t buffer_memory_limit; // max bytes for send/receive buffers.
 #ifdef PROXY_TLS
     void *tls_ctx;
 #endif
+    int user_stats_num; // highest seen stat index
+    struct proxy_user_stats_entry *user_stats;
+    char *user_stats_namebuf; // compact linear buffer for stat names
+    struct proxy_tunables tunables; // NOTE: updates covered by stats_lock
+    struct proxy_global_stats global_stats;
+    // less frequently used entries down here.
+    void *proxy_code;
+    lua_State *proxy_sharedvm; // sub VM for short-lock global events/data
+    pthread_mutex_t stats_lock; // used for rare global counters
     pthread_mutex_t config_lock;
     pthread_cond_t config_cond;
     pthread_t config_tid;
@@ -253,10 +265,6 @@ typedef struct {
     bool loading; // bool indicating an active config load.
     bool memprofile; // indicate if we want to profile lua memory.
     uint8_t memprofile_thread_counter;
-    struct proxy_global_stats global_stats;
-    struct proxy_user_stats user_stats;
-    struct proxy_tunables tunables; // NOTE: updates covered by stats_lock
-    pthread_mutex_t stats_lock; // used for rare global counters
 } proxy_ctx_t;
 
 #define PROXY_GET_THR_CTX(L) ((*(LIBEVENT_THREAD **)lua_getextraspace(L))->proxy_ctx)
@@ -604,6 +612,7 @@ void proxy_run_backend_queue(be_head_t *head);
 struct mcp_backendconn_s *proxy_choose_beconn(mcp_backend_t *be);
 mcp_resp_t *mcp_prep_resobj(lua_State *L, mcp_request_t *rq, mcp_backend_t *be, LIBEVENT_THREAD *t);
 mcp_resp_t *mcp_prep_bare_resobj(lua_State *L, LIBEVENT_THREAD *t);
+void mcp_resp_set_elapsed(mcp_resp_t *r);
 io_pending_proxy_t *mcp_queue_rctx_io(mcp_rcontext_t *rctx, mcp_request_t *rq, mcp_backend_t *be, mcp_resp_t *r);
 
 // await interface
@@ -656,31 +665,6 @@ enum mcp_rqueue_e {
     QWAIT_SLEEP,
 };
 
-enum mcp_funcgen_router_e {
-    FGEN_ROUTER_NONE = 0,
-    FGEN_ROUTER_SHORTSEP,
-    FGEN_ROUTER_LONGSEP,
-    FGEN_ROUTER_ANCHORSM,
-    FGEN_ROUTER_ANCHORBIG,
-};
-
-struct mcp_router_long_s {
-    char start[KEY_HASH_FILTER_MAX+1];
-    char stop[KEY_HASH_FILTER_MAX+1];
-};
-
-struct mcp_funcgen_router {
-    enum mcp_funcgen_router_e type;
-    union {
-        char sep;
-        char lsep[KEY_HASH_FILTER_MAX+1];
-        char anchorsm[2]; // short anchored mode.
-        struct mcp_router_long_s big;
-    } conf;
-    mcp_funcgen_t *def_fgen; // default route
-    int map_ref;
-};
-
 #define FGEN_NAME_MAXLEN 80
 struct mcp_funcgen_s {
     LIBEVENT_THREAD *thread; // worker thread that created this funcgen.
@@ -693,13 +677,44 @@ struct mcp_funcgen_s {
     unsigned int free; // free contexts
     unsigned int free_max; // size of list below.
     unsigned int free_pressure; // "pressure" for when to early release rctx
-    unsigned int routecount; // total routes if this fgen is a router.
     bool closed; // the hook holding this fgen has been replaced
     bool ready; // if we're locked down or not.
+    bool is_router; // if this fgen is actually a router object.
     mcp_rcontext_t **list;
     struct mcp_rqueue_s *queue_list;
-    struct mcp_funcgen_router router;
     char name[FGEN_NAME_MAXLEN+1]; // string name for the generator.
+};
+
+enum mcp_funcgen_router_e {
+    FGEN_ROUTER_NONE = 0,
+    FGEN_ROUTER_CMDMAP,
+    FGEN_ROUTER_SHORTSEP,
+    FGEN_ROUTER_LONGSEP,
+    FGEN_ROUTER_ANCHORSM,
+    FGEN_ROUTER_ANCHORBIG,
+};
+
+struct mcp_router_long_s {
+    char start[KEY_HASH_FILTER_MAX+1];
+    char stop[KEY_HASH_FILTER_MAX+1];
+};
+
+// To simplify the attach/start code we wrap a funcgen with the router
+// structure. This allows us to have a larger router structure without
+// bloating the fgen object itself, and still benefit from letting funcgen
+// new/cleanup handle most of the memory management.
+struct mcp_funcgen_router {
+    mcp_funcgen_t fgen_self;
+    enum mcp_funcgen_router_e type;
+    union {
+        char sep;
+        char lsep[KEY_HASH_FILTER_MAX+1];
+        char anchorsm[2]; // short anchored mode.
+        struct mcp_router_long_s big;
+    } conf;
+    int map_ref;
+    mcp_funcgen_t *def_fgen; // default route
+    mcp_funcgen_t *cmap[CMD_END_STORAGE]; // fallback command map
 };
 
 #define RQUEUE_TYPE_NONE 0
@@ -803,6 +818,7 @@ int mcplib_request_flag_set(lua_State *L);
 int mcplib_request_flag_replace(lua_State *L);
 int mcplib_request_flag_del(lua_State *L);
 int mcplib_request_gc(lua_State *L);
+int mcplib_request_match_res(lua_State *L);
 void mcp_request_cleanup(LIBEVENT_THREAD *t, mcp_request_t *rq);
 
 // response interface
