@@ -1579,6 +1579,7 @@ static void process_marithmetic_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_res
                     }
                     META_SPACE(p);
                     memcpy(p, &pr->request[pr->tokens[i]], tlen);
+                    p += tlen;
                     break;
                 case 'k':
                     META_KEY(p, key, nkey, of.key_binary);
@@ -1607,6 +1608,7 @@ static void process_marithmetic_cmd(LIBEVENT_THREAD *t, mcp_parser_t *pr, mc_res
                     }
                     META_SPACE(p);
                     memcpy(p, &pr->request[pr->tokens[i]], tlen);
+                    p += tlen;
                     break;
                 case 'k':
                     META_KEY(p, key, nkey, of.key_binary);
@@ -1724,7 +1726,7 @@ int mcplib_internal_run(mcp_rcontext_t *rctx) {
     // wrap the main commands with something that decorates r->resp directly
     // instead of going through a parser to save some CPU.
     // Either way this is a lot less code.
-    mcmc_bare_parse_buf(resp->iov[0].iov_base, resp->iov[0].iov_len, &r->resp);
+    mcmc_parse_buf(resp->iov[0].iov_base, resp->iov[0].iov_len, &r->resp);
 
     if (rq->ascii_multiget) {
         if (r->resp.type == MCMC_RESP_GET) {

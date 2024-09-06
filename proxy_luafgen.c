@@ -1,6 +1,9 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 
 #include "proxy.h"
+#ifdef TLS
+#include "tls.h"
+#endif
 
 static mcp_funcgen_t *mcp_funcgen_route(lua_State *L, mcp_funcgen_t *fgen, mcp_parser_t *pr);
 static int mcp_funcgen_router_cleanup(lua_State *L, mcp_funcgen_t *fgen);
@@ -371,6 +374,7 @@ void mcp_funcgen_return_rctx(mcp_rcontext_t *rctx) {
         }
         return;
     }
+    WSTAT_DECR(rctx->fgen->thread, proxy_req_active, 1);
     _mcp_funcgen_return_rctx(rctx);
     _mcplib_funcgen_cache(fgen, rctx);
 }
@@ -438,7 +442,7 @@ mcp_rcontext_t *mcp_funcgen_start(lua_State *L, mcp_funcgen_t *fgen, mcp_parser_
 
     // TODO: could probably move a few more lines from proto_proxy into here,
     // but that's splitting hairs.
-
+    WSTAT_INCR(fgen->thread, proxy_req_active, 1);
     return rctx;
 }
 
@@ -833,7 +837,7 @@ static void _mcp_start_rctx_process_error(mcp_rcontext_t *rctx, struct mcp_rqueu
     io_pending_proxy_t *p = mcp_queue_rctx_io(rctx->parent, NULL, NULL, r);
     p->return_cb = proxy_return_rqu_cb;
     p->queue_handle = rctx->parent_handle;
-    p->await_background = true;
+    p->background = true;
 }
 
 static void mcp_start_subrctx(mcp_rcontext_t *rctx) {
@@ -852,7 +856,7 @@ static void mcp_start_subrctx(mcp_rcontext_t *rctx) {
             p->queue_handle = rctx->parent_handle;
             // TODO: change name of property to fast-return once mcp.await is
             // retired.
-            p->await_background = true;
+            p->background = true;
         } else if (type == LUA_TSTRING) {
             // TODO: wrap with a resobj and parse it.
             // for now we bypass the rqueue process handling
@@ -864,7 +868,7 @@ static void mcp_start_subrctx(mcp_rcontext_t *rctx) {
             io_pending_proxy_t *p = mcp_queue_rctx_io(rctx->parent, NULL, NULL, NULL);
             p->return_cb = proxy_return_rqu_cb;
             p->queue_handle = rctx->parent_handle;
-            p->await_background = true;
+            p->background = true;
         } else {
             // generate a generic object with an error.
             _mcp_start_rctx_process_error(rctx, rqu);
@@ -1215,7 +1219,7 @@ int mcplib_rcontext_wait_cond(lua_State *L) {
     if (rctx->wait_count == 0) {
         io_pending_proxy_t *p = mcp_queue_rctx_io(rctx, NULL, NULL, NULL);
         p->return_cb = proxy_return_rqu_dummy_cb;
-        p->await_background = true;
+        p->background = true;
         rctx->pending_reqs++;
         rctx->wait_mode = QWAIT_IDLE; // not actually waiting.
     } else if (argc > 3) {
@@ -1405,6 +1409,47 @@ int mcplib_rcontext_cfd(lua_State *L) {
     return 1;
 }
 
+// Must not call this if rctx has returned result to client already.
+int mcplib_rcontext_tls_peer_cn(lua_State *L) {
+    mcp_rcontext_t *rctx = lua_touserdata(L, 1);
+    if (!rctx->c) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+#ifdef TLS
+    int len = 0;
+    const unsigned char *cn = ssl_get_peer_cn(rctx->c, &len);
+    if (cn) {
+        lua_pushlstring(L, (const char *)cn, len);
+    } else {
+        lua_pushnil(L);
+    }
+#else
+    lua_pushnil(L);
+#endif
+    return 1;
+}
+
+// TODO: stub function.
+// need to attach request function to rcontext, by using another function that
+// doesn't fill out the request info
+int mcplib_rcontext_request_new(lua_State *L) {
+    mcp_parser_t pr = {0};
+
+    mcp_new_request(L, &pr, " ", 1);
+    return 1;
+}
+
+// TODO: stub function, see request_new above.
+int mcplib_rcontext_response_new(lua_State *L) {
+    mcp_resp_t *r = lua_newuserdatauv(L, sizeof(mcp_resp_t), 0);
+    memset(r, 0, sizeof(mcp_resp_t));
+    luaL_getmetatable(L, "mcp.response");
+    lua_setmetatable(L, -2);
+    return 1;
+}
+
 // the supplied handle must be valid.
 void mcp_rcontext_push_rqu_res(lua_State *L, mcp_rcontext_t *rctx, int handle) {
     struct mcp_rqueue_s *rqu = &rctx->qslots[handle];
@@ -1578,32 +1623,34 @@ static mcp_funcgen_t *mcp_funcgen_route(lua_State *L, mcp_funcgen_t *fgen, mcp_p
 // called from mcp_funcgen_cleanup if necessary.
 static int mcp_funcgen_router_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
     struct mcp_funcgen_router *fr = (struct mcp_funcgen_router *)fgen;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, fr->map_ref);
+    if (fr->map_ref) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, fr->map_ref);
 
-    // walk the map, de-ref any funcgens found.
-    int tidx = lua_absindex(L, -1);
-    lua_pushnil(L);
-    while (lua_next(L, tidx) != 0) {
-        int type = lua_type(L, -1);
-        if (type == LUA_TUSERDATA) {
-            mcp_funcgen_t *mfgen = lua_touserdata(L, -1);
-            mcp_funcgen_dereference(L, mfgen);
-            lua_pop(L, 1);
-        } else if (type == LUA_TTABLE) {
-            int midx = lua_absindex(L, -1);
-            lua_pushnil(L);
-            while (lua_next(L, midx) != 0) {
+        // walk the map, de-ref any funcgens found.
+        int tidx = lua_absindex(L, -1);
+        lua_pushnil(L);
+        while (lua_next(L, tidx) != 0) {
+            int type = lua_type(L, -1);
+            if (type == LUA_TUSERDATA) {
                 mcp_funcgen_t *mfgen = lua_touserdata(L, -1);
                 mcp_funcgen_dereference(L, mfgen);
-                lua_pop(L, 1); // drop value
+                lua_pop(L, 1);
+            } else if (type == LUA_TTABLE) {
+                int midx = lua_absindex(L, -1);
+                lua_pushnil(L);
+                while (lua_next(L, midx) != 0) {
+                    mcp_funcgen_t *mfgen = lua_touserdata(L, -1);
+                    mcp_funcgen_dereference(L, mfgen);
+                    lua_pop(L, 1); // drop value
+                }
+                lua_pop(L, 1); // drop command map table
             }
-            lua_pop(L, 1); // drop command map table
         }
-    }
 
-    lua_pop(L, 1); // drop the table.
-    luaL_unref(L, LUA_REGISTRYINDEX, fr->map_ref);
-    fr->map_ref = 0;
+        lua_pop(L, 1); // drop the table.
+        luaL_unref(L, LUA_REGISTRYINDEX, fr->map_ref);
+        fr->map_ref = 0;
+    }
 
     // release any command map entries.
     for (int x = 0; x < CMD_END_STORAGE; x++) {

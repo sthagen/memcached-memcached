@@ -100,12 +100,10 @@ struct mcp_memprofile {
 
 #define MCP_BACKEND_UPVALUE 1
 
-#define MCP_YIELD_POOL 1
-#define MCP_YIELD_AWAIT 2
-#define MCP_YIELD_INTERNAL 3
-#define MCP_YIELD_WAITCOND 4
-#define MCP_YIELD_WAITHANDLE 5
-#define MCP_YIELD_SLEEP 6
+#define MCP_YIELD_INTERNAL 1
+#define MCP_YIELD_WAITCOND 2
+#define MCP_YIELD_WAITHANDLE 3
+#define MCP_YIELD_SLEEP 4
 
 #define SHAREDVM_FGEN_IDX 1
 #define SHAREDVM_FGENSLOT_IDX 2
@@ -492,6 +490,7 @@ enum mcp_resp_mode {
 #define RESP_CMD_MAX 8
 typedef struct {
     mcmc_resp_t resp;
+    mcmc_tokenizer_t tok; // optional tokenization of res
     char *buf; // response line + potentially value.
     mc_resp *cresp; // client mc_resp object during extstore fetches.
     LIBEVENT_THREAD *thread; // cresp's owner thread needed for extstore cleanup.
@@ -546,13 +545,9 @@ struct _io_pending_proxy_t {
             struct iovec iov[2]; // request string + tail buffer
             int iovcnt; // 1 or 2...
             unsigned int iovbytes; // total bytes in the iovec
-            int mcpres_ref; // mcp.res reference used for await()
-            int await_ref; // lua reference if we were an await object
             mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
             bool flushed; // whether we've fully written this request to a backend.
-            bool is_await; // are we an await object?
-            bool await_first; // are we the main route for an await object?
-            bool await_background; // dummy IO for backgrounded awaits
+            bool background; // dummy IO for backgrounded awaits
             bool qcount_incr; // HACK.
         };
     };
@@ -614,20 +609,6 @@ mcp_resp_t *mcp_prep_resobj(lua_State *L, mcp_request_t *rq, mcp_backend_t *be, 
 mcp_resp_t *mcp_prep_bare_resobj(lua_State *L, LIBEVENT_THREAD *t);
 void mcp_resp_set_elapsed(mcp_resp_t *r);
 io_pending_proxy_t *mcp_queue_rctx_io(mcp_rcontext_t *rctx, mcp_request_t *rq, mcp_backend_t *be, mcp_resp_t *r);
-
-// await interface
-enum mcp_await_e {
-    AWAIT_GOOD = 0, // looks for OK + NOT MISS
-    AWAIT_ANY, // any response, including errors,
-    AWAIT_OK, // any non-error response
-    AWAIT_FIRST, // return the result from the first pool
-    AWAIT_FASTGOOD, // returns on first hit or majority non-error
-    AWAIT_BACKGROUND, // returns as soon as background jobs are dispatched
-};
-int mcplib_await(lua_State *L);
-int mcplib_await_logerrors(lua_State *L);
-int mcplib_await_run_rctx(mcp_rcontext_t *rctx);
-int mcplib_await_return(io_pending_proxy_t *p);
 
 // internal request interface
 int mcplib_internal(lua_State *L);
@@ -773,6 +754,8 @@ struct mcp_rcontext_s {
     struct mcp_rqueue_s qslots[]; // queueable slots.
 };
 
+#define mcp_is_flag_invalid(f) (f < 65 || f > 122)
+
 void mcp_run_rcontext_handle(mcp_rcontext_t *rctx, int handle);
 void mcp_process_rctx_wait(mcp_rcontext_t *rctx, int handle);
 int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res);
@@ -786,6 +769,9 @@ int mcplib_rcontext_res_any(lua_State *L);
 int mcplib_rcontext_res_ok(lua_State *L);
 int mcplib_rcontext_result(lua_State *L);
 int mcplib_rcontext_cfd(lua_State *L);
+int mcplib_rcontext_tls_peer_cn(lua_State *L);
+int mcplib_rcontext_request_new(lua_State *L);
+int mcplib_rcontext_response_new(lua_State *L);
 int mcplib_rcontext_sleep(lua_State *L);
 int mcplib_funcgenbare_new(lua_State *L);
 int mcplib_funcgen_new(lua_State *L);
@@ -810,9 +796,11 @@ int mcplib_request_key(lua_State *L);
 int mcplib_request_ltrimkey(lua_State *L);
 int mcplib_request_rtrimkey(lua_State *L);
 int mcplib_request_token(lua_State *L);
+int mcplib_request_token_int(lua_State *L);
 int mcplib_request_ntokens(lua_State *L);
 int mcplib_request_has_flag(lua_State *L);
 int mcplib_request_flag_token(lua_State *L);
+int mcplib_request_flag_token_int(lua_State *L);
 int mcplib_request_flag_add(lua_State *L);
 int mcplib_request_flag_set(lua_State *L);
 int mcplib_request_flag_replace(lua_State *L);
@@ -822,8 +810,30 @@ int mcplib_request_match_res(lua_State *L);
 void mcp_request_cleanup(LIBEVENT_THREAD *t, mcp_request_t *rq);
 
 // response interface
+int mcplib_response_elapsed(lua_State *L);
+int mcplib_response_ok(lua_State *L);
+int mcplib_response_hit(lua_State *L);
+int mcplib_response_vlen(lua_State *L);
+int mcplib_response_code(lua_State *L);
+int mcplib_response_line(lua_State *L);
+int mcplib_response_flag_blank(lua_State *L);
+
+// inspector interface
+int mcplib_req_inspector_new(lua_State *L);
+int mcplib_res_inspector_new(lua_State *L);
+int mcplib_inspector_gc(lua_State *L);
+int mcplib_inspector_call(lua_State *L);
+
+// mutator interface
+int mcplib_req_mutator_new(lua_State *L);
+int mcplib_res_mutator_new(lua_State *L);
+int mcplib_mutator_gc(lua_State *L);
+int mcplib_mutator_call(lua_State *L);
+
 void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r);
 void mcp_set_resobj(mcp_resp_t *r, mcp_request_t *rq, mcp_backend_t *be, LIBEVENT_THREAD *t);
+int mcplib_response_gc(lua_State *L);
+int mcplib_response_close(lua_State *L);
 
 int mcplib_open_dist_jump_hash(lua_State *L);
 int mcplib_open_dist_ring_hash(lua_State *L);
@@ -835,6 +845,7 @@ int mcp_request_render(mcp_request_t *rq, int idx, char flag, const char *tok, s
 int mcp_request_append(mcp_request_t *rq, const char flag, const char *tok, size_t len);
 int mcp_request_find_flag_index(mcp_request_t *rq, const char flag);
 int mcp_request_find_flag_token(mcp_request_t *rq, const char flag, const char **token, size_t *len);
+int mcp_request_find_flag_tokenint64(mcp_request_t *rq, const char flag, int64_t *token);
 void proxy_lua_error(lua_State *L, const char *s);
 #define proxy_lua_ferror(L, fmt, ...) \
     do { \

@@ -3,7 +3,7 @@ if reload_count == nil then
 end
 
 function mcp_config_pools()
-    mcp.backend_read_timeout(0.25)
+    mcp.backend_read_timeout(3)
     mcp.backend_connect_timeout(5)
     mcp.backend_flap_time(30) -- need a long time to reset the flap counter
     mcp.backend_flap_backoff_ramp(1.2) -- very slow ramp
@@ -22,5 +22,14 @@ function mcp_config_pools()
 end
 
 function mcp_config_routes(pool)
-    mcp.attach(mcp.CMD_MG, function(r) return pool(r) end)
+    local fg = mcp.funcgen_new()
+    local handle = fg:new_handle(pool)
+    fg:ready({
+        f = function(rctx)
+            return function(r)
+                return rctx:enqueue_and_wait(r, handle)
+            end
+        end
+    })
+    mcp.attach(mcp.CMD_MG, fg)
 end

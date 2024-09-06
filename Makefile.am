@@ -58,9 +58,11 @@ endif
 if ENABLE_PROXY
 memcached_SOURCES += proto_proxy.c proto_proxy.h vendor/mcmc/mcmc.h \
 					 proxy_xxhash.c proxy.h \
-					 proxy_await.c proxy_ustats.c \
+					 proxy_ustats.c \
 					 proxy_ratelim.c \
 					 proxy_jump_hash.c proxy_request.c \
+					 proxy_result.c proxy_inspector.c \
+					 proxy_mutator.c \
 					 proxy_network.c proxy_lua.c \
 					 proxy_luafgen.c \
 					 proxy_config.c proxy_ring_hash.c \

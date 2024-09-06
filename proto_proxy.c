@@ -503,15 +503,15 @@ void proxy_submit_cb(io_queue_t *q) {
         mcp_backend_t *be;
         P_DEBUG("%s: queueing req for backend: %p\n", __func__, (void *)p);
         if (p->qcount_incr) {
-            // funny workaround: awaiting IOP's don't count toward
-            // resuming a connection, only the completion of the await
+            // funny workaround: async IOP's don't count toward
+            // resuming a connection, only the completion of the async
             // condition.
             q->count++;
         }
 
-        if (p->await_background) {
-            P_DEBUG("%s: fast-returning await_background object: %p\n", __func__, (void *)p);
-            // intercept await backgrounds
+        if (p->background) {
+            P_DEBUG("%s: fast-returning background object: %p\n", __func__, (void *)p);
+            // intercept background requests
             // this call cannot recurse if we're on the worker thread,
             // since the worker thread has to finish executing this
             // function in order to pick up the returned IO.
@@ -577,8 +577,8 @@ void proxy_submit_cb(io_queue_t *q) {
     return;
 }
 
-// This function handles return processing for the "old style" API: direct
-// pool calls and mcp.await()
+// This function handles return processing for the "old style" API:
+// currently just `mcp.internal()`
 void proxy_return_rctx_cb(io_pending_t *pending) {
     io_pending_proxy_t *p = (io_pending_proxy_t *)pending;
     if (p->client_resp && p->client_resp->blen) {
@@ -586,17 +586,6 @@ void proxy_return_rctx_cb(io_pending_t *pending) {
         // can't run 0 since that means something special (run the GC)
         unsigned int kb = p->client_resp->blen / 1000;
         p->thread->proxy_vm_extra_kb += kb > 0 ? kb : 1;
-    }
-
-    if (p->is_await) {
-        p->rctx->async_pending--;
-        mcplib_await_return(p);
-        // need to directly attempt to return the context,
-        // we may or may not be hitting proxy_run_rcontext from await_return.
-        if (p->rctx->async_pending == 0) {
-            mcp_funcgen_return_rctx(p->rctx);
-        }
-        return;
     }
 
     mcp_rcontext_t *rctx = p->rctx;
@@ -702,14 +691,12 @@ int try_read_command_proxy(conn *c) {
 // Must only be called with an active coroutine.
 void proxy_cleanup_conn(conn *c) {
     assert(c->proxy_rctx);
-    LIBEVENT_THREAD *thr = c->thread;
     mcp_rcontext_t *rctx = c->proxy_rctx;
     assert(rctx->pending_reqs == 1);
     rctx->pending_reqs = 0;
 
     mcp_funcgen_return_rctx(rctx);
     c->proxy_rctx = NULL;
-    WSTAT_DECR(thr, proxy_req_active, 1);
 }
 
 // we buffered a SET of some kind.
@@ -879,10 +866,6 @@ static void _proxy_run_tresp_to_resp(mc_resp *tresp, mc_resp *resp) {
 // - need to only increment q->count once per stack of requests coming from a
 //   resp.
 //
-// There are workarounds for this all over. In the await code, we test for
-// "the first await object" or "is an await background object", for
-// incrementing the q->count
-// For pool-backed requests we always increment in submit
 // For RQU backed requests (new API) there isn't an easy place to test for
 // "the first request", because:
 // - The connection queue is a stack of _all_ requests pending on this
@@ -914,13 +897,11 @@ int proxy_run_rcontext(mcp_rcontext_t *rctx) {
     int cores = lua_resume(Lc, NULL, rctx->lua_narg, &nresults);
     rctx->lua_narg = 1; // reset to default since not-default is uncommon.
     size_t rlen = 0;
-    conn *c = rctx->c;
     mc_resp *resp = rctx->resp;
 
     if (cores == LUA_OK) {
         // don't touch the result object if we were a sub-context.
         if (!rctx->parent) {
-            WSTAT_DECR(c->thread, proxy_req_active, 1);
             int type = lua_type(Lc, 1);
             mcp_resp_t *r = NULL;
             P_DEBUG("%s: coroutine completed. return type: %d\n", __func__, type);
@@ -930,7 +911,6 @@ int proxy_run_rcontext(mcp_rcontext_t *rctx) {
                     proxy_out_errstring(resp, PROXY_SERVER_ERROR, "backend failure");
                 } else if (r->cresp) {
                     mc_resp *tresp = r->cresp;
-                    assert(c != NULL);
 
                     _proxy_run_tresp_to_resp(tresp, resp);
                     // we let the mcp_resp gc handler free up tresp and any
@@ -967,25 +947,7 @@ int proxy_run_rcontext(mcp_rcontext_t *rctx) {
         lua_pop(Lc, 1);
 
         int res = 0;
-        mcp_request_t *rq = NULL;
-        mcp_backend_t *be = NULL;
-        mcp_resp_t *r = NULL;
         switch (yield_type) {
-            case MCP_YIELD_AWAIT:
-                // called with await context on the stack.
-                rctx->first_queue = false; // HACK: ensure awaits are counted.
-                mcplib_await_run_rctx(rctx);
-                break;
-            case MCP_YIELD_POOL:
-                // TODO (v2): c only used for cache alloc?
-                // pool_call checks the argument already.
-                be = lua_touserdata(Lc, -1);
-                rq = lua_touserdata(Lc, -2);
-                // not using a pre-made res object from this yield type.
-                r = mcp_prep_resobj(Lc, rq, be, c->thread);
-                rctx->first_queue = false; // HACK: ensure poolreqs are counted.
-                mcp_queue_rctx_io(rctx, rq, be, r);
-                break;
             case MCP_YIELD_INTERNAL:
                 // stack should be: rq, res
                 if (rctx->parent) {
@@ -1027,7 +989,6 @@ int proxy_run_rcontext(mcp_rcontext_t *rctx) {
         P_DEBUG("%s: Failed to run coroutine: %s\n", __func__, lua_tostring(Lc, -1));
         LOGGER_LOG(NULL, LOG_PROXYEVENTS, LOGGER_PROXY_ERROR, NULL, lua_tostring(Lc, -1));
         if (!rctx->parent) {
-            WSTAT_DECR(c->thread, proxy_req_active, 1);
             proxy_out_errstring(resp, PROXY_SERVER_ERROR, "lua failure");
         }
         rctx->pending_reqs--;
@@ -1193,13 +1154,11 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     WSTAT_L(c->thread);
     istats->counters[pr.command]++;
     c->thread->stats.proxy_conn_requests++;
-    c->thread->stats.proxy_req_active++;
     active_reqs = c->thread->stats.proxy_req_active;
     WSTAT_UL(c->thread);
 
-    if (active_reqs > ctx->active_req_limit) {
+    if (active_reqs >= ctx->active_req_limit) {
         proxy_out_errstring(c->resp, PROXY_SERVER_ERROR, "active request limit reached");
-        WSTAT_DECR(c->thread, proxy_req_active, 1);
         if (pr.vlen != 0) {
             c->sbytes = pr.vlen;
             conn_set_state(c, conn_swallow);
@@ -1211,7 +1170,6 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
     mcp_rcontext_t *rctx = mcp_funcgen_start(L, hook_ref.ctx, &pr);
     if (rctx == NULL) {
         proxy_out_errstring(c->resp, PROXY_SERVER_ERROR, "lua start failure");
-        WSTAT_DECR(c->thread, proxy_req_active, 1);
         if (pr.vlen != 0) {
             c->sbytes = pr.vlen;
             conn_set_state(c, conn_swallow);
@@ -1251,7 +1209,6 @@ static void proxy_process_command(conn *c, char *command, size_t cmdlen, bool mu
             // normal cleanup
             lua_settop(L, 0);
             proxy_out_errstring(c->resp, PROXY_SERVER_ERROR, "out of memory");
-            WSTAT_DECR(c->thread, proxy_req_active, 1);
             c->sbytes = pr.vlen;
             conn_set_state(c, conn_swallow);
             return;
@@ -1367,7 +1324,7 @@ io_pending_proxy_t *mcp_queue_rctx_io(mcp_rcontext_t *rctx, mcp_request_t *rq, m
     p->c = c;
     p->client_resp = r;
     p->flushed = false;
-    p->return_cb = proxy_return_rctx_cb;
+    p->return_cb = NULL;
     p->finalize_cb = proxy_finalize_rctx_cb;
 
     // pass along the request context for resumption.
