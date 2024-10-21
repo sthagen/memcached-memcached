@@ -31,19 +31,46 @@ is(<$w>, "OK\r\n");
 
 {
     test_mgintres();
-    #test_mgreq();
-    #test_mgres();
+    test_mgreq();
+    test_mgres();
 }
 
 sub test_mgintres {
     note 'testing mcp.internal()';
-    $t->c_send("ms intres/tokenint 5 F5\r\n");
-    $t->c_send("hello\r\n");
-    $t->c_recv("HD\r\n");
-    $t->clear();
+    subtest 'mgintres 0b init' => sub {
+        $t->c_send("ms intres/tokenint 0 F7\r\n");
+        $t->c_send("\r\n");
+        $t->c_recv("HD\r\n");
+        $t->clear();
+    };
+
+    subtest 'flagtoken and flagint 0b' => sub {
+        $t->c_send("mg intres/tokenint f t s Omoo\r\n");
+        $t->c_recv("SERVER_ERROR O[true]: moo t[true]: -1\r\n");
+        $t->clear();
+    };
+
+    subtest 'flagtoken and flagint with 0b value returned' => sub {
+        $t->c_send("mg intres/tokenint v f t s Omoo\r\n");
+        $t->c_recv("SERVER_ERROR O[true]: moo t[true]: -1\r\n");
+        $t->clear();
+    };
+
+    subtest 'mgintres 5b init' => sub {
+        $t->c_send("ms intres/tokenint 5 F5\r\n");
+        $t->c_send("hello\r\n");
+        $t->c_recv("HD\r\n");
+        $t->clear();
+    };
 
     subtest 'flagtoken and flagint' => sub {
         $t->c_send("mg intres/tokenint f t s Omoo\r\n");
+        $t->c_recv("SERVER_ERROR O[true]: moo t[true]: -1\r\n");
+        $t->clear();
+    };
+
+    subtest 'flagtoken and flagint with value returned' => sub {
+        $t->c_send("mg intres/tokenint v f t s Omoo\r\n");
         $t->c_recv("SERVER_ERROR O[true]: moo t[true]: -1\r\n");
         $t->clear();
     };
@@ -115,6 +142,15 @@ sub test_mgres {
         $t->c_send("mg reshasf/foo f t s\r\n");
         $t->be_recv_c(0);
         $t->be_send(0, "HD f1234 t9995\r\n");
+        $t->c_recv("SERVER_ERROR f: true t: true\r\n");
+        $t->clear();
+    };
+
+    subtest 'has flags with value returned' => sub {
+        $t->c_send("mg reshasf/foo v f t s\r\n");
+        $t->be_recv_c(0);
+        $t->be_send(0, "VA 4 f1234 t9995\r\n");
+        $t->be_send(0, "data\r\n");
         $t->c_recv("SERVER_ERROR f: true t: true\r\n");
         $t->clear();
     };

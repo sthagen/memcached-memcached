@@ -661,6 +661,7 @@ struct mcp_funcgen_s {
     bool closed; // the hook holding this fgen has been replaced
     bool ready; // if we're locked down or not.
     bool is_router; // if this fgen is actually a router object.
+    struct timespec free_waiter; // must be "too free" for this much time
     mcp_rcontext_t **list;
     struct mcp_rqueue_s *queue_list;
     char name[FGEN_NAME_MAXLEN+1]; // string name for the generator.
@@ -864,4 +865,6 @@ int mcplib_open_hash_xxhash(lua_State *L);
 
 __attribute__((unused)) void dump_stack(lua_State *L, const char *msg);
 __attribute__((unused)) void dump_registry(lua_State *L, const char *msg);
+__attribute__((unused)) void dump_funcgen(lua_State *L, const char *name, const char *msg);
+__attribute__((unused)) void dump_pools(lua_State *L, const char *msg);
 #endif
