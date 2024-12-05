@@ -10,8 +10,6 @@
  * allow code experiments and further information gathering before completing
  * the interface.
  *
- * it currently has bugs, unfinished features, and will not immediately
- * release request or result buffers after a request completes.
  */
 
 // space or \r\n
@@ -37,14 +35,6 @@ enum mcp_mut_steptype {
     mcp_mut_step_final, // not used.
 };
 
-enum mcp_mut_step_arg {
-    mcp_mut_step_arg_none = 0,
-    mcp_mut_step_arg_request,
-    mcp_mut_step_arg_response,
-    mcp_mut_step_arg_string,
-    mcp_mut_step_arg_int,
-};
-
 // START STEP STRUCTS
 
 // struct forward declarations for entry/step function pointers
@@ -55,13 +45,14 @@ struct mcp_mut_part;
 
 typedef int (*mcp_mut_c)(lua_State *L, int tidx);
 typedef int (*mcp_mut_i)(lua_State *L, int tidx, int sc, struct mcp_mutator *mut);
-typedef int (*mcp_mut_r)(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p);
+typedef int (*mcp_mut_n)(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p);
+typedef void (*mcp_mut_r)(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p);
 
 struct mcp_mut_entry {
     const char *s; // string name
     mcp_mut_c c; // argument checker
     mcp_mut_i i; // argument initializer
-    mcp_mut_r n; // runtime length totaller
+    mcp_mut_n n; // runtime length totaller
     mcp_mut_r r; // runtime assembly
     unsigned int t; // allowed object types
     int rc; // number of results to expect
@@ -92,8 +83,7 @@ struct mcp_mut_flagval {
 struct mcp_mut_step {
     enum mcp_mut_steptype type;
     unsigned int idx; // common: input argument position
-    enum mcp_mut_step_arg arg; // common: type of input argument
-    mcp_mut_r n; // totaller function
+    mcp_mut_n n; // totaller function
     mcp_mut_r r; // data copy function
     union {
         struct mcp_mut_string string;
@@ -133,7 +123,7 @@ struct mcp_mut_run {
 
 #define mut_step_c(n) static int mcp_mutator_##n##_c(lua_State *L, int tidx)
 #define mut_step_i(n) static int mcp_mutator_##n##_i(lua_State *L, int tidx, int sc, struct mcp_mutator *mut)
-#define mut_step_r(n) static int mcp_mutator_##n##_r(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p)
+#define mut_step_r(n) static void mcp_mutator_##n##_r(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p)
 #define mut_step_n(n) static int mcp_mutator_##n##_n(struct mcp_mut_run *run, struct mcp_mut_step *s, struct mcp_mut_part *p)
 
 // PRIVATE INTERFACE
@@ -148,8 +138,8 @@ static void _mut_check_idx(lua_State *L, int tidx) {
         if (!isnum) {
             proxy_lua_ferror(L, "mutator step %d: must provide 'idx' argument as an integer", tidx);
         }
-        if (i < 2) {
-            proxy_lua_ferror(L, "mutator step %d: 'idx' argument must be greater than 1", tidx);
+        if (i < 1) {
+            proxy_lua_ferror(L, "mutator step %d: 'idx' argument must be greater than 0", tidx);
         }
     } else {
         proxy_lua_ferror(L, "mutator step %d: must provide 'idx' argument", tidx);
@@ -195,14 +185,28 @@ static void _mut_init_flag(lua_State *L, int tidx, struct mcp_mut_flag *c) {
     lua_pop(L, 1); // val or nil
 }
 
+// mutator must be at position 1. index to check at idx.
+// pulls metatables and compares them to see if we have a request or response
+// object. then fills the appropriate pointer and returns.
+static inline void _mut_checkudata(lua_State *L, unsigned int idx, mcp_request_t **srq, mcp_resp_t **srs) {
+    lua_getmetatable(L, idx);
+    lua_getiuservalue(L, 1, MUT_REQ);
+    if (lua_rawequal(L, -1, -2)) {
+        lua_pop(L, 2);
+        *srq = lua_touserdata(L, idx);
+        return;
+    }
+    lua_getiuservalue(L, 1, MUT_RES);
+    if (lua_rawequal(L, -1, -3)) {
+        *srs = lua_touserdata(L, idx);
+    }
+    lua_pop(L, 3);
+}
+
 // END COMMMON ARG HANDLERS
 
 // START STEPS
 
-// FIXME: decide on if this should take an mcp.CMD_etc instead, or at least
-// optionally.
-// we could also parse this into the int to avoid copying a string here.
-// FIXME: track step progress and validate we're the first one.
 mut_step_c(cmdset) {
     size_t len = 0;
 
@@ -252,11 +256,8 @@ mut_step_r(cmdset) {
 
     memcpy(run->d_pos, str, c->len);
     run->d_pos += c->len;
-
-    return 0;
 }
 
-// TODO: validate we're at the right stage to copy a command (no command set)
 mut_step_c(cmdcopy) {
     _mut_check_idx(L, tidx);
     return 0;
@@ -273,27 +274,44 @@ mut_step_i(cmdcopy) {
 }
 
 mut_step_n(cmdcopy) {
+    lua_State *L = run->L;
     unsigned idx = s->idx;
-    // TODO: validate metatable matches or pull from cached entry
-    mcp_request_t *srq = lua_touserdata(run->L, idx);
+    mcp_request_t *srq = NULL;
+    mcp_resp_t *srs = NULL;
 
-    // command must be at the start
-    const char *cmd = srq->pr.request;
-    // command ends at the first token
-    int clen = srq->pr.tokens[1];
-    if (cmd[clen] == ' ') {
-        clen--;
+    switch (lua_type(L, idx)) {
+        case LUA_TSTRING:
+            p->src = lua_tolstring(L, idx, &p->slen);
+            break;
+        case LUA_TUSERDATA:
+            _mut_checkudata(L, idx, &srq, &srs);
+            p->slen = 0;
+            if (srq) {
+                // command must be at the start
+                const char *cmd = srq->pr.request;
+                // command ends at the first token
+                int clen = srq->pr.tokens[1];
+                if (cmd[clen] == ' ') {
+                    clen--;
+                }
+                p->src = cmd;
+                p->slen = clen;
+            } else {
+                // can only use a request object
+                return -1;
+            }
+            break;
+        default:
+            // ints/etc unsupported
+            return -1;
     }
-    p->src = cmd;
-    p->slen = clen;
 
-    return clen;
+    return p->slen;
 }
 
 mut_step_r(cmdcopy) {
     memcpy(run->d_pos, p->src, p->slen);
     run->d_pos += p->slen;
-    return 0;
 }
 
 // TODO: validate a cmd is already slated to be set
@@ -304,7 +322,6 @@ mut_step_c(keycopy) {
     return 0;
 }
 
-// FIXME: idx_i_g?
 mut_step_i(keycopy) {
     struct mcp_mut_step *s = &mut->steps[sc];
     if (lua_getfield(L, tidx, "idx") != LUA_TNIL) {
@@ -315,12 +332,30 @@ mut_step_i(keycopy) {
 }
 
 mut_step_n(keycopy) {
+    lua_State *L = run->L;
     unsigned idx = s->idx;
-    // TODO: validate metatable table matches or pull from cached entry
-    mcp_request_t *srq = lua_touserdata(run->L, idx);
+    mcp_request_t *srq = NULL;
+    mcp_resp_t *srs = NULL;
 
-    p->src = MCP_PARSER_KEY(srq->pr);
-    p->slen = srq->pr.klen;
+    switch (lua_type(L, idx)) {
+        case LUA_TSTRING:
+            p->src = lua_tolstring(L, idx, &p->slen);
+            break;
+        case LUA_TUSERDATA:
+            _mut_checkudata(L, idx, &srq, &srs);
+            if (srq) {
+                p->src = MCP_PARSER_KEY(srq->pr);
+                p->slen = srq->pr.klen;
+            } else {
+                // TODO: if a result object:
+                // - if meta, and 'k' flag, copy flag token.
+                return -1;
+            }
+            break;
+        default:
+            // ints/etc unsupported
+            return -1;
+    }
 
     return p->slen;
 }
@@ -328,20 +363,18 @@ mut_step_n(keycopy) {
 mut_step_r(keycopy) {
     memcpy(run->d_pos, p->src, p->slen);
     run->d_pos += p->slen;
-    return 0;
 }
 
-// TODO: check we're okay to set a key
 mut_step_c(keyset) {
     size_t len = 0;
 
-    if (lua_getfield(L, tidx, "str") != LUA_TNIL) {
+    if (lua_getfield(L, tidx, "val") != LUA_TNIL) {
         lua_tolstring(L, -1, &len);
         if (len < 1) {
-            proxy_lua_ferror(L, "mutator step %d: 'str' must have nonzero length", tidx);
+            proxy_lua_ferror(L, "mutator step %d: 'val' must have nonzero length", tidx);
         }
     } else {
-        proxy_lua_ferror(L, "mutator step %d: must provide 'str' argument", tidx);
+        proxy_lua_ferror(L, "mutator step %d: must provide 'val' argument", tidx);
     }
     lua_pop(L, 1); // val or nil
 
@@ -354,7 +387,7 @@ mut_step_i(keyset) {
     size_t len = 0;
 
     // store our match string in the arena space that we reserved before.
-    if (lua_getfield(L, tidx, "str") != LUA_TNIL) {
+    if (lua_getfield(L, tidx, "val") != LUA_TNIL) {
         const char *str = lua_tolstring(L, -1, &len);
         c->str = mut->aused;
         c->len = len;
@@ -380,13 +413,11 @@ mut_step_r(keyset) {
 
     memcpy(run->d_pos, str, c->len);
     run->d_pos += c->len;
-    return 0;
 }
 
-// TODO: ensure step is first
 // TODO: pre-validate that it's an accepted code?
 mut_step_c(rescodeset) {
-    return _mut_check_strlen(L, tidx, "str");
+    return _mut_check_strlen(L, tidx, "val");
 }
 
 mut_step_i(rescodeset) {
@@ -394,7 +425,7 @@ mut_step_i(rescodeset) {
     struct mcp_mut_string *c = &s->c.string;
     size_t len = 0;
 
-    if (lua_getfield(L, tidx, "str") != LUA_TNIL) {
+    if (lua_getfield(L, tidx, "val") != LUA_TNIL) {
         const char *str = lua_tolstring(L, -1, &len);
         c->str = mut->aused;
         c->len = len;
@@ -420,10 +451,8 @@ mut_step_r(rescodeset) {
 
     memcpy(run->d_pos, str, c->len);
     run->d_pos += c->len;
-    return 0;
 }
 
-// TODO: check we're the first step
 mut_step_c(rescodecopy) {
     _mut_check_idx(L, tidx);
     return 0;
@@ -440,37 +469,51 @@ mut_step_i(rescodecopy) {
 }
 
 mut_step_n(rescodecopy) {
+    lua_State *L = run->L;
     unsigned idx = s->idx;
-    // TODO: validate metatable matches or pull from cached entry
-    mcp_resp_t *srs = lua_touserdata(run->L, idx);
+    mcp_request_t *srq = NULL;
+    mcp_resp_t *srs = NULL;
 
-    // TODO: can't recover the exact from the mcmc resp object, so lets make
-    // sure it's tokenized and copy the first token.
-    if (srs->resp.type == MCMC_RESP_META) {
-        mcmc_tokenize_res(srs->buf, srs->resp.reslen, &srs->tok);
-    } else {
-        // FIXME: above only does meta responses
-        assert(1 == 0);
+    switch (lua_type(L, idx)) {
+        case LUA_TSTRING:
+            p->src = lua_tolstring(L, idx, &p->slen);
+            break;
+        case LUA_TUSERDATA:
+            _mut_checkudata(L, idx, &srq, &srs);
+            if (srs) {
+                // can't recover the exact code from the mcmc resp object, so lets make
+                // sure it's tokenized and copy the first token.
+                if (srs->resp.type == MCMC_RESP_META) {
+                    mcmc_tokenize_res(srs->buf, srs->resp.reslen, &srs->tok);
+                } else {
+                    // FIXME: only supports meta responses
+                    return -1;
+                }
+                int len = 0;
+                p->src = mcmc_token_get(srs->buf, &srs->tok, 0, &len);
+                p->slen = len;
+                if (len < 2) {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+            break;
+        default:
+            // ints/etc unsupported
+            return -1;
     }
-    int len = 0;
-    p->src = mcmc_token_get(srs->buf, &srs->tok, 0, &len);
-    p->slen = len;
-    return len;
+
+    return p->slen;
 }
 
-// TODO: take a string or number from that position.
 mut_step_r(rescodecopy) {
-    // FIXME: error propagation
-    // FIXME: can we do all the error handling in the totalling phase?
-    if (p->slen < 2) {
-        return -1;
-    }
     memcpy(run->d_pos, p->src, p->slen);
     run->d_pos += p->slen;
-    return 0;
 }
 
 // TODO: can be no other steps after an error is set.
+// TODO: if idx given instead of msg copy an input string.
 mut_step_c(reserr) {
     size_t total = 0;
     char *code = NULL;
@@ -486,12 +529,12 @@ mut_step_c(reserr) {
         } else if (strcmp(val, "client") == 0) {
             code = RESERR_CLIENT_STR;
         } else {
-            proxy_lua_ferror(L, "mutator step %d: mode must be 'error', server', or 'client'", tidx);
+            proxy_lua_ferror(L, "mutator step %d: code must be 'error', server', or 'client'", tidx);
         }
 
         total += strlen(code);
     } else {
-        proxy_lua_ferror(L, "mutator step %d: must provide 'mode' argument", tidx);
+        proxy_lua_ferror(L, "mutator step %d: must provide 'code' argument", tidx);
     }
     lua_pop(L, 1);
 
@@ -528,21 +571,25 @@ mut_step_i(reserr) {
             proxy_lua_ferror(L, "mutator step %d: code must be 'error', server', or 'client'", tidx);
         }
 
+        // Start our string here.
+        c->str = mut->aused;
         size_t clen = strlen(code);
         memcpy(a, code, clen);
         a += clen;
         *a = ' ';
         a++;
-        mut->aused += clen + 1;
+        clen++;
+        mut->aused += clen;
+        c->len += clen;
     } else {
         proxy_lua_ferror(L, "mutator step %d: must provide 'code' argument", tidx);
     }
     lua_pop(L, 1);
 
     if (lua_getfield(L, tidx, "msg") != LUA_TNIL) {
+        // Extend the string with a msg if supplied.
         const char *str = lua_tolstring(L, -1, &len);
-        c->str = mut->aused;
-        c->len = len;
+        c->len += len;
         memcpy(a, str, len);
         mut->aused += len;
     } else {
@@ -550,7 +597,7 @@ mut_step_i(reserr) {
     }
     lua_pop(L, 1);
 
-    return len;
+    return c->len;
 }
 
 mut_step_n(reserr) {
@@ -568,7 +615,6 @@ mut_step_r(reserr) {
     // set error code first
     memcpy(run->d_pos, str, len);
     run->d_pos += len;
-    return 0;
 }
 
 // TODO: track which flags we've already set and error on dupes
@@ -612,7 +658,6 @@ mut_step_n(flagset) {
     return c->str.len + 1; // room for flag
 }
 
-// TODO: validate we're okay to set flags.
 // FIXME: triple check that this is actually the same code for req vs res?
 // seems like it is.
 mut_step_r(flagset) {
@@ -628,8 +673,6 @@ mut_step_r(flagset) {
         memcpy(run->d_pos, str, len);
         run->d_pos += len;
     }
-
-    return 0;
 }
 
 mut_step_c(flagcopy) {
@@ -653,56 +696,67 @@ mut_step_i(flagcopy) {
     return 0;
 }
 
-// TODO: any reason for a req to pull from a res or vice versa?
-// FIXME: handling when source flag doesn't exist might need a special case.
 mut_step_n(flagcopy) {
-    struct mcp_mutator *mut = run->mut;
     struct mcp_mut_flag *c = &s->c.flag;
 
-    unsigned idx = s->idx;
-    // TODO: validate idx or use cached entry.
-    if (mut->type == MUT_REQ) {
-        mcp_request_t *srq = lua_touserdata(run->L, idx);
-        if (srq->pr.cmd_type != CMD_TYPE_META) {
-            return -1;
-        }
-        if (srq->pr.t.meta.flags & c->bit) {
-            const char *tok = NULL;
-            size_t tlen = 0;
-            mcp_request_find_flag_token(srq, c->f, &tok, &tlen);
+    lua_State *L = run->L;
+    unsigned int idx = s->idx;
+    mcp_request_t *srq = NULL;
+    mcp_resp_t *srs = NULL;
 
-            if (tlen > 0) {
-                p->src = tok;
-                p->slen = tlen;
-            } else {
-                p->slen = 0;
-            }
-        }
-    } else {
-        mcp_resp_t *srs = lua_touserdata(run->L, idx);
-        if (srs->resp.type != MCMC_RESP_META) {
-            // FIXME: error, can't copy flag from non-meta res
+    switch (lua_type(L, idx)) {
+        case LUA_TSTRING:
+            p->src = lua_tolstring(L, idx, &p->slen);
+            break;
+        case LUA_TNUMBER:
+            // TODO: unimplemented
             return -1;
-        }
-        mcmc_tokenize_res(srs->buf, srs->resp.reslen, &srs->tok);
-        if (mcmc_token_has_flag_bit(&srs->tok, c->bit) == MCMC_OK) {
-            // flag exists, so copy that in.
-            // realistically this func is only used if we're also copying a
-            // token, so we look for that too.
-            // could add an option to avoid checking for a token?
-            int len = 0;
-            const char *tok = mcmc_token_get_flag(srs->buf, &srs->tok, c->f, &len);
+            break;
+        case LUA_TUSERDATA:
+            _mut_checkudata(L, idx, &srq, &srs);
+            p->slen = 0;
+            if (srq) {
+                if (srq->pr.cmd_type != CMD_TYPE_META) {
+                    return -1;
+                }
+                if (srq->pr.t.meta.flags & c->bit) {
+                    const char *tok = NULL;
+                    size_t tlen = 0;
+                    mcp_request_find_flag_token(srq, c->f, &tok, &tlen);
 
-            if (len > 0) {
-                p->src = tok;
-                p->slen = len;
+                    if (tlen > 0) {
+                        p->src = tok;
+                        p->slen = tlen;
+                    }
+                }
+            } else if (srs) {
+                if (srs->resp.type != MCMC_RESP_META) {
+                    // FIXME: error, can't copy flag from non-meta res
+                    return -1;
+                }
+                mcmc_tokenize_res(srs->buf, srs->resp.reslen, &srs->tok);
+                if (mcmc_token_has_flag_bit(&srs->tok, c->bit) == MCMC_OK) {
+                    // flag exists, so copy that in.
+                    // realistically this func is only used if we're also copying a
+                    // token, so we look for that too.
+                    // could add an option to avoid checking for a token?
+                    int len = 0;
+                    const char *tok = mcmc_token_get_flag(srs->buf, &srs->tok, c->f, &len);
+
+                    if (len > 0) {
+                        p->src = tok;
+                        p->slen = len;
+                    }
+                }
             } else {
-                p->slen = 0;
+                return -1;
             }
-        }
+            break;
+        default:
+            return -1;
     }
 
-    return 0;
+    return p->slen;
 }
 
 mut_step_r(flagcopy) {
@@ -713,26 +767,12 @@ mut_step_r(flagcopy) {
         memcpy(run->d_pos, p->src, p->slen);
         run->d_pos += p->slen;
     }
-    return 0;
 }
 
 // TODO: check that the value hasn't been set yet.
 mut_step_c(valcopy) {
     _mut_check_idx(L, tidx);
 
-    // TODO: lift to common func
-    if (lua_getfield(L, tidx, "arg") == LUA_TSTRING) {
-        const char *a = lua_tostring(L, -1);
-        if (strcmp(a, "request") != 0 &&
-            strcmp(a, "response") != 0 &&
-            strcmp(a, "string") != 0 &&
-            strcmp(a, "int") != 0) {
-            proxy_lua_ferror(L, "mutator step %d: 'arg' must be request, response, string or int", tidx);
-        }
-    } else {
-        proxy_lua_ferror(L, "mutator step %d: missing 'arg' for input type", tidx);
-    }
-    lua_pop(L, 1);
     return 0;
 }
 
@@ -744,79 +784,39 @@ mut_step_i(valcopy) {
     }
     lua_pop(L, 1);
 
-    // TODO: lift to common func
-    if (lua_getfield(L, tidx, "arg") == LUA_TSTRING) {
-        const char *a = lua_tostring(L, -1);
-        if (strcmp(a, "request") == 0) {
-            s->arg = mcp_mut_step_arg_request;
-        } else if (strcmp(a, "response") == 0) {
-            s->arg = mcp_mut_step_arg_response;
-        } else if (strcmp(a, "string") == 0) {
-            s->arg = mcp_mut_step_arg_string;
-        } else if (strcmp(a, "int") == 0) {
-            s->arg = mcp_mut_step_arg_int;
-        } else {
-            proxy_lua_ferror(L, "mutator step %d: 'arg' must be request, response, string or int", tidx);
-        }
-    }
-    lua_pop(L, 1);
-
     return 0;
 }
 
 mut_step_n(valcopy) {
     lua_State *L = run->L;
-    unsigned idx = s->idx;
+    unsigned int idx = s->idx;
     // extract the string + length we need to copy
-    mcp_request_t *srq;
-    //mcp_resp_t *srs;
+    mcp_request_t *srq = NULL;
+    mcp_resp_t *srs = NULL;
 
-    // TODO: lift to common func?
-    // parts of it? with callback?
-    switch (s->arg) {
-        case mcp_mut_step_arg_none:
-            // can't get here.
+    switch (lua_type(L, idx)) {
+        case LUA_TSTRING:
+            run->vbuf = lua_tolstring(L, idx, &run->vlen);
             break;
-        case mcp_mut_step_arg_request:
-            lua_getmetatable(L, idx);
-            lua_getiuservalue(L, 1, MUT_REQ);
-            if (lua_rawequal(L, -1, -2) == 0) {
-                // FIXME: error propagation
+        case LUA_TNUMBER:
+            // TODO: unimplemented
+            break;
+        case LUA_TUSERDATA:
+            _mut_checkudata(L, idx, &srq, &srs);
+            if (srq) {
+                if (srq->pr.vbuf) {
+                    run->vbuf = srq->pr.vbuf;
+                    run->vlen = srq->pr.vlen;
+                }
+            } else if (srs) {
+                // TODO: need to locally parse the result to get the actual val
+                // offsets until later refactoring takes place.
+            } else {
                 return -1;
             }
-            lua_pop(L, 2);
-            srq = lua_touserdata(L, idx);
-            if (srq->pr.vbuf) {
-                run->vbuf = srq->pr.vbuf;
-                run->vlen = srq->pr.vlen;
-            }
             break;
-        case mcp_mut_step_arg_response:
-            lua_getmetatable(L, idx);
-            lua_getiuservalue(L, 1, MUT_RES);
-            if (lua_rawequal(L, -1, -2) == 0) {
-                // FIXME: error propagation
-                return -1;
-            }
-            lua_pop(L, 2);
-            assert(1 == 0);
-            //srs = lua_touserdata(L, idx);
-            // TODO: need to locally parse the result to get the actual val
-            // offsets until later refactoring takes place.
-            break;
-        case mcp_mut_step_arg_string:
-            if (lua_isstring(L, idx)) {
-                // TODO: do we require the user supplies "\r\n"?
-                // detect it here and add a flag or adjust or etc?
-                run->vbuf = lua_tolstring(L, idx, &run->vlen);
-            }
-            break;
-        case mcp_mut_step_arg_int:
-            // TODO: just do number instead of int? meh.
-            // we want to not auto-convert this to a string.
-            lua_isnumber(L, idx);
-            assert(1 == 0); // TODO: unimplemented.
-            break;
+        default:
+            return -1;
     }
 
     // count the number of digits in vlen to reserve space.
@@ -835,7 +835,6 @@ mut_step_n(valcopy) {
 // we remove the \r\n from the protocol length
 mut_step_r(valcopy) {
     run->d_pos = itoa_u64(run->vlen-2, run->d_pos);
-    return 0;
 }
 
 // END STEPS
@@ -894,7 +893,7 @@ static int mcp_mutator_new(lua_State *L, enum mcp_mut_type type) {
 
     size_t extsize = sizeof(struct mcp_mut_step) * scount;
     struct mcp_mutator *mut = lua_newuserdatauv(L, sizeof(*mut) + extsize, 2);
-    memset(mut, 0, sizeof(*mut));
+    memset(mut, 0, sizeof(*mut) + extsize);
 
     mut->arena = malloc(size);
     if (mut->arena == NULL) {
@@ -924,7 +923,8 @@ static int mcp_mutator_new(lua_State *L, enum mcp_mut_type type) {
             // around the much larger mcp_mut_entries at runtime.
             mut->steps[scount].n = mcp_mut_entries[st].n;
             mut->steps[scount].r = mcp_mut_entries[st].r;
-            mut->steps[scount].idx++; // actual args are "self, etc, etc"
+            // actual args are "self, dst, args". start user idx's at 3
+            mut->steps[scount].idx += 2;
         }
         lua_pop(L, 1); // drop t or nil
         scount++;
@@ -946,8 +946,7 @@ static inline int _mcp_mut_run_total(struct mcp_mut_run *run, struct mcp_mut_par
         assert(s->type != mcp_mut_step_none);
         int len = s->n(run, s, &parts[x]);
         if (len < 0) {
-            assert(1 == 0);
-            break;
+            return -1;
         } else {
             total += len;
         }
@@ -966,12 +965,9 @@ static inline int _mcp_mut_run_assemble(struct mcp_mut_run *run, struct mcp_mut_
     for (int x = 0; x < mut->scount; x++) {
         struct mcp_mut_step *s = &mut->steps[x];
         assert(s->type != mcp_mut_step_none);
-        // TODO: handle -1 errors, halt.
-        // TODO: can we structure this so we don't have to check for errors at
-        // this stage, only the first one? would be nice to cut the branch out
-        if (s->r(run, s, &parts[x]) < 0) {
-            assert(1 == 0);
-        }
+        // Error handling is pushed to the totalling phase.
+        // In this phase we should just be copying data and cannot fail.
+        s->r(run, s, &parts[x]);
 
         *(run->d_pos) = ' ';
         run->d_pos++;
@@ -994,34 +990,44 @@ static int mcp_mut_run(struct mcp_mut_run *run) {
     struct mcp_mut_part parts[mut->scount];
 
     // first accumulate the length tally
+    // FIXME: noticed off-by-one's sometimes.
+    // maybe add a debug assert to verify the written total (d_pos - etc)
+    // matches total?
+    // This isn't critical so long as total is > actual, which it has been
     int total = _mcp_mut_run_total(run, parts);
-    // FIXME: error handling from total call
+    if (total < 0) {
+        lua_pushboolean(run->L, 0);
+        return 1;
+    }
 
     // ensure space and/or allocate memory then seed our destination pointer.
     if (mut->type == MUT_REQ) {
         mcp_request_t *rq = run->arg;
-        // FIXME: cleanup should be managed by slot rctx.
-        mcp_request_cleanup(t, rq);
+        if (rq->pr.vbuf) {
+            // FIXME: maybe NULL rq->pr.request in cleanup phase and test that
+            // instead? this check will only fire if req had a vbuf.
+            proxy_lua_error(run->L, "mutator: request has already been rendered");
+            return 0;
+        }
         // future.. should be able to dynamically assign request buffer.
         if (total > MCP_REQUEST_MAXLEN) {
-            // FIXME: proper error.
-            assert(1 == 0);
+            proxy_lua_error(run->L, "mutator: new request is too long");
+            return 0;
         }
         run->d_pos = rq->request;
 
         _mcp_mut_run_assemble(run, parts);
 
-        // TODO: process_request()
-        // if run->vbuf, malloc/copy vbuf.
         if (process_request(&rq->pr, rq->request, run->d_pos - rq->request) != 0) {
-            // TODO: throw error or return false?
-            assert(1 == 0);
+            proxy_lua_error(run->L, "mutator: failed to parse new request");
+            return 0;
         }
 
         if (run->vbuf) {
             rq->pr.vbuf = malloc(run->vlen);
             if (rq->pr.vbuf == NULL) {
-                assert(1 == 0);
+                proxy_lua_error(run->L, "mutator: failed to allocate value buffer");
+                return 0;
             }
             pthread_mutex_lock(&t->proxy_limit_lock);
             t->proxy_buffer_memory_used += rq->pr.vlen;
@@ -1032,23 +1038,27 @@ static int mcp_mut_run(struct mcp_mut_run *run) {
         }
     } else {
         mcp_resp_t *rs = run->arg;
-        // FIXME: cleanup should be managed by slot rctx.
-        mcp_response_cleanup(t, rs);
+        if (rs->buf) {
+            proxy_lua_error(run->L, "mutator: result has already been rendered");
+            return 0;
+        }
 
-        // TODO: alloc big enough result buffer.
-        rs->buf = malloc(total);
+        // value is inlined in result buffers. future intention to allow more
+        // complex objects so we can refcount values.
+        rs->buf = malloc(total + run->vlen);
         if (rs->buf == NULL) {
-            // FIXME: proper error.
-            assert(1 == 0);
+            proxy_lua_error(run->L, "mutator: failed to allocate result buffer");
+            return 0;
         }
         run->d_pos = rs->buf;
 
         _mcp_mut_run_assemble(run, parts);
 
         rs->tok.ntokens = 0; // TODO: handler from mcmc?
-        if (mcmc_parse_buf(rs->buf, run->d_pos - rs->buf, &rs->resp) != MCMC_OK) {
-            // TODO: throw error or return false?
-            assert(1 == 0);
+        rs->status = mcmc_parse_buf(rs->buf, run->d_pos - rs->buf, &rs->resp);
+        if (rs->resp.type == MCMC_RESP_FAIL) {
+            proxy_lua_error(run->L, "mutator: failed to parse new result");
+            return 0;
         }
 
         // results are sequential buffers, copy the value in.
@@ -1059,7 +1069,7 @@ static int mcp_mut_run(struct mcp_mut_run *run) {
 
         rs->blen = run->d_pos - rs->buf;
         // NOTE: We increment but don't check the memory limits here. Any
-        // incoming request or incoming response will alos check the memory
+        // incoming request or incoming response will also check the memory
         // limits, and just doing an increment here removes some potential
         // error handling. Requests that are already started should be allowed
         // to complete to minimize impact of hitting memory limits.
