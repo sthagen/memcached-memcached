@@ -227,6 +227,13 @@ struct proxy_tunables {
     bool down; // backend is forced into a down/bad state.
 };
 
+struct proxy_logging {
+    unsigned int deadline; // log if slower than N us (user specifies ms)
+    unsigned int rate; // sampling
+    bool all_errors; // always log on an error case
+    char *detail;
+};
+
 typedef STAILQ_HEAD(globalobj_head_s, mcp_globalobj_s) globalobj_head_t;
 typedef struct {
     lua_State *proxy_state; // main configuration vm
@@ -362,7 +369,6 @@ struct mcp_cron_s {
     bool repeat;
 };
 
-typedef STAILQ_HEAD(io_head_s, _io_pending_proxy_t) io_head_t;
 #define MAX_LABELLEN 512
 #define MAX_NAMELEN 255
 #define MAX_PORTLEN 6
@@ -383,7 +389,9 @@ struct mcp_backend_label_s {
     char label[MAX_LABELLEN+1];
     size_t llen; // cache label length for small speedup in pool creation.
     int conncount; // number of sockets to make.
+    bool use_logging;
     struct proxy_tunables tunables;
+    struct proxy_logging logging;
 };
 
 // lua object wrapper meant to own a malloc'ed conn structure
@@ -407,8 +415,8 @@ struct mcp_backendconn_s {
 #ifdef PROXY_TLS
     void *ssl;
 #endif
-    io_head_t io_head; // stack of requests.
-    io_pending_proxy_t *io_next; // next request to write.
+    iop_head_t iop_write; // requests needing to be written
+    iop_head_t iop_read; // requests waiting for read response
     char *rbuf; // statically allocated read buffer.
     size_t rbufused; // currently active bytes in the buffer
     struct event main_event; // libevent: changes role, mostly for main read events
@@ -436,13 +444,15 @@ struct mcp_backend_s {
     bool transferred; // if beconn has been shipped to owner thread.
     bool use_io_thread; // note if this backend is worker-local or not.
     bool stacked; // if backend already queued for syscalls.
+    bool use_logging; // if automatic logging is enabled.
     STAILQ_ENTRY(mcp_backend_s) beconn_next; // stack for connecting conns
     STAILQ_ENTRY(mcp_backend_s) be_next; // stack for backends
-    io_head_t io_head; // stack of inbound requests.
+    iop_head_t iop_head; // stack of inbound requests.
+    struct proxy_logging logging;
+    struct proxy_tunables tunables; // this gets copied a few times for speed.
     char name[MAX_NAMELEN+1];
     char port[MAX_PORTLEN+1];
     char label[MAX_LABELLEN+1];
-    struct proxy_tunables tunables; // this gets copied a few times for speed.
     struct mcp_backendconn_s be[];
 };
 typedef STAILQ_HEAD(be_head_s, mcp_backend_s) be_head_t;
@@ -467,7 +477,7 @@ struct proxy_event_thread_s {
 #endif
     pthread_mutex_t mutex; // covers stack.
     pthread_cond_t cond; // condition to wait on while stack drains.
-    io_head_t io_head_in; // inbound requests to process.
+    iop_head_t iop_head_in; // inbound requests to process.
     be_head_t be_head; // stack of backends for processing.
     beconn_head_t beconn_head_in; // stack of backends for connection processing.
 #ifdef USE_EVENTFD
@@ -495,6 +505,7 @@ typedef struct {
     char *buf; // response line + potentially value.
     mc_resp *cresp; // client mc_resp object during extstore fetches.
     LIBEVENT_THREAD *thread; // cresp's owner thread needed for extstore cleanup.
+    mcp_backend_t *be; // backend that generated this response
     unsigned int blen; // total size of the value to read.
     struct timeval start; // time this object was created.
     long elapsed; // time elapsed once handled.
@@ -503,16 +514,14 @@ typedef struct {
     uint8_t cmd; // from parser (pr.command)
     uint8_t extra; // ascii multiget hack for memory accounting. extra blen.
     enum mcp_resp_mode mode; // reply mode (for noreply fixing)
-    char be_name[MAX_NAMELEN+1];
-    char be_port[MAX_PORTLEN+1];
 } mcp_resp_t;
 
 // re-cast an io_pending_t into this more descriptive structure.
 // the first few items _must_ match the original struct.
-#define IO_PENDING_TYPE_PROXY 0
-#define IO_PENDING_TYPE_EXTSTORE 1
 struct _io_pending_proxy_t {
-    int io_queue_type;
+    uint8_t io_queue_type;
+    uint8_t io_sub_type;
+    uint8_t payload; // payload offset
     LIBEVENT_THREAD *thread;
     conn *c;
     mc_resp *resp;
@@ -522,9 +531,9 @@ struct _io_pending_proxy_t {
     // original struct ends here
 
     mcp_rcontext_t *rctx; // pointer to request context.
+    mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
     int queue_handle; // queue slot to return this result to
     bool ascii_multiget; // passed on from mcp_r_t
-    uint8_t io_type; // extstore IO or backend IO
     union {
         // extstore IO.
         struct {
@@ -539,17 +548,12 @@ struct _io_pending_proxy_t {
         };
         // backend request IO
         struct {
-            // FIXME: use top level next chain
-            struct _io_pending_proxy_t *next; // stack for IO submission
-            STAILQ_ENTRY(_io_pending_proxy_t) io_next; // stack for backends
             mcp_backend_t *backend; // backend server to request from
             struct iovec iov[2]; // request string + tail buffer
             int iovcnt; // 1 or 2...
             unsigned int iovbytes; // total bytes in the iovec
-            mcp_resp_t *client_resp; // reference (currently pointing to a lua object)
             bool flushed; // whether we've fully written this request to a backend.
             bool background; // dummy IO for backgrounded awaits
-            bool qcount_incr; // HACK.
         };
     };
 };
@@ -606,7 +610,6 @@ void proxy_init_event_thread(proxy_event_thread_t *t, proxy_ctx_t *ctx, struct e
 void *proxy_event_thread(void *arg);
 void proxy_run_backend_queue(be_head_t *head);
 struct mcp_backendconn_s *proxy_choose_beconn(mcp_backend_t *be);
-mcp_resp_t *mcp_prep_resobj(lua_State *L, mcp_request_t *rq, mcp_backend_t *be, LIBEVENT_THREAD *t);
 mcp_resp_t *mcp_prep_bare_resobj(lua_State *L, LIBEVENT_THREAD *t);
 void mcp_resp_set_elapsed(mcp_resp_t *r);
 io_pending_proxy_t *mcp_queue_rctx_io(mcp_rcontext_t *rctx, mcp_request_t *rq, mcp_backend_t *be, mcp_resp_t *r);
@@ -614,6 +617,7 @@ io_pending_proxy_t *mcp_queue_rctx_io(mcp_rcontext_t *rctx, mcp_request_t *rq, m
 // internal request interface
 int mcplib_internal(lua_State *L);
 int mcplib_internal_run(mcp_rcontext_t *rctx);
+void *mcp_rcontext_internal(mcp_rcontext_t *rctx, mcp_request_t *rq, mcp_resp_t *r);
 
 // user stats interface
 #define MAX_USTATS_DEFAULT 1024
@@ -703,10 +707,11 @@ struct mcp_funcgen_router {
 
 #define RQUEUE_TYPE_NONE 0
 #define RQUEUE_TYPE_POOL 1
-#define RQUEUE_TYPE_FGEN 2
-#define RQUEUE_TYPE_UOBJ 3 // user tracked object types past this point
-#define RQUEUE_TYPE_UOBJ_REQ 4
-#define RQUEUE_TYPE_UOBJ_RES 5
+#define RQUEUE_TYPE_INT  2
+#define RQUEUE_TYPE_FGEN 3
+#define RQUEUE_TYPE_UOBJ 4 // user tracked object types past this point
+#define RQUEUE_TYPE_UOBJ_REQ 5
+#define RQUEUE_TYPE_UOBJ_RES 6
 #define RQUEUE_ASSIGNED (1<<0)
 #define RQUEUE_R_RESUME (1<<1)
 #define RQUEUE_R_GOOD (1<<3)
@@ -750,7 +755,6 @@ struct mcp_rcontext_s {
     enum mcp_rqueue_e wait_mode;
     uint8_t lua_narg; // number of responses to push when yield resuming.
     uint8_t uobj_count; // number of extra tracked req/res objects.
-    bool first_queue; // HACK
     lua_State *Lc; // coroutine thread pointer.
     mcp_request_t *request; // ptr to the above reference.
     mcp_rcontext_t *parent; // parent rctx in the call graph
@@ -775,6 +779,8 @@ int mcplib_rcontext_res_good(lua_State *L);
 int mcplib_rcontext_res_any(lua_State *L);
 int mcplib_rcontext_res_ok(lua_State *L);
 int mcplib_rcontext_result(lua_State *L);
+int mcplib_rcontext_best_result(lua_State *L);
+int mcplib_rcontext_worst_result(lua_State *L);
 int mcplib_rcontext_cfd(lua_State *L);
 int mcplib_rcontext_tls_peer_cn(lua_State *L);
 int mcplib_rcontext_request_new(lua_State *L);
@@ -792,7 +798,7 @@ int mcplib_funcgen_gc(lua_State *L);
 void mcp_funcgen_reference(lua_State *L);
 void mcp_funcgen_dereference(lua_State *L, mcp_funcgen_t *fgen);
 void mcp_rcontext_push_rqu_res(lua_State *L, mcp_rcontext_t *rctx, int handle);
-
+void mcplib_rqu_log(mcp_request_t *rq, mcp_resp_t *rs, int flag, int cfd);
 
 int mcplib_factory_command_new(lua_State *L);
 

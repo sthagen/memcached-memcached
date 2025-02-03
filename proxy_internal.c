@@ -155,12 +155,13 @@ static int proxy_storage_get(LIBEVENT_THREAD *t, item *it, mc_resp *resp,
     // io_pending owns the reference for this object now.
     io->hdr_it = it;
     io->tresp = resp; // our mc_resp is a temporary object.
-    io->io_queue_type = IO_QUEUE_EXTSTORE;
-    io->io_type = IO_PENDING_TYPE_EXTSTORE; // proxy specific sub-type.
+    io->io_queue_type = IO_QUEUE_PROXY;
+    io->io_sub_type = IO_PENDING_TYPE_EXTSTORE; // proxy specific sub-type.
     io->gettype = type;
     io->thread = t;
     io->return_cb = proxy_return_rctx_cb;
     io->finalize_cb = proxy_finalize_rctx_cb;
+    io->payload = offsetof(io_pending_proxy_t, eio);
     obj_io *eio = &io->eio;
 
     eio->buf = malloc(ntotal);
@@ -1636,30 +1637,8 @@ error:
 
 /*** Lua and internal handler ***/
 
-int mcplib_internal(lua_State *L) {
-    luaL_checkudata(L, 1, "mcp.request");
-    mcp_resp_t *r = lua_newuserdatauv(L, sizeof(mcp_resp_t), 0);
-    memset(r, 0, sizeof(mcp_resp_t));
-    luaL_getmetatable(L, "mcp.response");
-    lua_setmetatable(L, -2);
-
-    lua_pushinteger(L, MCP_YIELD_INTERNAL);
-    return lua_yield(L, 2);
-}
-
-// we're pretending to be p_c_ascii(), but reusing our already tokenized code.
-// the text parser should eventually move to the new tokenizer and we can
-// merge all of this code together.
-int mcplib_internal_run(mcp_rcontext_t *rctx) {
-    lua_State *L = rctx->Lc;
-    mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
-    mcp_resp_t *r = luaL_checkudata(L, 2, "mcp.response");
-    mc_resp *resp = resp_start_unlinked(rctx->c);
-    LIBEVENT_THREAD *t = rctx->c->thread;
+static inline int _mcplib_internal_run(LIBEVENT_THREAD *t, mcp_request_t *rq, mcp_resp_t *r, mc_resp *resp) {
     mcp_parser_t *pr = &rq->pr;
-    if (resp == NULL) {
-        return -1;
-    }
 
     // TODO: meta no-op isn't handled here. haven't decided how yet.
     switch (rq->pr.command) {
@@ -1739,16 +1718,57 @@ int mcplib_internal_run(mcp_rcontext_t *rctx) {
         }
     }
 
-    // in case someone logs this response it should make sense.
-    memcpy(r->be_name, "internal", strlen("internal"));
-    memcpy(r->be_port, "0", 1);
-
     // TODO: r-> will need status/code/mode copied from resp.
     r->cresp = resp;
     r->thread = t;
     r->cmd = rq->pr.command;
     // Always return OK from here as this is signalling an internal error.
     r->status = MCMC_OK;
+
+    return 0;
+}
+
+int mcplib_internal(lua_State *L) {
+    luaL_checkudata(L, 1, "mcp.request");
+    mcp_resp_t *r = lua_newuserdatauv(L, sizeof(mcp_resp_t), 0);
+    memset(r, 0, sizeof(mcp_resp_t));
+    luaL_getmetatable(L, "mcp.response");
+    lua_setmetatable(L, -2);
+
+    lua_pushinteger(L, MCP_YIELD_INTERNAL);
+    return lua_yield(L, 2);
+}
+
+// V2 API internal handling.
+void *mcp_rcontext_internal(mcp_rcontext_t *rctx, mcp_request_t *rq, mcp_resp_t *r) {
+    LIBEVENT_THREAD *t = rctx->fgen->thread;
+    mc_resp *resp = resp_start_unlinked(rctx->c);
+    if (resp == NULL) {
+        return NULL;
+    }
+
+    // TODO: release resp here instead on error?
+    if (_mcplib_internal_run(t, rq, r, resp) != 0) {
+        return NULL;
+    }
+
+    return resp;
+}
+
+// we're pretending to be p_c_ascii(), but reusing our already tokenized code.
+// the text parser should eventually move to the new tokenizer and we can
+// merge all of this code together.
+int mcplib_internal_run(mcp_rcontext_t *rctx) {
+    lua_State *L = rctx->Lc;
+    mcp_request_t *rq = luaL_checkudata(L, 1, "mcp.request");
+    mcp_resp_t *r = luaL_checkudata(L, 2, "mcp.response");
+    mc_resp *resp = resp_start_unlinked(rctx->c);
+    LIBEVENT_THREAD *t = rctx->c->thread;
+    if (resp == NULL) {
+        return -1;
+    }
+
+    _mcplib_internal_run(t, rq, r, resp);
 
     // resp object is associated with the
     // response object, which is about a
@@ -1763,13 +1783,10 @@ int mcplib_internal_run(mcp_rcontext_t *rctx) {
         resp->io_pending = NULL;
 
         // Add io object to extstore submission queue.
-        io_queue_t *q = conn_io_queue_get(rctx->c, IO_QUEUE_EXTSTORE);
+        io_queue_t *q = thread_io_queue_get(rctx->fgen->thread, IO_QUEUE_EXTSTORE);
         io_pending_proxy_t *io = (io_pending_proxy_t *)rctx->resp->io_pending;
 
-        io->eio.next = q->stack_ctx;
-        q->stack_ctx = &io->eio;
-        assert(q->count >= 0);
-        q->count++;
+        STAILQ_INSERT_TAIL(&q->stack, (io_pending_t *)io, iop_next);
 
         io->rctx = rctx;
         io->c = rctx->c;

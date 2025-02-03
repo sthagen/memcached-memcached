@@ -12,21 +12,6 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen);
 static void mcp_resume_rctx_from_cb(mcp_rcontext_t *rctx);
 static void proxy_return_rqu_cb(io_pending_t *pending);
 
-static inline void _mcp_queue_hack(conn *c) {
-    if (c) {
-        // HACK
-        // see notes above proxy_run_rcontext.
-        // in case the above resume calls queued new work, we have to submit
-        // it to the backend handling system here.
-        for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
-            if (q->stack_ctx != NULL) {
-                io_queue_cb_t *qcb = thread_io_queue_get(c->thread, q->type);
-                qcb->submit_cb(q);
-            }
-        }
-    }
-}
-
 // If we're GC'ed but not closed, it means it was created but never
 // attached to a function, so ensure everything is closed properly.
 int mcplib_funcgen_gc(lua_State *L) {
@@ -86,7 +71,7 @@ static void mcp_rcontext_cleanup(lua_State *L, mcp_funcgen_t *fgen, mcp_rcontext
     // cleanup of request queue entries. recurse funcgen cleanup.
     for (int x = 0; x < fgen->max_queues; x++) {
         struct mcp_rqueue_s *rqu = &rctx->qslots[x];
-        if (rqu->obj_type == RQUEUE_TYPE_POOL) {
+        if (rqu->obj_type == RQUEUE_TYPE_POOL || rqu->obj_type == RQUEUE_TYPE_INT) {
             // nothing to do.
         } else if (rqu->obj_type == RQUEUE_TYPE_FGEN) {
             // don't need to recurse, just free the subrctx.
@@ -236,7 +221,7 @@ static int _mcplib_funcgen_gencall(lua_State *L) {
         struct mcp_rqueue_s *frqu = &fgen->queue_list[x];
         struct mcp_rqueue_s *rqu = &rc->qslots[x];
         rqu->obj_type = frqu->obj_type;
-        if (frqu->obj_type == RQUEUE_TYPE_POOL) {
+        if (frqu->obj_type == RQUEUE_TYPE_POOL || frqu->obj_type == RQUEUE_TYPE_INT) {
             rqu->obj_ref = 0;
             rqu->obj = frqu->obj;
             mcp_resp_t *r = mcp_prep_bare_resobj(L, fgen->thread);
@@ -328,26 +313,23 @@ static int _mcplib_funcgen_gencall(lua_State *L) {
 static void _mcp_funcgen_return_rctx(mcp_rcontext_t *rctx) {
     mcp_funcgen_t *fgen = rctx->fgen;
     assert(rctx->pending_reqs == 0);
-    int res = lua_resetthread(rctx->Lc);
+    int res = lua_status(rctx->Lc);
     if (res != LUA_OK) {
-        // TODO: I was under the impression it was possible to reuse a
-        // coroutine from an error state, but it seems like this only works if
-        // the routine landed in LUA_YIELD or LUA_OK
-        // Leaving a note here to triple check this or if my memory was wrong.
-        // Instead for now we throw away the coroutine if it was involved in
-        // an error. Realistically this shouldn't be normal so it might not
-        // matter anyway.
+        // Can't reuse the thread if we ended in an error.
+        // Reset and close out the old thread.
+        lua_resetthread(rctx->Lc);
         lua_State *L = fgen->thread->L;
         luaL_unref(L, LUA_REGISTRYINDEX, rctx->coroutine_ref);
+        // Make a new thread.
         rctx->Lc = lua_newthread(L);
         assert(rctx->Lc);
         rctx->coroutine_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
+        // Thread is okay, clear stack and continue.
         lua_settop(rctx->Lc, 0);
     }
     rctx->wait_mode = QWAIT_IDLE;
     rctx->resp = NULL;
-    rctx->first_queue = false; // HACK
     if (rctx->request) {
         mcp_request_cleanup(fgen->thread, rctx->request);
     }
@@ -546,7 +528,7 @@ static void mcp_funcgen_cleanup(lua_State *L, mcp_funcgen_t *fgen) {
     if (fgen->queue_list) {
         for (int x = 0; x < fgen->max_queues; x++) {
             struct mcp_rqueue_s *rqu = &fgen->queue_list[x];
-            if (rqu->obj_type == RQUEUE_TYPE_POOL) {
+            if (rqu->obj_type == RQUEUE_TYPE_POOL || rqu->obj_type == RQUEUE_TYPE_INT) {
                 // just the obj_ref
                 luaL_unref(L, LUA_REGISTRYINDEX, rqu->obj_ref);
             } else if (rqu->obj_type == RQUEUE_TYPE_FGEN) {
@@ -657,6 +639,7 @@ int mcplib_funcgen_new_handle(lua_State *L) {
     mcp_funcgen_t *fgen = lua_touserdata(L, 1);
     mcp_pool_proxy_t *pp = NULL;
     mcp_funcgen_t *fg = NULL;
+    void *test = NULL;
 
     if (fgen->ready) {
         proxy_lua_error(L, "cannot modify function generator after calling ready");
@@ -665,6 +648,8 @@ int mcplib_funcgen_new_handle(lua_State *L) {
 
     if ((pp = luaL_testudata(L, 2, "mcp.pool_proxy")) != NULL) {
         // good.
+    } else if ((test = luaL_testudata(L, 2, "mcp.internal_be")) != NULL) {
+        // also good.
     } else if ((fg = luaL_testudata(L, 2, "mcp.funcgen")) != NULL) {
         if (fg->is_router) {
             proxy_lua_error(L, "cannot assign a router to a handle in new_handle");
@@ -698,6 +683,11 @@ int mcplib_funcgen_new_handle(lua_State *L) {
         rqu->obj_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         rqu->obj_type = RQUEUE_TYPE_POOL;
         rqu->obj = pp;
+    } else if (test) {
+        // pops test from the stack
+        rqu->obj_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        rqu->obj_type = RQUEUE_TYPE_INT;
+        rqu->obj = test;
     } else {
         // pops the fgen from the stack.
         mcp_funcgen_reference(L);
@@ -973,32 +963,10 @@ static void mcp_resume_rctx_from_cb(mcp_rcontext_t *rctx) {
             }
         } else if (res == LUA_YIELD) {
             // normal.
-            _mcp_queue_hack(rctx->c);
         } else {
             lua_pop(rctx->Lc, 1); // drop the error message.
             _mcp_resume_rctx_process_error(rctx, rqu);
             mcp_funcgen_return_rctx(rctx);
-        }
-    } else {
-        // Parent rctx has returned either a response or error to its top
-        // level resp object and is now complete.
-        // HACK
-        // see notes in proxy_run_rcontext()
-        // NOTE: this function is called from rqu_cb(), which pushes the
-        // submission loop. This code below can call drive_machine(), which
-        // calls submission loop if stuff is queued.
-        // Would remove redundancy if we can signal up to rqu_cb() and either
-        // q->count-- or do the inline submission at that level.
-        if (res != LUA_YIELD) {
-            mcp_funcgen_return_rctx(rctx);
-            io_queue_t *q = conn_io_queue_get(rctx->c, IO_QUEUE_PROXY);
-            q->count--;
-            if (q->count == 0) {
-                // call re-add directly since we're already in the worker thread.
-                conn_worker_readd(rctx->c);
-            }
-        } else if (res == LUA_YIELD) {
-            _mcp_queue_hack(rctx->c);
         }
     }
 }
@@ -1114,6 +1082,10 @@ int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res)
         }
     }
 
+    if (res->be && res->be->use_logging) {
+        mcplib_rqu_log(rqu->rq, res, flag, rctx->conn_fd);
+    }
+
     if (rqu->cb_ref) {
         lua_settop(rctx->Lc, 0);
         lua_rawgeti(rctx->Lc, LUA_REGISTRYINDEX, rqu->cb_ref);
@@ -1147,6 +1119,7 @@ int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res)
                                  // we settop _before_ calling cb's and
                                  // _before_ setting up for a coro resume.
     }
+
     rqu->flags |= flag;
     return rqu->flags;
 }
@@ -1180,15 +1153,50 @@ void mcp_run_rcontext_handle(mcp_rcontext_t *rctx, int handle) {
         if (rqu->obj_type == RQUEUE_TYPE_POOL) {
             mcp_request_t *rq = rqu->rq;
             mcp_backend_t *be = mcplib_pool_proxy_call_helper(rqu->obj, MCP_PARSER_KEY(rq->pr), rq->pr.klen);
-            // FIXME: queue requires conn because we're stacking objects
-            // into the connection for later submission, which means we
-            // absolutely cannot queue things once *c becomes invalid.
-            // need to assert/block this from happening.
+
             mcp_set_resobj(rqu->res_obj, rq, be, rctx->fgen->thread);
             io_pending_proxy_t *p = mcp_queue_rctx_io(rctx, rq, be, rqu->res_obj);
             p->return_cb = proxy_return_rqu_cb;
             p->queue_handle = handle;
             rctx->pending_reqs++;
+        } else if (rqu->obj_type == RQUEUE_TYPE_INT) {
+            mcp_request_t *rq = rqu->rq;
+            mc_resp *resp = mcp_rcontext_internal(rctx, rq, rqu->res_obj);
+            if (resp == NULL) {
+                // NOTE: This can be OOM (no resp alloc)
+                // or bad parse (no such command)
+                // we _could_ set an ERRMSG here.
+                mcp_resp_t *r = rqu->res_obj;
+                r->status = MCMC_ERR;
+                r->resp.code = MCMC_CODE_SERVER_ERROR;
+                io_pending_proxy_t *p = mcp_queue_rctx_io(rctx, NULL, NULL, rqu->res_obj);
+                p->return_cb = proxy_return_rqu_cb;
+                p->queue_handle = handle;
+                p->background = true;
+                rctx->pending_reqs++;
+            } else if (resp->io_pending) {
+                resp->io_pending->return_cb = proxy_return_rqu_cb;
+                // Add io object to extstore submission queue.
+                io_queue_t *q = thread_io_queue_get(rctx->fgen->thread, IO_QUEUE_EXTSTORE);
+                io_pending_proxy_t *io = (io_pending_proxy_t *)resp->io_pending;
+                io->queue_handle = handle;
+                io->client_resp = rqu->res_obj;
+
+                STAILQ_INSERT_TAIL(&q->stack, (io_pending_t *)io, iop_next);
+
+                io->rctx = rctx;
+                io->c = rctx->c;
+                io->ascii_multiget = rq->ascii_multiget;
+                // mark the buffer into the mcp_resp for freeing later.
+                rqu->res_obj->buf = io->eio.buf;
+                rctx->pending_reqs++;
+            } else {
+                io_pending_proxy_t *p = mcp_queue_rctx_io(rctx, NULL, NULL, rqu->res_obj);
+                p->return_cb = proxy_return_rqu_cb;
+                p->queue_handle = handle;
+                p->background = true;
+                rctx->pending_reqs++;
+            }
         } else if (rqu->obj_type == RQUEUE_TYPE_FGEN) {
             // TODO: NULL the ->c post-return?
             mcp_rcontext_t *subrctx = rqu->obj;
@@ -1365,32 +1373,6 @@ int mcplib_rcontext_wait_handle(lua_State *L) {
     return lua_yield(L, 1);
 }
 
-// TODO: This is disabled due to issues with the IO subsystem. Fixing this
-// requires retiring of API1 to allow refactoring or some extra roundtrip
-// work.
-// - if rctx:sleep() is called, the coroutine is suspended.
-// - once resumed after the timeout, we may later suspend again and make
-// backend requests
-// - once the coroutine is completed, we need to check if the owning client
-// conn is ready to be resumed
-// - BUG: we can only get into the "conn is in IO queue wait" state if a
-// sub-IO was created and submitted somewhere.
-// - This means either rctx:sleep() needs to be implemented by submitting a
-// dummy IO req (as other code does)
-// - OR we need to refactor the IO system so the dummies aren't required
-// anymore.
-//
-// If a dummy is used, we would have to implement this as:
-// - immediately submit a dummy IO if sleep is called.
-// - this allows the IO system to move the connection into the right state
-// - will immediately circle back then set an alarm for the sleep timeout
-// - once the sleep resumes, run code as normal. resumption should work
-// properly since we've entered the correct state originally.
-//
-// This adds a lot of CPU overhead to sleep, which should be fine given the
-// nature of the function, but also adds a lot of code and increases the
-// chances of bugs. So I'm leaving it out until this can be implemented more
-// simply.
 int mcplib_rcontext_sleep(lua_State *L) {
     mcp_rcontext_t *rctx = lua_touserdata(L, 1);
     if (rctx->wait_mode != QWAIT_IDLE) {
@@ -1462,6 +1444,103 @@ int mcplib_rcontext_result(lua_State *L) {
         lua_pushnil(L);
     }
 
+    return 2;
+}
+
+// TODO: best_result AND worst_result are EXPERIMENTAL.
+// Do not rely on their behavior yet!
+//
+// arg must be an array table.
+// returns res, GOOD|OK|ANY
+// tries to find a result in that order.
+int mcplib_rcontext_best_result(lua_State *L) {
+    mcp_rcontext_t *rctx = lua_touserdata(L, 1);
+
+    if (lua_istable(L, 2)) {
+        int final_handle = -1;
+        int final_flag = -1;
+        unsigned int len = lua_rawlen(L, 2);
+        for (int x = 0; x < len; x++) {
+            lua_rawgeti(L, 2, x+1);
+            int handle = lua_tointeger(L, 3);
+            lua_pop(L, 1);
+
+            if (handle < 0 || handle >= rctx->fgen->max_queues) {
+                proxy_lua_error(L, "invalid queue handle passed to best_result");
+            }
+
+            struct mcp_rqueue_s *rqu = &rctx->qslots[handle];
+            if (rqu->flags & RQUEUE_R_GOOD) {
+                final_handle = handle;
+                break;
+            } else if (rqu->flags & RQUEUE_R_OK) {
+                final_handle = handle;
+                final_flag = RQUEUE_R_OK;
+            } else if (final_flag != RQUEUE_R_OK) {
+                // only use an error if we don't already have an OK
+                final_handle = handle;
+            }
+        }
+
+        if (final_handle != -1) {
+            struct mcp_rqueue_s *rqu = &rctx->qslots[final_handle];
+            lua_rawgeti(L, LUA_REGISTRYINDEX, rqu->res_ref);
+            lua_pushinteger(L, rqu->flags & (RQUEUE_R_ANY|RQUEUE_R_OK|RQUEUE_R_GOOD));
+        } else {
+            lua_pushnil(L);
+            lua_pushnil(L);
+        }
+    } else {
+        proxy_lua_error(L, "must pass a table to :best_result");
+    }
+    return 2;
+}
+
+// arg must be an array table.
+// returns res, ANY|OK|GOOD
+// tries to find a result in that order.
+// TODO: test with incomplete requests? not sure what the data looks like.
+int mcplib_rcontext_worst_result(lua_State *L) {
+    mcp_rcontext_t *rctx = lua_touserdata(L, 1);
+
+    if (lua_istable(L, 2)) {
+        int final_handle = -1;
+        unsigned int len = lua_rawlen(L, 2);
+        for (int x = 0; x < len; x++) {
+            lua_rawgeti(L, 2, x+1);
+            int handle = lua_tointeger(L, 3);
+            lua_pop(L, 1);
+
+            if (handle < 0 || handle >= rctx->fgen->max_queues) {
+                proxy_lua_error(L, "invalid queue handle passed to worst_result");
+            }
+
+            struct mcp_rqueue_s *rqu = &rctx->qslots[handle];
+            if (rqu->flags & RQUEUE_R_ANY) {
+                // can't be worse than an ANY.
+                // TODO: is it possible to differentiate further?
+                final_handle = handle;
+                break;
+            } else if (rqu->flags & RQUEUE_R_OK) {
+                final_handle = handle;
+            } else if (final_handle == -1) {
+                // only allow a GOOD if it's the only thing we've seen.
+                assert(rqu->flags & RQUEUE_R_GOOD);
+                final_handle = handle;
+            }
+        }
+
+        if (final_handle != -1) {
+            struct mcp_rqueue_s *rqu = &rctx->qslots[final_handle];
+            lua_rawgeti(L, LUA_REGISTRYINDEX, rqu->res_ref);
+            lua_pushinteger(L, rqu->flags & (RQUEUE_R_ANY|RQUEUE_R_OK|RQUEUE_R_GOOD));
+        } else {
+            lua_pushnil(L);
+            lua_pushnil(L);
+        }
+    } else {
+        proxy_lua_error(L, "must pass a table to :worst_result");
+    }
     return 2;
 }
 
