@@ -954,6 +954,8 @@ static void mcp_resume_rctx_from_cb(mcp_rcontext_t *rctx) {
             } else {
                 // generate a generic object with an error.
                 _mcp_resume_rctx_process_error(rctx, rqu);
+                mcp_funcgen_return_rctx(rctx);
+                return;
             }
 
             // return ourself before telling the parent to wait.
@@ -1043,7 +1045,29 @@ void mcp_process_rctx_wait(mcp_rcontext_t *rctx, int handle) {
     }
 
     assert(rctx->pending_reqs != 0);
-    if ((status & RQUEUE_R_RESUME) || rctx->wait_done == rctx->wait_count || rctx->pending_reqs == 1) {
+    bool should_resume = (status & RQUEUE_R_RESUME);
+    if (rctx->wait_done == rctx->wait_count || rctx->pending_reqs == 1) {
+        should_resume = true;
+    } else if (status & RQUEUE_R_ERROR) {
+        // An error condition could happen without the pending req
+        // decrementing. Since this should be a rare state we do a slow check
+        // on if the wait result is still possible.
+        int possible = 0;
+        // move an errored RQU to a WAITED state so we don't block the wait on
+        // it during a future error.
+        rqu->state = RQUEUE_WAITED;
+        for (int x = 0; x < rctx->fgen->max_queues; x++) {
+            struct mcp_rqueue_s *rqu = &rctx->qslots[x];
+            if (rqu->state != RQUEUE_IDLE && rqu->state != RQUEUE_WAITED) {
+                possible++;
+            }
+        }
+        if (possible == 0) {
+            should_resume = true;
+        }
+    }
+
+    if (should_resume) {
         // ran out of stuff to wait for. time to resume.
         // TODO: can we do the settop at the yield? nothing we need to
         // keep in the stack in this mode.
@@ -1080,6 +1104,8 @@ int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res)
         } else {
             flag = RQUEUE_R_OK;
         }
+    } else {
+        flag = RQUEUE_R_ERROR;
     }
 
     if (res->be && res->be->use_logging) {
@@ -1447,9 +1473,6 @@ int mcplib_rcontext_result(lua_State *L) {
     return 2;
 }
 
-// TODO: best_result AND worst_result are EXPERIMENTAL.
-// Do not rely on their behavior yet!
-//
 // arg must be an array table.
 // returns res, GOOD|OK|ANY
 // tries to find a result in that order.
@@ -1470,7 +1493,9 @@ int mcplib_rcontext_best_result(lua_State *L) {
             }
 
             struct mcp_rqueue_s *rqu = &rctx->qslots[handle];
-            if (rqu->flags & RQUEUE_R_GOOD) {
+            if (!rqu->flags) {
+                continue; // error or unprocessed.
+            } else if (rqu->flags & RQUEUE_R_GOOD) {
                 final_handle = handle;
                 break;
             } else if (rqu->flags & RQUEUE_R_OK) {
@@ -1505,6 +1530,7 @@ int mcplib_rcontext_worst_result(lua_State *L) {
 
     if (lua_istable(L, 2)) {
         int final_handle = -1;
+        int final_flags = 0;
         unsigned int len = lua_rawlen(L, 2);
         for (int x = 0; x < len; x++) {
             lua_rawgeti(L, 2, x+1);
@@ -1516,17 +1542,12 @@ int mcplib_rcontext_worst_result(lua_State *L) {
             }
 
             struct mcp_rqueue_s *rqu = &rctx->qslots[handle];
-            if (rqu->flags & RQUEUE_R_ANY) {
-                // can't be worse than an ANY.
-                // TODO: is it possible to differentiate further?
+            if (!rqu->flags) {
+                continue;
+            } else if (final_flags <= rqu->flags) {
+                // flag values increase by how bad they are.
                 final_handle = handle;
-                break;
-            } else if (rqu->flags & RQUEUE_R_OK) {
-                final_handle = handle;
-            } else if (final_handle == -1) {
-                // only allow a GOOD if it's the only thing we've seen.
-                assert(rqu->flags & RQUEUE_R_GOOD);
-                final_handle = handle;
+                final_flags = rqu->flags;
             }
         }
 

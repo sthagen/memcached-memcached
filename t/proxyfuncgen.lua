@@ -79,6 +79,8 @@ function new_basic_factory(arg, func)
     -- here would be a good place to do bounds checking on arguments in
     -- similar functions.
     o.wait = arg.wait
+    o.timeout = arg.timeout
+    o.mode = arg.mode
     for _, v in pairs(arg.list) do
         table.insert(o.t, fgen:new_handle(v))
         o.c = o.c + 1
@@ -616,6 +618,62 @@ function badreturn_gen(rctx)
     end
 end
 
+-- TODO: should really make the wait time ignored if timeout is nil? throws an
+-- error but means more lua to deal with optional waits...
+function bestres_factory_gen(rctx, arg)
+    local handles = arg.t
+    local timeout = nil
+    if arg.timeout then
+        timeout = arg.timeout
+    end
+    return function(r)
+        rctx:enqueue(r, handles)
+        if timeout then
+            rctx:wait_cond(#handles, mcp.WAIT_ANY, timeout)
+        else
+            rctx:wait_cond(#handles)
+        end
+        local res, tag = rctx:best_result(handles)
+        return res
+    end
+end
+
+function worstres_factory_gen(rctx, arg)
+    local handles = arg.t
+    return function(r)
+        rctx:enqueue(r, handles)
+        rctx:wait_cond(#handles)
+        local res, tag = rctx:worst_result(handles)
+        return res
+    end
+end
+
+function timeout_factory_gen(rctx, arg)
+    local handles = arg.t
+    local wait = #handles
+    local timeout = nil
+    local mode = mcp.WAIT_GOOD
+    if arg.wait then
+        wait = arg.wait
+    end
+    if arg.timeout then
+        timeout = arg.timeout
+    end
+    if arg.mode then
+        mode = arg.mode
+    end
+    return function(r)
+        rctx:enqueue(r, handles)
+        if timeout then
+            rctx:wait_cond(wait, mode, timeout)
+        else
+            rctx:wait_cond(wait, mode)
+        end
+        local res, tag = rctx:best_result(handles)
+        return res
+    end
+end
+
 -- TODO: this might be supported only in a later update.
 -- new queue after parent return
 -- - do an immediate return + cb queue, queue from that callback
@@ -655,9 +713,20 @@ function mcp_config_routes(p)
     local suberr_wrap = new_direct_factory({ p = suberrors, name = "suberrwrap" })
     local badreturn = new_error_factory(badreturn_gen, "badreturn")
 
+    local bestres = new_basic_factory({ list = p, name = "bestres" }, bestres_factory_gen)
+    local bestrestime = new_basic_factory({ list = p, timeout = 0.5, name = "bestres" }, bestres_factory_gen)
+    local worstres = new_basic_factory({ list = p, name = "worstres" }, worstres_factory_gen)
+
     -- for testing traffic splitting.
     local split = new_split_factory({ a = single, b = singletwo, name = "split" })
     local splitfailover = new_split_factory({ a = failover, b = singletwo, name = "splitfailover" })
+
+    -- test timeout via subrctx's that themselves timeout
+    local timesubone = new_basic_factory({ list = { p[1] }, timeout = 0.25, name = "timesubone" }, timeout_factory_gen)
+    local timesubtwo = new_basic_factory({ list = { p[2] }, timeout = 0.25, name = "timesubone" }, timeout_factory_gen)
+    local timesubthr = new_basic_factory({ list = { p[3] }, timeout = 0.25, name = "timesubone" }, timeout_factory_gen)
+    local timetop = new_basic_factory({ list = { timesubone, timesubtwo, timesubthr }, wait = 1, name = "timetop" }, timeout_factory_gen)
+    local timefgtop = new_basic_factory({ list = { timesubone, timesubtwo, timesubthr }, wait = 2, mode = mcp.WAIT_FASTGOOD, name = "timefgtop" }, timeout_factory_gen)
 
     local map = {
         ["single"] = single,
@@ -678,6 +747,11 @@ function mcp_config_routes(p)
         ["splitfailover"] = splitfailover,
         ["locality"] = locality,
         ["badreturn"] = badreturn,
+        ["bestres"] = bestres,
+        ["bestrestime"] = bestrestime,
+        ["worstres"] = worstres,
+        ["timetop"] = timetop,
+        ["timefgtop"] = timefgtop,
     }
 
     local parg = {
