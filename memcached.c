@@ -551,6 +551,8 @@ void conn_worker_readd(conn *c) {
             // any recursion here.
             event_active(&c->event, 0, 0);
             break;
+        case conn_nread:
+            // ran IO queue while waiting for set payload.
         case conn_write:
         case conn_mwrite:
         case conn_read:
@@ -1415,6 +1417,11 @@ static void reset_cmd_handler(conn *c) {
         conn_set_state(c, conn_parse_cmd);
     } else if (c->resp_head) {
         conn_set_state(c, conn_mwrite);
+    } else if (c->ssl_enabled && ssl_pending(c->ssl)) {
+        // We may have pending bytes in the TLS BIO because of a mismatch
+        // between TLS records and occasional direct reads from the network.
+        // Round-trip back through the read code instead of stopping.
+        conn_set_state(c, conn_read);
     } else {
         conn_set_state(c, conn_waiting);
     }
@@ -1796,7 +1803,7 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("proxy_conn_requests", "%llu", (unsigned long long)thread_stats.proxy_conn_requests);
         APPEND_STAT("proxy_conn_errors", "%llu", (unsigned long long)thread_stats.proxy_conn_errors);
         APPEND_STAT("proxy_conn_oom", "%llu", (unsigned long long)thread_stats.proxy_conn_oom);
-        APPEND_STAT("proxy_req_active", "%llu", (unsigned long long)thread_stats.proxy_req_active);
+        APPEND_STAT("proxy_req_active", "%lld", (long long int)thread_stats.proxy_req_active);
     }
 #endif
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
@@ -3314,10 +3321,12 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_closing:
-            if (IS_UDP(c->transport))
-                conn_cleanup(c);
-            else
-                conn_close(c);
+            if (!c->resps_suspended) {
+                if (IS_UDP(c->transport))
+                    conn_cleanup(c);
+                else
+                    conn_close(c);
+            }
             stop = true;
             break;
 
@@ -4446,7 +4455,7 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
     {
         struct timeval tv;
         gettimeofday(&tv, NULL);
-        restart_set_kv(ctx, "stop_time", "%lu", tv.tv_sec);
+        restart_set_kv(ctx, "stop_time", "%llu", (unsigned long long) tv.tv_sec);
     }
 
     // Might as well just fetch the next CAS value to use than tightly

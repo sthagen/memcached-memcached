@@ -31,6 +31,7 @@ $t->set_c($ps);
 $t->accept_backends();
 {
     # Comment out unused sections when debugging.
+    test_complex();
     test_timesub();
     test_best();
     test_worst();
@@ -41,6 +42,7 @@ $t->accept_backends();
     test_waitfor();
     # Run test returns twice for extra leak checking.
     my $func_before = mem_stats($ps, "proxyfuncs");
+    test_proxycancel();
     test_returns();
     test_returns();
     subtest 'final func counts' => sub {
@@ -50,6 +52,39 @@ $t->accept_backends();
 }
 
 done_testing();
+
+sub test_proxycancel {
+    subtest 'close conn while uploading, ensure no asserts' => sub {
+        for (1 .. 10) {
+            my $s = $p_srv->new_sock;
+            print $s "ms cancelable 5\r\n";
+            $s->close;
+        }
+        $t->clear();
+    };
+
+    subtest 'close conn after corrupt upload' => sub {
+        for (1 .. 10) {
+            my $s = $p_srv->new_sock;
+            print $s "ms badchunk 2\r\nfail";
+            $s->close;
+        }
+        $t->clear();
+        ok("didn't assert from corrupted uploads");
+    };
+}
+
+sub test_complex {
+    subtest 'complex with post-result asyncs' => sub {
+        $t->c_send("mg complex/a t\r\n");
+        #$t->be_recv_c([0, 1, 2], "received request");
+        $t->c_recv("SERVER_ERROR backend failure\r\n", "client received error");
+        $t->be_recv_c([0, 1], "received one request");
+        $t->be_send(0, "HD t30\r\n");
+        $t->be_send(1, "HD t31\r\n");
+        $t->clear();
+    };
+}
 
 sub test_timesub {
     subtest 'rctx WAIT_GOOD with timed out subrctx' => sub {
@@ -264,6 +299,24 @@ sub test_logging {
         $t->clear();
     };
 
+    subtest 'subrctx log error' => sub {
+        my $w = $p_srv->new_sock;
+        print $w "watch proxyreqs\n";
+        is(<$w>, "OK\r\n", 'watcher enabled');
+
+        $t->c_send("mg subfastlog/a t\r\n");
+        $t->be_recv_c([4]);
+        $t->be_send([4], "SERVER_ERROR busted\r\n");
+        $t->c_recv_be();
+
+        my $l2 = scalar <$w>;
+        like($l2, qr/detail=fastlog/, 'got logreq line');
+        like($l2, qr/cfd=/, 'client file descriptor present');
+        unlike($l2, qr/cfd=0/, 'client file descriptor is nonzero');
+
+        $t->clear();
+    };
+
     # test sampling when not error
     # test always log when slow/fast
 }
@@ -425,6 +478,14 @@ sub test_returns {
 
         $t->c_send("mg suberrors/none t\r\n");
         $t->c_recv("SERVER_ERROR backend failure\r\n", "lua returned nothing");
+        $t->clear();
+
+        $t->c_send("mg suberrors/resume t\r\n");
+        $t->c_recv("SERVER_ERROR backend failure\r\n", "lua returned error");
+        $t->clear();
+
+        $t->c_send("mg suberrors/stringt\r\n");
+        $t->c_recv("SERVER_ERROR backend failure\r\n", "lua returned error");
         $t->clear();
     };
 }

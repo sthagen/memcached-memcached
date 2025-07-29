@@ -404,6 +404,7 @@ void mcp_funcgen_return_rctx(mcp_rcontext_t *rctx) {
         return;
     }
     WSTAT_DECR(rctx->fgen->thread, proxy_req_active, 1);
+    assert(rctx->fgen->thread->stats.proxy_req_active >= 0);
     _mcp_funcgen_return_rctx(rctx);
     _mcplib_funcgen_cache(fgen, rctx);
 }
@@ -800,7 +801,6 @@ static void _mcplib_rcontext_queue(lua_State *L, mcp_rcontext_t *rctx, mcp_reque
         lua_pushvalue(L, 2); // duplicate the request obj
         lua_rawgeti(subrctx->Lc, LUA_REGISTRYINDEX, subrctx->function_ref);
         lua_xmove(L, subrctx->Lc, 1); // move the requet object.
-        subrctx->pending_reqs++;
     }
 
     // hold the request reference.
@@ -1105,11 +1105,7 @@ int mcp_process_rqueue_return(mcp_rcontext_t *rctx, int handle, mcp_resp_t *res)
             flag = RQUEUE_R_OK;
         }
     } else {
-        flag = RQUEUE_R_ERROR;
-    }
-
-    if (res->be && res->be->use_logging) {
-        mcplib_rqu_log(rqu->rq, res, flag, rctx->conn_fd);
+        flag |= RQUEUE_R_ERROR;
     }
 
     if (rqu->cb_ref) {
@@ -1156,7 +1152,22 @@ static void proxy_return_rqu_cb(io_pending_t *pending) {
     mcp_rcontext_t *rctx = p->rctx;
 
     if (p->client_resp) {
-        mcp_process_rqueue_return(rctx, p->queue_handle, p->client_resp);
+        mcp_resp_t *res = p->client_resp;
+        mcp_process_rqueue_return(rctx, p->queue_handle, res);
+        if (res->be && res->be->use_logging) {
+            struct mcp_rqueue_s *rqu = &rctx->qslots[p->queue_handle];
+            int conn_fd = 0;
+            // TODO: would be nice to have fast-access to top level.
+            mcp_rcontext_t *n_rctx = rctx;
+            while (n_rctx) {
+                if (!n_rctx->parent) {
+                    conn_fd = n_rctx->conn_fd;
+                    break;
+                }
+                n_rctx = n_rctx->parent;
+            }
+            mcplib_rqu_log(rqu->rq, res, rqu->flags, conn_fd);
+        }
     }
     rctx->pending_reqs--;
     assert(rctx->pending_reqs > -1);
@@ -1227,6 +1238,7 @@ void mcp_run_rcontext_handle(mcp_rcontext_t *rctx, int handle) {
             // TODO: NULL the ->c post-return?
             mcp_rcontext_t *subrctx = rqu->obj;
             subrctx->c = rctx->c;
+            subrctx->pending_reqs++;
             rctx->pending_reqs++;
             mcp_start_subrctx(subrctx);
         } else {

@@ -58,6 +58,7 @@ typedef struct mcmc_ctx {
 // break so long as the passed in 'len' is reasonable.
 MCMC_STATIC int _mcmc_tokenize_meta(mcmc_tokenizer_t *t, const char *line, size_t len, const int mstart, const int max) {
     const char *s = line;
+    const char *end;
     t->metaflags = 0;
 
     // since multigets can be huge, we can't purely judge reqlen against this
@@ -67,56 +68,51 @@ MCMC_STATIC int _mcmc_tokenize_meta(mcmc_tokenizer_t *t, const char *line, size_
     }
 
     if (line[len-2] == '\r') {
-        len -= 2;
+        end = s + len - 2;
     } else {
-        len -= 1;
+        end = s + len - 1;
     }
 
-    const char *end = s + len;
     int curtoken = 0;
 
-    int state = 0;
     while (s != end) {
-        switch (state) {
-            case 0:
-                // scanning for first non-space to find a token.
-                if (*s != ' ') {
-                    if (curtoken >= mstart) {
-                        if (*s > 64 && *s < 123) {
-                            t->metaflags |= (uint64_t)1 << (*s - 65);
-                        } else if (isdigit(*s) == 0) {
-                            return MCMC_NOK;
-                        }
-                    }
-                    t->tokens[curtoken] = s - line;
-                    if (++curtoken == max) {
-                        s++;
-                        state = 2;
-                        break;
-                    }
-                    state = 1;
-                }
+        if (curtoken >= mstart) {
+            if (*s > 64 && *s < 123) {
+                t->metaflags |= (uint64_t)1 << (*s - 65);
+            } else if (isdigit(*s) == 0) {
+                return MCMC_NOK;
+            }
+        }
+        t->tokens[curtoken] = s - line;
+        if (++curtoken == max) {
+            s++;
+            // hit max tokens before end of the line.
+            // keep advancing so we can place endcap token.
+            s = memchr(s, ' ', end - s);
+            if (!s) {
+                s = end;
+            }
+            break;
+        }
+        s++;
+        // avoid memchr if we were a single byte token.
+        if (*s == ' ') {
+            while (*s == ' ' && s != end) {
                 s++;
+            }
+        } else {
+            // advance over a token
+            s = memchr(s, ' ', end - s);
+            if (!s) {
+                s = end;
                 break;
-            case 1:
-                // advance over a token
-                if (*s != ' ') {
-                    s++;
-                } else {
-                    state = 0;
+            } else {
+                while (*s == ' ' && s != end) {
+                    s++; // skip any spaces until the next token.
                 }
-                break;
-            case 2:
-                // hit max tokens before end of the line.
-                // keep advancing so we can place endcap token.
-                if (*s == ' ') {
-                    goto endloop;
-                }
-                s++;
-                break;
+            }
         }
     }
-endloop:
 
     // endcap token so we can quickly find the length of any token by looking
     // at the next one.
@@ -518,28 +514,20 @@ MCMC_STATIC int mcmc_toktou64(const char *t, size_t len, uint64_t *out) {
     return MCMC_OK;
 }
 
-// TODO: these funcs aren't defending against len == 0
-// note that the command strings _must_ end in a \n so it _should_ be
-// impossible to land after the buffer.
-// However this should be adjusted next time I work on it:
-// - instead of len, calculate end.
-// - only do '-' check if pos != end
-// - check pos against end in the while loop and just incr pos
-
 MCMC_STATIC int mcmc_tokto32(const char *t, size_t len, int32_t *out) {
     int32_t sum = 0;
     const char *pos = t;
+    const char *end = pos + len;
     int is_sig = 0;
     if (len > MCMC_TOKTO32_MAX) {
         return MCMC_TOKTO_ELONG;
     }
     // If we're negative the first character must be -
-    if (pos[0] == '-') {
-        len--;
+    if (pos != end && pos[0] == '-') {
         pos++;
         is_sig = 1;
     }
-    while (len--) {
+    while (pos != end) {
         char num = pos[0] - '0';
         if (num > -1 && num < 10) {
             if (is_sig) {
@@ -567,17 +555,17 @@ MCMC_STATIC int mcmc_tokto32(const char *t, size_t len, int32_t *out) {
 MCMC_STATIC int mcmc_tokto64(const char *t, size_t len, int64_t *out) {
     int64_t sum = 0;
     const char *pos = t;
+    const char *end = pos + len;
     int is_sig = 0;
     if (len > MCMC_TOKTO64_MAX) {
         return MCMC_TOKTO_ELONG;
     }
     // If we're negative the first character must be -
-    if (pos[0] == '-') {
-        len--;
+    if (pos != end && pos[0] == '-') {
         pos++;
         is_sig = 1;
     }
-    while (len--) {
+    while (pos != end) {
         char num = pos[0] - '0';
         if (num > -1 && num < 10) {
             if (is_sig) {
@@ -620,7 +608,7 @@ int mcmc_tokenize(const char *l, size_t len, mcmc_tokenizer_t *t, int meta_offse
 }
 
 const char *mcmc_token_get(const char *l, mcmc_tokenizer_t *t, int idx, int *len) {
-    if (idx > 0 && idx < t->ntokens) {
+    if (idx >= 0 && idx < t->ntokens) {
         return _mcmc_token(l, t, idx, len);
     } else {
         return NULL;
