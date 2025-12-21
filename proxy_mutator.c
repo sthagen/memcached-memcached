@@ -295,7 +295,8 @@ mut_step_n(cmdcopy) {
                 // command must be at the start
                 const char *cmd = srq->pr.request;
                 // command ends at the first token
-                int clen = srq->pr.tokens[1];
+                // FIXME: use the mcmc API to pull the token.
+                int clen = srq->pr.tok.tokens[1];
                 if (cmd[clen] == ' ') {
                     clen--;
                 }
@@ -350,7 +351,7 @@ mut_step_n(keycopy) {
         case LUA_TUSERDATA:
             _mut_checkudata(L, idx, &srq, &srs);
             if (srq) {
-                p->src = MCP_PARSER_KEY(srq->pr);
+                p->src = MCP_PARSER_KEY(&srq->pr);
                 p->slen = srq->pr.klen;
             } else {
                 // TODO: if a result object:
@@ -821,13 +822,11 @@ mut_step_n(flagcopy) {
                 if (srq->pr.cmd_type != CMD_TYPE_META) {
                     return -1;
                 }
-                if (srq->pr.t.meta.flags & c->bit) {
-                    const char *tok = NULL;
-                    size_t tlen = 0;
+                int tlen = 0;
+                if (mcmc_token_has_flag_bit(&srs->tok, c->bit) == MCMC_OK) {
+                    const char *tok = mcmc_token_get_flag(srq->pr.request, &srq->pr.tok, c->f, &tlen);
                     p->slen = 1;
-                    mcp_request_find_flag_token(srq, c->f, &tok, &tlen);
-
-                    if (tlen > 0) {
+                    if (tok && tlen > 0) {
                         p->src = tok;
                         p->slen += tlen;
                     }
@@ -1210,9 +1209,7 @@ static int mcp_mut_run(struct mcp_mut_run *run) {
                 proxy_lua_error(run->L, "mutator: failed to allocate value buffer");
                 return 0;
             }
-            pthread_mutex_lock(&t->proxy_limit_lock);
             t->proxy_buffer_memory_used += rq->pr.vlen;
-            pthread_mutex_unlock(&t->proxy_limit_lock);
 
             rq->pr.vlen = run->vlen;
             memcpy(rq->pr.vbuf, run->vbuf, run->vlen);
@@ -1254,9 +1251,7 @@ static int mcp_mut_run(struct mcp_mut_run *run) {
         // limits, and just doing an increment here removes some potential
         // error handling. Requests that are already started should be allowed
         // to complete to minimize impact of hitting memory limits.
-        pthread_mutex_lock(&t->proxy_limit_lock);
         t->proxy_buffer_memory_used += rs->blen;
-        pthread_mutex_unlock(&t->proxy_limit_lock);
     }
 
     return ret;

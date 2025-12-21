@@ -400,6 +400,7 @@ struct stats {
     uint64_t      slab_reassign_busy_items; /* valid temporarily unmovable */
     uint64_t      slab_reassign_busy_deletes; /* refcounted items killed */
     uint64_t      slab_reassign_busy_nomem; /* valid items lost during slab move */
+    const char *  slab_reassign_last_busy_status; /* text of last busy item status */
     uint64_t      lru_crawler_starts; /* Number of item crawlers kicked off */
     uint64_t      lru_maintainer_juggles; /* number of LRU bg pokes */
     uint64_t      time_in_listen_disabled_us;  /* elapsed time in microseconds while server unable to process new connections */
@@ -588,6 +589,8 @@ extern struct settings settings;
 /* if item key was sent in binary */
 #define ITEM_KEY_BINARY 4096
 
+#define ITEM_PRESERVE_FLAGS (ITEM_FETCHED|ITEM_TOKEN_SENT|ITEM_STALE|ITEM_KEY_BINARY)
+
 /**
  * Structure for storing items within memcached.
  */
@@ -748,15 +751,14 @@ typedef struct {
     void *proxy_int_stats;
     void *proxy_event_thread; // worker threads can also be proxy IO threads
     struct event *proxy_gc_timer; // periodic GC pushing.
-    pthread_mutex_t proxy_limit_lock;
     int proxy_vm_extra_kb;
     int proxy_vm_last_kb;
     unsigned int proxy_vm_negative_delta;
     int proxy_vm_gcrunning;
     int proxy_vm_gcpokemem;
     int64_t proxy_active_req_limit;
-    uint64_t proxy_buffer_memory_limit; // protected by limit_lock
-    uint64_t proxy_buffer_memory_used; // protected by limit_lock
+    uint64_t proxy_buffer_memory_limit;
+    uint64_t proxy_buffer_memory_used;
     uint32_t proxy_rng[4]; // fast per-thread rng for lua.
     // TODO: add ctx object so we can attach to queue.
 #endif
@@ -786,6 +788,10 @@ typedef struct _mc_resp {
     bool skip;
     bool suspended; // waiting for response from subsystem
     bool free; // double free detection.
+    bool noreply; // TODO: remove if we can rely on skip-only
+    bool binary_prot; // let main ascii prot know if we're binary or not
+    bool mset_res; // whether we're completing an mset across a netread
+    bool set_stale; // mset flag
 #ifdef PROXY
     bool proxy_res; // we're handling a proxied response buffer.
 #endif
@@ -832,8 +838,6 @@ struct conn {
     int    sfd;
     bool sasl_started;
     bool authenticated;
-    bool set_stale;
-    bool mset_res; /** uses mset format for return code */
     bool close_after_write; /** flush write then move to close connection */
     bool rbuf_malloced; /** read buffer was malloc'ed for ascii mget, needs free() */
     bool item_malloced; /** item for conn_nread state is a temporary malloc */
@@ -886,7 +890,6 @@ struct conn {
     struct sockaddr_in6 request_addr; /* udp: Who sent the most recent request */
     socklen_t request_addr_size;
 
-    bool   noreply;   /* True if the reply should not be sent. */
     /* current stats command */
     struct {
         char *buffer;

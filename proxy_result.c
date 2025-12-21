@@ -8,6 +8,21 @@ int mcplib_response_elapsed(lua_State *L) {
     return 1;
 }
 
+#define res_buf(r) (r->cresp ? r->cresp->iov[0].iov_base : r->buf)
+
+// TODO: won't always get the full buffer. need to refactor the result object
+// one more time.
+int mcplib_response_raw_string(lua_State *L) {
+    mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
+    const char *buf = res_buf(r);
+    if (buf) {
+        lua_pushlstring(L, buf, r->blen);
+    } else {
+        lua_pushnil(L);
+    }
+    return 1;
+}
+
 // resp:ok()
 int mcplib_response_ok(lua_State *L) {
     mcp_resp_t *r = luaL_checkudata(L, -1, "mcp.response");
@@ -123,9 +138,7 @@ void mcp_response_cleanup(LIBEVENT_THREAD *t, mcp_resp_t *r) {
     // On error/similar we might be holding the read buffer.
     // If the buf is handed off to mc_resp for return, this pointer is NULL
     if (r->buf != NULL) {
-        pthread_mutex_lock(&t->proxy_limit_lock);
-        t->proxy_buffer_memory_used -= r->blen + r->extra;
-        pthread_mutex_unlock(&t->proxy_limit_lock);
+        t->proxy_buffer_memory_used -= r->blen;
 
         free(r->buf);
         r->buf = NULL;

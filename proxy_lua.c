@@ -569,7 +569,8 @@ static mcp_backend_wrap_t *_mcplib_backend_checkcache(lua_State *L, mcp_backend_
         if (strncmp(be_orig->be->name, bel->name, MAX_NAMELEN) == 0
                 && strncmp(be_orig->be->port, bel->port, MAX_PORTLEN) == 0
                 && be_orig->be->conncount == bel->conncount
-                && memcmp(&be_orig->be->tunables, &bel->tunables, sizeof(bel->tunables)) == 0) {
+                && memcmp(&be_orig->be->tunables, &bel->tunables, sizeof(bel->tunables)) == 0
+                && memcmp(&be_orig->be->logging, &bel->logging, sizeof(bel->logging)) == 0) {
             // backend is the same, return it.
             return be_orig;
         } else {
@@ -1732,6 +1733,8 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"key", mcplib_request_key},
         {"ltrimkey", mcplib_request_ltrimkey},
         {"rtrimkey", mcplib_request_rtrimkey},
+        {"raw_line", mcplib_request_raw_line},
+        {"raw_value", mcplib_request_raw_value},
         {"token", mcplib_request_token},
         {"token_int", mcplib_request_token_int},
         {"ntokens", mcplib_request_ntokens},
@@ -1756,6 +1759,7 @@ int proxy_register_libs(void *ctx, LIBEVENT_THREAD *t, void *state) {
         {"line", mcplib_response_line},
         {"flag_blank", mcplib_response_flag_blank},
         {"elapsed", mcplib_response_elapsed},
+        {"raw_string", mcplib_response_raw_string},
         {"__gc", mcplib_response_gc},
         {"__close", mcplib_response_close},
         {"close", mcplib_response_close},

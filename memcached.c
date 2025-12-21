@@ -715,8 +715,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->rbuf_malloced = false;
     c->item_malloced = false;
     c->sasl_started = false;
-    c->set_stale = false;
-    c->mset_res = false;
     c->close_after_write = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
     assert(c->resps_suspended == 0);
@@ -726,8 +724,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 #ifdef TLS
     c->ssl_wbuf = NULL;
 #endif
-
-    c->noreply = false;
 
     if (ssl) {
         // musn't get here without ssl enabled.
@@ -975,9 +971,7 @@ void resp_reset(mc_resp *resp) {
 #ifdef PROXY
         if (resp->proxy_res) {
             LIBEVENT_THREAD *t = resp->bundle->thread;
-            pthread_mutex_lock(&t->proxy_limit_lock);
             t->proxy_buffer_memory_used -= resp->wbytes;
-            pthread_mutex_unlock(&t->proxy_limit_lock);
         }
 #endif
         free(resp->write_and_free);
@@ -1192,9 +1186,7 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
 #ifdef PROXY
         if (resp->proxy_res) {
             LIBEVENT_THREAD *t = resp->bundle->thread;
-            pthread_mutex_lock(&t->proxy_limit_lock);
             t->proxy_buffer_memory_used -= resp->wbytes;
-            pthread_mutex_unlock(&t->proxy_limit_lock);
         }
 #endif
         free(resp->write_and_free);
@@ -1234,7 +1226,7 @@ void out_string(conn *c, const char *str) {
     // tosend and reset if nonzero?
     resp_reset(resp);
 
-    if (c->noreply) {
+    if (resp->noreply) {
         // TODO: just invalidate the response since nothing's been attempted
         // to send yet?
         resp->skip = true;
@@ -1267,7 +1259,7 @@ void out_string(conn *c, const char *str) {
 // For metaget-style ASCII commands. Ignores noreply, ensuring clients see
 // protocol level errors.
 void out_errstring(conn *c, const char *str) {
-    c->noreply = false;
+    c->resp->noreply = false;
     out_string(c, str);
 }
 
@@ -1861,6 +1853,7 @@ void server_stats(ADD_STAT add_stats, void *c) {
         APPEND_STAT("slab_reassign_busy_items", "%llu", stats.slab_reassign_busy_items);
         APPEND_STAT("slab_reassign_busy_deletes", "%llu", stats.slab_reassign_busy_deletes);
         APPEND_STAT("slab_reassign_busy_nomem", "%llu", stats.slab_reassign_busy_nomem);
+        APPEND_STAT("slab_reassign_last_busy_status", "%s", stats.slab_reassign_last_busy_status);
         APPEND_STAT("slab_reassign_running", "%u", stats_state.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }
@@ -1990,7 +1983,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("proxy_enabled", "%s", settings.proxy_enabled ? "yes" : "no");
     APPEND_STAT("proxy_uring_enabled", "%s", settings.proxy_uring ? "yes" : "no");
 #endif
-    APPEND_STAT("num_napi_ids", "%s", settings.num_napi_ids);
+    APPEND_STAT("num_napi_ids", "%d", settings.num_napi_ids);
     APPEND_STAT("memory_file", "%s", settings.memory_file);
     APPEND_STAT("client_flags_size", "%d", sizeof(client_flags_t));
 }
@@ -3094,7 +3087,6 @@ static void drive_machine(conn *c) {
             break;
 
         case conn_parse_cmd:
-            c->noreply = false;
             if (c->try_read_command(c) == 0) {
                 /* we need more data! */
                 if (c->resp_head) {
@@ -3209,11 +3201,6 @@ static void drive_machine(conn *c) {
                 out_of_memory(c, "SERVER_ERROR Out of memory during read");
                 c->sbytes = c->rlbytes;
                 conn_set_state(c, conn_swallow);
-                // Ensure this flag gets cleared. It gets killed on conn_new()
-                // so any conn_closing is fine, calling complete_nread is
-                // fine. This swallow semms to be the only other case.
-                c->set_stale = false;
-                c->mset_res = false;
                 break;
             }
             /* otherwise we have a real error, on which we close the connection */
@@ -3931,11 +3918,23 @@ static void clock_handler(const evutil_socket_t fd, const short which, void *arg
     // This function should be quick to avoid delaying the timer.
     assoc_start_expand(stats_state.curr_items);
     // also, if HUP'ed we need to do some maintenance.
-    // for now that's just the authfile reload.
+    // for now that's just the authfile and TLS certificates reload.
     if (settings.sig_hup) {
         settings.sig_hup = false;
 
         authfile_load(settings.auth_file);
+
+#ifdef TLS
+        if (settings.ssl_ctx != NULL) {
+            char *errmsg = NULL;
+            refresh_certs(&errmsg);
+            if (errmsg != NULL) {
+                vperror("Could not reload TLS certificates on SIGHUP: %s", errmsg);
+                free(errmsg);
+            }
+        }
+#endif
+
 #ifdef PROXY
         if (settings.proxy_ctx) {
             proxy_start_reload(settings.proxy_ctx);
@@ -3998,10 +3997,13 @@ static void usage(void) {
             settings.access);
 #endif /* #ifndef DISABLE_UNIX_SOCKET */
     printf("-A, --enable-shutdown     enable ascii \"shutdown\" command\n");
-    printf("-l, --listen=<addr>       interface to listen on (default: INADDR_ANY)\n");
+    printf("-l, --listen=<addr>       interface to listen on (default: INADDR_ANY)\n"
+           "                          can specify multiple comma separated listeners configured with different protocols\n"
+           "                          format: proto[<protcol>]:tag[<name>]:ip:port\n"
+           "                          i.e -l proto[binary]:tag[services]:127.0.0.1:11211,proto[ascii]:tag_tools_:127.0.0.1:11212\n");
 #ifdef TLS
-    printf("                          if TLS/SSL is enabled, 'notls' prefix can be used to\n"
-           "                          disable for specific listeners (-l notls:<ip>:<port>) \n");
+    printf("                          if TLS/SSL is enabled, 'notls', 'btls', 'mtls' prefix can be used to\n"
+           "                          specify for specific listeners no tls, basic tls, or peer-auth tls (i.e -l mtls:proto[ascii]:tag_tools_:127.0.0.1:11212\n");
 #endif
     printf("-d, --daemon              run as a daemon\n"
            "-r, --enable-coredumps    maximize core file limit\n"
@@ -5390,6 +5392,7 @@ int main (int argc, char **argv) {
                     goto error;
                 }
                 settings.logger_buf_size *= 1024; /* kilobytes */
+                break;
             case SLAB_SIZES:
                 slab_sizes_unparsed = strdup(subopts_value);
                 break;

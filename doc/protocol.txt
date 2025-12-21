@@ -542,6 +542,7 @@ The flags used by the 'mg' command are:
 
 - b: interpret key as base64 encoded binary value
 - c: return item cas token
+- C(token): check CAS, do not send value if matches
 - f: return client flags token
 - h: return whether item has been hit before as a 0 or 1
 - k: return key as a token
@@ -574,6 +575,16 @@ are sent to memcached in base64 encoding.
 
 If 'b' flag is sent in the response, and a key is returned via 'k', this
 signals to the client that the key is base64 encoded binary.
+
+- C(token): check CAS value against item, remove 'v' flag if matches
+
+If a CAS token is supplied with C, and a 'v' flag is supplied, only return the
+value if the CAS flag does NOT match. The response code will be "HD" if the
+CAS does match, else "VA <size>" if the CAS does not match. This allows
+conditionally fetching the value of an item only if it has changed.
+
+All other flags behave as normal, example: T(token) will update the TTL
+regardless of if the CAS matches.
 
 - h: return whether item has been hit before as a 0 or 1
 - l: return time since item was last accessed in seconds
@@ -1335,7 +1346,6 @@ integers separated by a colon (treat this as a floating point number).
 | proxy_conn_oom        | 64u     | Number of out of memory errors while      |
 |                       |         | serving proxy requests                    |
 | proxy_req_active      | 64u     | Number of in-flight proxy requests        |
-| proxy_req_await       | 64u     | Number of in-flight proxy async requests  |
 | cmd_get               | 64u     | Cumulative number of retrieval reqs       |
 | cmd_set               | 64u     | Cumulative number of storage reqs         |
 | cmd_flush             | 64u     | Cumulative number of flush reqs           |
@@ -1434,7 +1444,10 @@ integers separated by a colon (treat this as a floating point number).
 | slab_reassign_busy_nomem                                                    |
 |                       | 64u     | Times waiting for free slab memory before |
 |                       |         | being able to rescue valid items during   |
-                        |         | a page move.                              |
+|                       |         | a page move.                              |
+| slab_reassign_last_busy_status                                              |
+|                       | string  | Reason why an item was busy, causing the  |
+|                       |         | page mover to wait and retry later        |
 | slab_reassign_busy_deletes                                                  |
 |                       | 64u     | Items busy during page move, requiring    |
 |                       |         | deletion before page can be moved.        |

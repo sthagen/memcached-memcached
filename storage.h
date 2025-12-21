@@ -15,7 +15,11 @@ void storage_delete(void *e, item *it);
 void storage_stats(ADD_STAT add_stats, void *c);
 void process_extstore_stats(ADD_STAT add_stats, void *c);
 bool storage_validate_item(void *e, item *it);
-int storage_get_item(conn *c, item *it, mc_resp *resp);
+#ifdef EXTSTORE
+int storage_get_item(LIBEVENT_THREAD *t, item *it, mc_resp *resp);
+#else
+#define storage_get_item NULL
+#endif
 
 // callback for the IO queue subsystem.
 void storage_submit_cb(io_queue_t *q);
@@ -29,7 +33,7 @@ void storage_compact_pause(void);
 void storage_compact_resume(void);
 
 // Init functions.
-struct extstore_conf_file *storage_conf_parse(char *arg, unsigned int page_size);
+struct extstore_conf_file *storage_conf_parse(char *arg);
 void *storage_init_config(struct settings *s);
 int storage_read_config(void *conf, char **subopt);
 int storage_check_config(void *conf);

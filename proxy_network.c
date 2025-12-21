@@ -536,16 +536,6 @@ static int proxy_backend_drive_machine(struct mcp_backendconn_s *be) {
                     // this is a MISS from a GET request
                     // or final handler from a STAT request.
                     assert(r->resp.vlen == 0);
-                    if (p->ascii_multiget) {
-                        // Ascii multiget hack mode; consume END's
-                        be->rbufused -= r->resp.reslen;
-                        if (be->rbufused > 0) {
-                            memmove(be->rbuf, be->rbuf+r->resp.reslen, be->rbufused);
-                        }
-
-                        be->state = mcp_backend_next;
-                        continue;
-                    }
                     break;
                 case MCMC_RESP_META:
                     // we can handle meta responses easily since they're self
@@ -580,28 +570,25 @@ static int proxy_backend_drive_machine(struct mcp_backendconn_s *be) {
             // for now we simply malloc, but reusable buffers should be used
 
             r->blen = r->resp.reslen + r->resp.vlen;
-            {
-                bool oom = proxy_bufmem_checkadd(r->thread, r->blen + extra_space);
-
-                if (oom) {
-                    flags = P_BE_FAIL_OOM;
-                    // need to zero out blen so we don't over-decrement later
-                    r->blen = 0;
-                    stop = true;
-                    break;
-                }
-            }
             r->buf = malloc(r->blen + extra_space);
             if (r->buf == NULL) {
-                // Enforce accounting.
-                pthread_mutex_lock(&r->thread->proxy_limit_lock);
-                r->thread->proxy_buffer_memory_used -= r->blen + extra_space;
-                pthread_mutex_unlock(&r->thread->proxy_limit_lock);
-
                 flags = P_BE_FAIL_OOM;
                 r->blen = 0;
                 stop = true;
                 break;
+            }
+
+            // Only do an inline check of the memory limit if we're not on an
+            // IO thread. Avoids having to wrap the memory limit with a mutex
+            if (!be->be_parent->use_io_thread) {
+                if (r->thread->proxy_buffer_memory_used > r->thread->proxy_buffer_memory_limit) {
+                    free(r->buf);
+                    flags = P_BE_FAIL_OOM;
+                    r->buf = NULL;
+                    r->blen = 0;
+                    stop = true;
+                    break;
+                }
             }
 
             P_DEBUG("%s: r->status: %d, r->bread: %d, r->vlen: %lu\n", __func__, r->status, r->bread, r->resp.vlen);
@@ -644,14 +631,8 @@ static int proxy_backend_drive_machine(struct mcp_backendconn_s *be) {
                 } else {
                     // response is good.
                     // FIXME (v2): copy what the server actually sent?
-                    if (!p->ascii_multiget) {
-                        // sigh... if part of a multiget we need to eat the END
-                        // markers down here.
-                        memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
-                        r->blen += 5;
-                    } else {
-                        r->extra = 5;
-                    }
+                    memcpy(r->buf+r->blen, ENDSTR, ENDLEN);
+                    r->blen += 5;
 
                     // advance buffer
                     be->rbufused -= ENDLEN;
