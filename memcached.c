@@ -1847,13 +1847,18 @@ void server_stats(ADD_STAT add_stats, void *c) {
     APPEND_STAT("hash_bytes", "%llu", (unsigned long long)stats_state.hash_bytes);
     APPEND_STAT("hash_is_expanding", "%u", stats_state.hash_is_expanding);
     if (settings.slab_reassign) {
+        const char *busy_status = stats.slab_reassign_last_busy_status;
+        if (!busy_status) {
+            // Ensure we can't be NULL, for portability reasons.
+            busy_status = "none";
+        }
         APPEND_STAT("slab_reassign_rescues", "%llu", stats.slab_reassign_rescues);
         APPEND_STAT("slab_reassign_chunk_rescues", "%llu", stats.slab_reassign_chunk_rescues);
         APPEND_STAT("slab_reassign_inline_reclaim", "%llu", stats.slab_reassign_inline_reclaim);
         APPEND_STAT("slab_reassign_busy_items", "%llu", stats.slab_reassign_busy_items);
         APPEND_STAT("slab_reassign_busy_deletes", "%llu", stats.slab_reassign_busy_deletes);
         APPEND_STAT("slab_reassign_busy_nomem", "%llu", stats.slab_reassign_busy_nomem);
-        APPEND_STAT("slab_reassign_last_busy_status", "%s", stats.slab_reassign_last_busy_status);
+        APPEND_STAT("slab_reassign_last_busy_status", "%s", busy_status);
         APPEND_STAT("slab_reassign_running", "%u", stats_state.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }

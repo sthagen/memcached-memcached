@@ -722,7 +722,7 @@ static const char *mcp_key_hash_filter_stop(const char *conf, const char *key, s
     }
 
     memcpy(temp, key, klen);
-    temp[klen+1] = '\0';
+    temp[klen] = '\0';
 
     // TODO (v2): memmem would avoid the temp key and memcpy here, but it's
     // not technically portable. An easy improvement would be to detect
