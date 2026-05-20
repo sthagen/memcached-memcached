@@ -76,7 +76,7 @@ int mcp_request_render(mcp_request_t *rq, int idx, const char flag, const char *
         p += pr->tok.tokens[pr->tok.ntokens] - pr->tok.tokens[idx+1];
     } else {
         // If we removed something from the end we might've left some spaces.
-        while (*(p-1) == ' ') {
+        while (p > temp && *(p-1) == ' ') {
             p--;
         }
     }
@@ -656,7 +656,11 @@ int mcplib_request_match_res(lua_State *L) {
     // requests all have keys. check for an opaque.
     int opaque_len = 0;
     const char *opaque_token = mcmc_token_get_flag(rq->pr.request, &rq->pr.tok, 'O', &opaque_len);
-    mcmc_parse_buf(rs->buf, rs->blen, &reresp);
+    if (mcmc_parse_buf(rs->buf, rs->blen, &reresp) != MCMC_OK) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "failed to parse response");
+        return 2;
+    }
     mcmc_tokenize_res(rs->buf, reresp.reslen, &rs->tok);
 
     int matched = 0;
