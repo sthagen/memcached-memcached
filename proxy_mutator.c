@@ -489,6 +489,8 @@ mut_step_n(resnull) {
         case CMD_DELETE:
             p->src = "NOT_FOUND";
             break;
+        default:
+            return -1;
     }
     p->slen = strlen(p->src);
 
@@ -823,7 +825,7 @@ mut_step_n(flagcopy) {
                     return -1;
                 }
                 int tlen = 0;
-                if (mcmc_token_has_flag_bit(&srs->tok, c->bit) == MCMC_OK) {
+                if (mcmc_token_has_flag_bit(&srq->pr.tok, c->bit) == MCMC_OK) {
                     const char *tok = mcmc_token_get_flag(srq->pr.request, &srq->pr.tok, c->f, &tlen);
                     p->slen = 1;
                     if (tok && tlen > 0) {
@@ -1117,6 +1119,9 @@ static int mcp_mutator_new(lua_State *L, enum mcp_mut_type type) {
 
     if (size != mut->aused) {
         proxy_lua_error(L, "mutator failed to properly initialize, memory not filled correctly");
+    }
+    if (scount == 0) {
+        proxy_lua_error(L, "mutator failed to initialize, no steps given");
     }
     mut->scount = scount;
 

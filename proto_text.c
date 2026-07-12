@@ -223,6 +223,7 @@ void complete_nread_ascii(conn *c) {
 #define SUBCOMMAND_TOKEN 1
 #define KEY_TOKEN 1
 #define MAX_AUTH_REQ_LEN 16384
+#define MIN_AUTH_REQ_LEN 6
 
 int try_read_command_asciiauth(conn *c) {
     mcmc_tokenizer_t tok;
@@ -251,6 +252,12 @@ int try_read_command_asciiauth(conn *c) {
             return 0;
         }
 
+        if (el - st < MIN_AUTH_REQ_LEN) {
+            // Can't possibly be shorter than this. Parser dislikes getting
+            // strings < 2 in len.
+            conn_set_state(c, conn_closing);
+            return 1;
+        }
         // Looking for: "set foo 0 0 N\r\nuser pass\r\n"
         // key, flags, and ttl are ignored. N is used to see if we have the rest.
 
@@ -361,7 +368,8 @@ int try_read_command_ascii(conn *c) {
              * large multiget, if not we should just nuke the connection.
              */
             char *ptr = c->rcurr;
-            while (*ptr == ' ') { /* ignore leading whitespaces */
+            char *end = c->rcurr + c->rbytes-6;
+            while (*ptr == ' ' && ptr != end) { /* ignore leading whitespaces */
                 ++ptr;
             }
 
@@ -922,6 +930,10 @@ static void process_slabs_automove_command(conn *c, mcp_parser_t *pr) {
     } else if (strncmp(subcmd, "window", len) == 0) {
         if (ntokens < 4 || mcmc_token_get_u32(pr->request, &pr->tok, 3, &level) != MCMC_OK) {
             out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        if (level < 3 || level > 1800) {
+            out_string(c, "CLIENT_ERROR automove window too low or too high");
             return;
         }
 
